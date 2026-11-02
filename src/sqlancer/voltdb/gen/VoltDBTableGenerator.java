@@ -57,14 +57,26 @@ public final class VoltDBTableGenerator {
             partitionColumn.notNull = true;
         }
 
+        List<Column> primaryKey = null;
+        if (Randomly.getBooleanWithRatherLowProbability() || Randomly.getBoolean()) {
+            primaryKey = keyColumns(columns, partitionColumn, true);
+            if (globalState.getDbmsSpecificOptions().avoidKnownBugs) {
+                // ENG-30514: VoltDB stores NULL in a primary key column that is not declared NOT NULL, but its
+                // planner assumes such a column is never NULL, which gives wrong rows for outer joins
+                primaryKey.forEach(c -> c.notNull = true);
+            }
+        }
+        List<Column> uniqueKey = Randomly.getBooleanWithRatherLowProbability()
+                ? keyColumns(columns, partitionColumn, false) : null;
+
         StringBuilder sb = new StringBuilder("CREATE TABLE ").append(table).append(" (");
         sb.append(columns.stream().map(c -> c.name + " " + c.type + (c.notNull ? " NOT NULL" : ""))
                 .collect(Collectors.joining(", ")));
-        if (Randomly.getBooleanWithRatherLowProbability() || Randomly.getBoolean()) {
-            appendKey(sb, columns, partitionColumn, true);
+        if (primaryKey != null) {
+            appendKey(sb, primaryKey, partitionColumn, true);
         }
-        if (Randomly.getBooleanWithRatherLowProbability()) {
-            appendKey(sb, columns, partitionColumn, false);
+        if (uniqueKey != null) {
+            appendKey(sb, uniqueKey, partitionColumn, false);
         }
         sb.append(");");
         if (partitionColumn != null) {
@@ -73,14 +85,18 @@ public final class VoltDBTableGenerator {
         return new SQLQueryAdapter(sb.toString(), ExpectedErrors.newErrors().build(), true);
     }
 
-    // Appends PRIMARY KEY (primary) or a UNIQUE / ASSUMEUNIQUE constraint over a random column subset.
-    private static void appendKey(StringBuilder sb, List<Column> columns, Column partitionColumn, boolean primary) {
+    // A random column subset for a key; a primary key always includes the partitioning column.
+    private static List<Column> keyColumns(List<Column> columns, Column partitionColumn, boolean primary) {
         List<Column> key = new ArrayList<>(Randomly.nonEmptySubset(columns));
-        boolean hasPartitionColumn = partitionColumn == null || key.contains(partitionColumn);
-        if (primary && !hasPartitionColumn) {
+        if (primary && partitionColumn != null && !key.contains(partitionColumn)) {
             key.add(partitionColumn);
-            hasPartitionColumn = true;
         }
+        return key;
+    }
+
+    // Appends PRIMARY KEY (primary) or a UNIQUE / ASSUMEUNIQUE constraint over the key columns.
+    private static void appendKey(StringBuilder sb, List<Column> key, Column partitionColumn, boolean primary) {
+        boolean hasPartitionColumn = partitionColumn == null || key.contains(partitionColumn);
         sb.append(", ");
         if (primary) {
             sb.append("PRIMARY KEY");
