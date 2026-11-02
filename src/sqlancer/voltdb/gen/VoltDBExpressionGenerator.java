@@ -1,7 +1,9 @@
 package sqlancer.voltdb.gen;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import sqlancer.IgnoreMeException;
@@ -81,6 +83,14 @@ public final class VoltDBExpressionGenerator
         COMPARISON, AND_OR, NOT, IS_NULL, BETWEEN, IN, LIKE
     }
 
+    private enum NumericDomain {
+        ANY, EXACT, FLOAT;
+
+        boolean contains(VoltDBDataType type) {
+            return this == ANY || (type == VoltDBDataType.FLOAT) == (this == FLOAT);
+        }
+    }
+
     private enum NumericExpression {
         UNARY_MINUS, ARITHMETIC, ABS
     }
@@ -92,6 +102,8 @@ public final class VoltDBExpressionGenerator
     private List<VoltDBTable> fromTables = new ArrayList<>();
     private List<VoltDBJoin> joins = new ArrayList<>();
     private boolean hasOuterJoin;
+    // ENG-30513: which numeric types the current comparison draws its operands from (see inNumericDomain)
+    private NumericDomain numericDomain = NumericDomain.ANY;
     // how many comparison or IN operands enclose the expression being generated
     private int comparandNesting;
 
@@ -136,7 +148,17 @@ public final class VoltDBExpressionGenerator
                 // value fails, and the longer value can be another table's column; one side is a short constant
                 return new VoltDBBinaryOperation(generateComparand(kind, depth), generateConstant(kind, false), op);
             }
-            return new VoltDBBinaryOperation(generateComparand(kind, depth), generateComparand(kind, depth), op);
+            VoltDBBinaryOperator comparison = op;
+            return inNumericDomain(kind, () -> {
+                if (kind == Kind.NUMERIC && comparison.isOrdering() && avoidKnownBugs) {
+                    // ENG-30511: an index range scan on a narrower integer column with a key from a wider column that
+                    // is below the narrower type's range matches every row; constant keys are handled correctly
+                    return new VoltDBBinaryOperation(generateComparand(kind, depth), generateRangeBound(kind),
+                            comparison);
+                }
+                return new VoltDBBinaryOperation(generateComparand(kind, depth), generateComparand(kind, depth),
+                        comparison);
+            });
         case AND_OR:
             return new VoltDBBinaryOperation(generateExpression(Kind.BOOLEAN, depth + 1),
                     generateExpression(Kind.BOOLEAN, depth + 1),
@@ -157,6 +179,22 @@ public final class VoltDBExpressionGenerator
             do {
                 betweenKind = getRandomType();
             } while (!canCompareOrdered(betweenKind));
+            if (avoidKnownBugs) {
+                // ENG-30511 as for comparisons, and ENG-30512: COUNT(*) over an empty index range, such as
+                // x BETWEEN 9 AND 1, is negative; the bounds are constants in ascending order
+                Kind boundsKind = betweenKind;
+                return inNumericDomain(boundsKind, () -> {
+                    VoltDBConstant low = generateRangeBound(boundsKind);
+                    VoltDBConstant high = generateRangeBound(boundsKind);
+                    if (compareConstants(boundsKind, low, high) > 0) {
+                        VoltDBConstant swap = low;
+                        low = high;
+                        high = swap;
+                    }
+                    return new VoltDBBetweenOperation(generateExpression(boundsKind, depth + 1), low, high,
+                            Randomly.getBoolean());
+                });
+            }
             return new VoltDBBetweenOperation(generateExpression(betweenKind, depth + 1),
                     generateExpression(betweenKind, depth + 1), generateExpression(betweenKind, depth + 1),
                     Randomly.getBoolean());
@@ -172,12 +210,14 @@ public final class VoltDBExpressionGenerator
                 return generateIsNull(depth);
             }
             Kind inKind = getRandomType();
-            List<VoltDBExpression> list = new ArrayList<>();
-            int n = 1 + Randomly.smallNumber();
-            for (int i = 0; i < n; i++) {
-                list.add(generateInListElement(inKind, depth));
-            }
-            return new VoltDBInOperation(generateComparand(inKind, depth), list, Randomly.getBoolean());
+            return inNumericDomain(inKind, () -> {
+                List<VoltDBExpression> list = new ArrayList<>();
+                int n = 1 + Randomly.smallNumber();
+                for (int i = 0; i < n; i++) {
+                    list.add(generateInListElement(inKind, depth));
+                }
+                return new VoltDBInOperation(generateComparand(inKind, depth), list, Randomly.getBoolean());
+            });
         case LIKE:
             return generateLike(depth);
         default:
@@ -211,13 +251,71 @@ public final class VoltDBExpressionGenerator
         return generateConstant(kind, false);
     }
 
+    // ENG-30513: comparing a FLOAT with a DECIMAL of magnitude 2^63 or more gives wrong results, and such DECIMALs come
+    // from the data and from arithmetic, not only constants. Unless --avoid-known-bugs is false, a numeric comparison,
+    // BETWEEN or IN draws all its operands from either FLOAT or the exact types (integers and DECIMAL).
+    private VoltDBExpression inNumericDomain(Kind kind, Supplier<VoltDBExpression> generator) {
+        if (kind != Kind.NUMERIC || !avoidKnownBugs || numericDomain != NumericDomain.ANY) {
+            return generator.get();
+        }
+        numericDomain = Randomly.fromOptions(NumericDomain.EXACT, NumericDomain.FLOAT);
+        try {
+            return generator.get();
+        } finally {
+            numericDomain = NumericDomain.ANY;
+        }
+    }
+
+    private boolean isUsable(VoltDBColumn c, Kind kind) {
+        VoltDBDataType type = c.getType().getType();
+        return Kind.fromType(type) == kind && (kind != Kind.NUMERIC || numericDomain.contains(type));
+    }
+
+    // A constant bound for an ordered comparison or BETWEEN. ENG-30515: INDEX COUNT clamps a bound outside the
+    // column type's range to the type's limit and then misses rows holding that limit (TINYINT c < 32767 does not
+    // count 127), so numeric bounds lie inside every integer type's range: -126 to 126.
+    private VoltDBConstant generateRangeBound(Kind kind) {
+        if (kind != Kind.NUMERIC) {
+            return (VoltDBConstant) generateConstant(kind, false);
+        }
+        Randomly r = state.getRandomly();
+        long whole = r.getLong(-126, 127);
+        String text;
+        if (numericDomain == NumericDomain.FLOAT) {
+            text = whole + "." + r.getInteger(0, 1000) + "E0";
+        } else if (Randomly.getBoolean()) {
+            text = whole + "." + r.getInteger(0, 1000);
+        } else {
+            text = Long.toString(whole);
+        }
+        return new VoltDBConstant(whole < 0 ? "(" + text + ")" : text);
+    }
+
+    // Orders two NUMERIC or TEMPORAL constants as generateConstant writes them: a number, possibly in parentheses, or
+    // CAST('uuuu-MM-dd HH:mm:ss.SSSSSS' AS TIMESTAMP), whose text orders as the timestamp does.
+    private static int compareConstants(Kind kind, VoltDBConstant a, VoltDBConstant b) {
+        if (kind == Kind.NUMERIC) {
+            return new BigDecimal(a.toString().replaceAll("[()]", ""))
+                    .compareTo(new BigDecimal(b.toString().replaceAll("[()]", "")));
+        }
+        return a.toString().compareTo(b.toString());
+    }
+
     // ENG-30497: with an outer join, (x IS NULL) IS NOT NULL and the like over the inner table turn the join into an
     // inner join, so the operand is a column or a constant unless --avoid-known-bugs is false
+    // ENG-30516: WHERE c IS NULL AND c = 5 on an indexed column loses the IS NULL when c = 5 becomes the index lookup,
+    // so unless --avoid-known-bugs is false, IS NULL is written NOT (x IS NOT NULL), which VoltDB keeps.
     private VoltDBExpression generateIsNull(int depth) {
         Kind kind = getRandomType();
-        return new VoltDBUnaryPostfixOperation(
-                hasOuterJoin && avoidKnownBugs ? generateLeafNode(kind) : generateExpression(kind, depth + 1),
-                Randomly.fromOptions(VoltDBUnaryPostfixOperator.values()));
+        VoltDBExpression operand = hasOuterJoin && avoidKnownBugs ? generateLeafNode(kind)
+                : generateExpression(kind, depth + 1);
+        VoltDBUnaryPostfixOperator op = Randomly.fromOptions(VoltDBUnaryPostfixOperator.values());
+        if (op == VoltDBUnaryPostfixOperator.IS_NULL && avoidKnownBugs) {
+            return new VoltDBUnaryPrefixOperation(
+                    new VoltDBUnaryPostfixOperation(operand, VoltDBUnaryPostfixOperator.IS_NOT_NULL),
+                    VoltDBUnaryPrefixOperator.NOT);
+        }
+        return new VoltDBUnaryPostfixOperation(operand, op);
     }
 
     // ENG-30493: VoltDB orders BOOLEAN values TRUE < FALSE where it evaluates them, so <, >, BETWEEN and ORDER BY on
@@ -347,13 +445,17 @@ public final class VoltDBExpressionGenerator
         return new VoltDBConstant(literal);
     }
 
-    private static VoltDBDataType randomDataType(Kind kind) {
+    private VoltDBDataType randomDataType(Kind kind) {
         switch (kind) {
         case BOOLEAN:
             return VoltDBDataType.BOOLEAN;
         case NUMERIC:
-            return Randomly.fromOptions(VoltDBDataType.TINYINT, VoltDBDataType.SMALLINT, VoltDBDataType.INTEGER,
-                    VoltDBDataType.BIGINT, VoltDBDataType.FLOAT, VoltDBDataType.DECIMAL);
+            VoltDBDataType type;
+            do {
+                type = Randomly.fromOptions(VoltDBDataType.TINYINT, VoltDBDataType.SMALLINT, VoltDBDataType.INTEGER,
+                        VoltDBDataType.BIGINT, VoltDBDataType.FLOAT, VoltDBDataType.DECIMAL);
+            } while (!numericDomain.contains(type));
+            return type;
         case STRING:
             return VoltDBDataType.VARCHAR;
         case VARBINARY:
@@ -367,8 +469,8 @@ public final class VoltDBExpressionGenerator
 
     @Override
     protected VoltDBExpression generateColumn(Kind kind) {
-        return new VoltDBColumnReference(Randomly.fromList(columns.stream()
-                .filter(c -> Kind.fromType(c.getType().getType()) == kind).collect(Collectors.toList())));
+        return new VoltDBColumnReference(
+                Randomly.fromList(columns.stream().filter(c -> isUsable(c, kind)).collect(Collectors.toList())));
     }
 
     @Override
@@ -378,7 +480,7 @@ public final class VoltDBExpressionGenerator
 
     @Override
     protected boolean canGenerateColumnOfType(Kind kind) {
-        return columns.stream().anyMatch(c -> Kind.fromType(c.getType().getType()) == kind);
+        return columns.stream().anyMatch(c -> isUsable(c, kind));
     }
 
     @Override
@@ -393,7 +495,7 @@ public final class VoltDBExpressionGenerator
                 fromTables.add(t);
             } else if (anchor == null) {
                 anchor = t;
-            } else if (partitionKind(t) == partitionKind(anchor)) {
+            } else if (canPartitionJoin(anchor, t)) {
                 partitionJoined.add(t);
             }
             // a partitioned table whose partitioning column cannot be compared with the anchor's is left out
@@ -433,6 +535,16 @@ public final class VoltDBExpressionGenerator
             return Randomly.fromOptions(VoltDBJoin.JoinType.INNER, VoltDBJoin.JoinType.LEFT, VoltDBJoin.JoinType.FULL);
         }
         return VoltDBJoin.JoinType.getRandom();
+    }
+
+    // ENG-12656: an index lookup on a VARBINARY(n) column fails for a longer value, so unless --avoid-known-bugs is
+    // false, VARBINARY partitioning columns are joined only when they have the same size
+    private boolean canPartitionJoin(VoltDBTable anchor, VoltDBTable t) {
+        if (partitionKind(t) != partitionKind(anchor)) {
+            return false;
+        }
+        return partitionKind(t) != Kind.VARBINARY || !avoidKnownBugs
+                || partitionColumn(t).getType().getSize() == partitionColumn(anchor).getType().getSize();
     }
 
     private static Kind partitionKind(VoltDBTable t) {

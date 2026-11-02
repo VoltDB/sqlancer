@@ -44,6 +44,7 @@ public final class VoltDBErrors {
         // run-time arithmetic errors: random operands divide by zero and overflow, and the two NoREC queries may
         // evaluate an expression on different rows, so only one of them may hit the error
         errors.add("Attempted to divide"); // integer or DECIMAL division by zero
+        errors.add("data exception: division by zero"); // the same, in constants the planner folds
         errors.add("Invalid result value"); // FLOAT result is infinite or NaN
         errors.add("will overflow BigInt storage"); // integer +, -, * out of range
         errors.add("causing overflow/underflow"); // DECIMAL out of range

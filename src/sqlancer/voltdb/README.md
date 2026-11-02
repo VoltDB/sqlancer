@@ -167,7 +167,7 @@ Each is listed in `VoltDBErrors` with its reason. The run fails on any other err
 | INSERT | `CONSTRAINT VIOLATION` | Random values repeat existing keys. |
 | CREATE INDEX | `is not empty` | VoltDB cannot add a UNIQUE index to a table that has rows (an ASSUMEUNIQUE index it can). |
 | SELECT | `Join with filters that do not depend on joined tables is not supported` | A predicate that references a column can still fold to a constant, such as `(FALSE AND t.c) = FALSE`. |
-| SELECT | `Attempted to divide` | Integer or DECIMAL division by zero. |
+| SELECT | `Attempted to divide`, `data exception: division by zero` | Division by zero, at run time or in constants the planner folds. |
 | SELECT | `Invalid result value` | A FLOAT result is infinite or NaN. |
 | SELECT | `will overflow BigInt storage`, `causing overflow/underflow`, `out of range for the destination type` | Integer, DECIMAL or cast overflow. |
 | SELECT | `Numeric conversion error to type DECIMAL` | DECIMAL overflow in an expression of constants, which the planner folds. The message quotes a truncated value. |
@@ -185,7 +185,7 @@ index ..." at WARN. The statement succeeds, so the provider ignores it.
 | --- | --- | --- |
 | ENG-30489 | Closing a JDBC connection twice closes the client every other connection to the same URL shares, failing their in-flight calls. SQLancer closes each connection twice. | `VoltDBConnection.close()` is idempotent. |
 | ENG-4643 | JDBC `getString` on a NULL returns the type's NULL sentinel (INTEGER, TINYINT, FLOAT) or throws (DECIMAL, BOOLEAN, DATE, TIMESTAMP). | Not needed: NoREC reads only counts. TLP compares values and will need one. |
-| ENG-12656 | An index scan for `<`, `<=`, `>`, `>=` or BETWEEN on a VARBINARY(n) column, and for `=` when the column leads a multi-column unique index, fails ("Type VARCHAR can't be cast as VARBINARY") when the value, a constant or another table's column, is longer than n bytes. Found again by NoREC. | While `--avoid-known-bugs` is true, VARBINARY values are never compared with `<`, `>`, `<=`, `>=` or BETWEEN, a VARBINARY comparison has a constant on one side, and VARBINARY constants are at most one byte. |
+| ENG-12656 | An index scan for `<`, `<=`, `>`, `>=` or BETWEEN on a VARBINARY(n) column, and for `=` when the column leads a multi-column unique index, fails ("Type VARCHAR can't be cast as VARBINARY") when the value, a constant or another table's column, is longer than n bytes. Found again by NoREC. | While `--avoid-known-bugs` is true, VARBINARY values are never compared with `<`, `>`, `<=`, `>=` or BETWEEN, a VARBINARY comparison has a constant on one side, VARBINARY constants are at most one byte, and VARBINARY partitioning columns are joined only when their sizes match. |
 | ENG-22880 | A BIGINT literal at the type's minimum is stored as NULL instead of rejected. A FLOAT at -1.7976931348623157E308 and an INTEGER expression equal to INTEGER's minimum do the same. | Never generated. |
 
 The bugs below were found by NoREC in milestone 2. While `--avoid-known-bugs` is true (the default) the generator
@@ -209,6 +209,12 @@ avoids each one as described; set it to false to check whether a fix works.
 | ENG-30508 | A join filter of constants only, which VoltDB rejects ("Join with filters that do not depend on joined tables"), fails with an internal NumberFormatException instead when it is an IN with a DECIMAL constant on the left. | The internal error is an expected error, like the rejection it replaces. |
 | ENG-30509 | A range scan on a multi-column index compares a VARCHAR(n) column with only the first n characters of a longer value, a constant or another table's column: `c >= '-2'` matches `'-'`, and so does `c LIKE '-2%'`. Wrong rows. | Strings are never compared with `<`, `>`, `<=`, `>=` or BETWEEN; string constants and a LIKE pattern's literal prefix are at most one character (the smallest VARCHAR). |
 | ENG-30510 | After turning a RIGHT JOIN into a LEFT JOIN, VoltDB can use an ON condition on the preserved table as that table's index range, dropping rows that should be null-extended. Wrong rows. | No RIGHT JOIN (a LEFT JOIN with the tables swapped is the same). |
+| ENG-30511 | An index nested-loop join's range scan on a narrower integer column, with a key from a wider column that is below the narrower type's range, matches every row: `b > s` is true for BIGINT `b = -40000` and SMALLINT `s = 5`. Wrong rows. | Ordered comparisons of numbers have a constant on one side, and BETWEEN on numbers has constant bounds. |
+| ENG-30512 | COUNT(*) over an empty index range, such as `x BETWEEN 9 AND 1`, is negative (INDEX COUNT). | BETWEEN bounds are constants in ascending order. |
+| ENG-30513 | Comparing a FLOAT with a DECIMAL of magnitude 2^63 or more gives wrong results; the DECIMAL appears to wrap through a 64-bit integer. Such DECIMALs come from the data and from arithmetic. | A numeric comparison, BETWEEN or IN uses only FLOAT operands or only exact ones (integers and DECIMAL). |
+| ENG-30514 | A primary key column that is not declared NOT NULL accepts NULL, but the planner assumes it is never NULL: `LEFT JOIN t ON ... WHERE t.pk IS NULL` drops the ON condition. Wrong rows. | Primary key columns are NOT NULL. |
+| ENG-30515 | INDEX COUNT clamps a bound above the column type's range to the type's maximum and misses rows holding it: TINYINT `c < 32767` does not count 127. | Constants in ordered numeric comparisons and BETWEEN lie between -126 and 126. |
+| ENG-30516 | `WHERE c IS NULL AND c = 5` on an indexed column drops the IS NULL when `c = 5` becomes the index lookup. Wrong rows. | IS NULL is written `NOT (x IS NOT NULL)`. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
