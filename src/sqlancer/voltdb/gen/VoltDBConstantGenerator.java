@@ -93,7 +93,9 @@ public final class VoltDBConstantGenerator {
         do {
             d = r.getFiniteDouble();
         } while (d <= -Double.MAX_VALUE);
-        return Double.toString(d);
+        String s = Double.toString(d);
+        // without an exponent VoltDB reads the literal as a DECIMAL, which holds only 12 digits after the point
+        return s.contains("E") ? s : s + "E0";
     }
 
     private static BigDecimal decimal(Randomly r) {

@@ -34,6 +34,19 @@ public final class VoltDBErrors {
         return false;
     }
 
+    public static void addExpressionErrors(ExpectedErrors errors) {
+        // VoltDB does not support a join whose WHERE clause folds to a filter on none of the joined tables; a
+        // predicate that references a column can still fold to a constant, e.g. (FALSE AND t.c) = FALSE
+        errors.add("Join with filters that do not depend on joined tables is not supported");
+        // run-time arithmetic errors: random operands divide by zero and overflow, and the two NoREC queries may
+        // evaluate an expression on different rows, so only one of them may hit the error
+        errors.add("Attempted to divide"); // integer or DECIMAL division by zero
+        errors.add("Invalid result value"); // FLOAT result is infinite or NaN
+        errors.add("will overflow BigInt storage"); // integer +, -, * out of range
+        errors.add("causing overflow/underflow"); // DECIMAL out of range
+        errors.add("out of range for the destination type"); // a huge DECIMAL or FLOAT result cast to an integer
+    }
+
     public static void addInsertErrors(ExpectedErrors errors) {
         // a generated key can repeat an existing primary key or unique value
         errors.add("CONSTRAINT VIOLATION");
