@@ -1,5 +1,6 @@
 package sqlancer.voltdb;
 
+import sqlancer.common.ast.newast.NewFunctionNode;
 import sqlancer.common.ast.newast.NewToStringVisitor;
 import sqlancer.voltdb.ast.VoltDBConstant;
 import sqlancer.voltdb.ast.VoltDBExpression;
@@ -19,6 +20,16 @@ public class VoltDBToStringVisitor extends NewToStringVisitor<VoltDBExpression> 
         } else {
             throw new AssertionError(expr.getClass());
         }
+    }
+
+    // ENG-30506: in a parenthesized AND/OR list, an operand that starts with a function call after an IN predicate
+    // crashes VoltDB's parser, e.g. (a IN (1) OR ABS(a) > 5); BETWEEN and IN print their left operand without
+    // parentheses, so a function call is always printed in parentheses
+    @Override
+    public void visit(NewFunctionNode<VoltDBExpression, ?> funcCall) {
+        sb.append("(");
+        super.visit(funcCall);
+        sb.append(")");
     }
 
     private void visit(VoltDBJoin join) {

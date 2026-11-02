@@ -38,6 +38,9 @@ public final class VoltDBErrors {
         // VoltDB does not support a join whose WHERE clause folds to a filter on none of the joined tables; a
         // predicate that references a column can still fold to a constant, e.g. (FALSE AND t.c) = FALSE
         errors.add("Join with filters that do not depend on joined tables is not supported");
+        // ENG-30508: the same rejected filter, when it is an IN with a DECIMAL constant on the left, fails with an
+        // internal error instead
+        errors.add("NUMERIC constant value type must match a FLOAT, DECIMAL, or integral column, not null");
         // run-time arithmetic errors: random operands divide by zero and overflow, and the two NoREC queries may
         // evaluate an expression on different rows, so only one of them may hit the error
         errors.add("Attempted to divide"); // integer or DECIMAL division by zero
@@ -45,6 +48,9 @@ public final class VoltDBErrors {
         errors.add("will overflow BigInt storage"); // integer +, -, * out of range
         errors.add("causing overflow/underflow"); // DECIMAL out of range
         errors.add("out of range for the destination type"); // a huge DECIMAL or FLOAT result cast to an integer
+        // DECIMAL out of range in an expression of constants, which the planner folds; the message quotes a
+        // truncated value, e.g. "30145.999" for -99999999999999999999999999.999999999999 + -30146
+        errors.add("Numeric conversion error to type DECIMAL");
     }
 
     public static void addInsertErrors(ExpectedErrors errors) {
