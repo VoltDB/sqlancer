@@ -275,7 +275,10 @@ public final class VoltDBExpressionGenerator
 
     // A constant bound for an ordered comparison or BETWEEN. ENG-30515: INDEX COUNT clamps a bound outside the
     // column type's range to the type's limit and then misses rows holding that limit (TINYINT c < 32767 does not
-    // count 127), so numeric bounds lie inside every integer type's range: -126 to 126.
+    // count 127), so numeric bounds lie inside every integer type's range: -126 to 126. ENG-30521: exact bounds have no
+    // fraction unless --avoid-known-bugs is false, since a DECIMAL literal compares wrongly with a DECIMAL expression
+    // of
+    // 2^63 or more.
     private VoltDBConstant generateRangeBound(Kind kind) {
         if (kind != Kind.NUMERIC) {
             return (VoltDBConstant) generateConstant(kind, false);
@@ -285,7 +288,7 @@ public final class VoltDBExpressionGenerator
         String text;
         if (numericDomain == NumericDomain.FLOAT) {
             text = whole + "." + r.getInteger(0, 1000) + "E0";
-        } else if (Randomly.getBoolean()) {
+        } else if (Randomly.getBoolean() && !avoidKnownBugs) {
             text = whole + "." + r.getInteger(0, 1000);
         } else {
             text = Long.toString(whole);
@@ -453,10 +456,14 @@ public final class VoltDBExpressionGenerator
             return VoltDBDataType.BOOLEAN;
         case NUMERIC:
             VoltDBDataType type;
+            // ENG-30521: when a join's statement keeps its literals inline, a DECIMAL expression of 2^63 or more
+            // compares wrongly with any DECIMAL literal (a non-integer, or an integer outside BIGINT's range), so
+            // unless --avoid-known-bugs is false the exact side of a comparison, BETWEEN or IN has integer literals
             do {
                 type = Randomly.fromOptions(VoltDBDataType.TINYINT, VoltDBDataType.SMALLINT, VoltDBDataType.INTEGER,
                         VoltDBDataType.BIGINT, VoltDBDataType.FLOAT, VoltDBDataType.DECIMAL);
-            } while (!numericDomain.contains(type));
+            } while (!numericDomain.contains(type)
+                    || type == VoltDBDataType.DECIMAL && numericDomain == NumericDomain.EXACT && avoidKnownBugs);
             return type;
         case STRING:
             return VoltDBDataType.VARCHAR;
@@ -522,7 +529,11 @@ public final class VoltDBExpressionGenerator
             all.addAll(t.getColumns());
         }
         for (VoltDBTable t : explicitlyJoined) {
-            joins.add(new VoltDBJoin(new VoltDBTableReference(t), randomJoinType(), joinCondition(anchor, t)));
+            // a chain of INNER JOINs with partitioned tables, where a replicated table's ON condition folds to FALSE,
+            // loses the partitioning columns' equality ("This query is not plannable"); an outer join keeps it
+            VoltDBJoin.JoinType type = partitionJoined.isEmpty() ? randomJoinType()
+                    : Randomly.fromOptions(VoltDBJoin.JoinType.LEFT, VoltDBJoin.JoinType.FULL);
+            joins.add(new VoltDBJoin(new VoltDBTableReference(t), type, joinCondition(anchor, t)));
             all.addAll(t.getColumns());
         }
         this.columns = all;

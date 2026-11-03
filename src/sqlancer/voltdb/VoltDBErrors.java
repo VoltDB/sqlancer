@@ -52,6 +52,9 @@ public final class VoltDBErrors {
         // DECIMAL out of range in an expression of constants, which the planner folds; the message quotes a
         // truncated value, e.g. "30145.999" for -99999999999999999999999999.999999999999 + -30146
         errors.add("Numeric conversion error to type DECIMAL");
+        // ENG-30522: FLOAT overflow to infinity in an expression of constants, which the parser folds, fails with an
+        // internal NumberFormatException instead of "Invalid result value"
+        errors.add("Character I is neither a decimal digit number");
     }
 
     public static void addInsertErrors(ExpectedErrors errors) {

@@ -137,7 +137,8 @@ supports:
   FALSE, such as `pc = pc AND (1 = 0)`, takes it away ("This query is not plannable"). A partitioned table whose
   partitioning column cannot be compared with the anchor's is left out. Replicated tables are in the FROM list or,
   sometimes, joined explicitly (INNER, LEFT, RIGHT or FULL; RIGHT only when `--avoid-known-bugs` is false) with a random
-  ON condition.
+  ON condition. When partitioned tables are joined, those explicit joins are LEFT or FULL: in a chain of INNER JOINs,
+  a replicated table's ON condition that folds to FALSE takes the partitioning columns' equality with it too.
 - **Typed NULLs.** A NULL constant is `CAST(NULL AS type)`; VoltDB rejects a bare NULL whose type it cannot infer.
 - **Syntax.** Negative constants are in parentheses (`- -5` is a syntax error), `MOD` is never written as `%`, and an
   IN predicate is never the operand of a comparison or another IN (`x = (y IN (1))` is a syntax error).
@@ -214,6 +215,7 @@ Each is listed in `VoltDBErrors` with its reason. The run fails on any other err
 | SELECT | `Invalid result value` | A FLOAT result is infinite or NaN. |
 | SELECT | `will overflow BigInt storage`, `causing overflow/underflow`, `out of range for the destination type` | Integer, DECIMAL or cast overflow. |
 | SELECT | `Numeric conversion error to type DECIMAL` | DECIMAL overflow in an expression of constants, which the planner folds. The message quotes a truncated value. |
+| SELECT | `Character I is neither a decimal digit number` | FLOAT overflow to infinity in an expression of constants, which the parser folds (ENG-30522: an internal error instead of "Invalid result value"). |
 
 The two NoREC queries can evaluate an expression on different rows (the optimized query may skip rows through an index
 or a join), so only one of them may hit a run-time error. The oracle treats an expected error in either query as no
@@ -258,6 +260,15 @@ avoids each one as described; set it to false to check whether a fix works.
 | ENG-30514 | A primary key column that is not declared NOT NULL accepts NULL, but the planner assumes it is never NULL: `LEFT JOIN t ON ... WHERE t.pk IS NULL` drops the ON condition. Wrong rows. | Primary key columns are NOT NULL. |
 | ENG-30515 | INDEX COUNT clamps a bound above the column type's range to the type's maximum and misses rows holding it: TINYINT `c < 32767` does not count 127. | Constants in ordered numeric comparisons and BETWEEN lie between -126 and 126. |
 | ENG-30516 | `WHERE c IS NULL AND c = 5` on an indexed column drops the IS NULL when `c = 5` becomes the index lookup. Wrong rows. | IS NULL is written `NOT (x IS NOT NULL)`, in the predicate and in TLP's third partition. |
+
+The bugs below were found by TLP WHERE in milestone 3.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30521 | In a join whose statement keeps its literals inline (a constant conjunct such as `AND (1 = 1)` stops parameterization), a DECIMAL expression of 2^63 or more compares wrongly with a DECIMAL literal: `(d + 0) <= 22.656` matches `d = 1E19`. Wrong rows. | Comparisons, BETWEEN and IN over exact types have integer literals within BIGINT's range: no DECIMAL constants, and range bounds without a fraction. |
+| ENG-30522 | A constant FLOAT expression that overflows to infinity fails in the parser with an internal NumberFormatException. | An expected error. |
+
+ENG-30504 was also found again in new forms; see its row above.
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
