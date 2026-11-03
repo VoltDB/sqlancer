@@ -119,6 +119,8 @@ public final class VoltDBExpressionGenerator
     private boolean noFullJoins;
     // ENG-30533 (see setUngroupedAggregates)
     private boolean ungroupedAggregates;
+    // whether an aggregate's argument is being generated (ENG-30534)
+    private boolean inAggregate;
 
     public VoltDBExpressionGenerator(VoltDBGlobalState state) {
         this.state = state;
@@ -447,6 +449,11 @@ public final class VoltDBExpressionGenerator
             // unique
             // index; the smallest generated VARBINARY column holds one byte
             byte[] bytes = state.getRandomly().getBytes();
+            if (bytes.length == 0 && inAggregate) {
+                // ENG-30534: aggregates of x'' and of '' in a GROUP BY join whose ON condition holds x'' fail with a
+                // cast error, as if the two were one expression; an aggregate's VARBINARY constants are not empty
+                bytes = new byte[] { 0 };
+            }
             return new VoltDBConstant(bytes.length == 0 ? "x''" : String.format("x'%02X'", bytes[0]));
         }
         String literal = VoltDBConstantGenerator.generate(state.getRandomly(), VoltDBCompositeDataType.getRandom(type));
@@ -519,6 +526,7 @@ public final class VoltDBExpressionGenerator
             columns = aggregateColumns;
             aggregateColumns = null; // no aggregate inside an aggregate
         }
+        inAggregate = true;
         try {
             List<VoltDBExpression> args;
             if (function != VoltDBAggregateFunction.COUNT) {
@@ -544,6 +552,7 @@ public final class VoltDBExpressionGenerator
             aggregated = true;
             return new VoltDBAggregate(args, function);
         } finally {
+            inAggregate = false;
             columns = groupingColumns;
             aggregateColumns = outerAggregateColumns;
         }
