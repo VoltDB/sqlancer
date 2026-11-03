@@ -310,7 +310,7 @@ public final class VoltDBExpressionGenerator
     private VoltDBExpression generateIsNull(int depth) {
         Kind kind = getRandomType();
         VoltDBExpression operand = hasOuterJoin && avoidKnownBugs ? generateLeafNode(kind)
-                : generateExpression(kind, depth + 1);
+                : withoutNot(generateExpression(kind, depth + 1));
         VoltDBUnaryPostfixOperator op = Randomly.fromOptions(VoltDBUnaryPostfixOperator.values());
         if (op == VoltDBUnaryPostfixOperator.IS_NULL && avoidKnownBugs) {
             return new VoltDBUnaryPrefixOperation(
@@ -597,12 +597,23 @@ public final class VoltDBExpressionGenerator
         return new VoltDBUnaryPrefixOperation(expr, VoltDBUnaryPrefixOperator.NOT);
     }
 
+    // ENG-30504: (NOT (K AND (x OR y))) IS NOT NULL fails too once the planner folds K away, so unless
+    // --avoid-known-bugs is false, the operand of IS [NOT] NULL loses its leading NOTs; (NOT q) IS NULL is q IS NULL
+    private VoltDBExpression withoutNot(VoltDBExpression expr) {
+        VoltDBExpression e = expr;
+        while (avoidKnownBugs && e instanceof VoltDBUnaryPrefixOperation && ((VoltDBUnaryPrefixOperation) e)
+                .getOperatorRepresentation().equals(VoltDBUnaryPrefixOperator.NOT.getTextRepresentation())) {
+            e = ((VoltDBUnaryPrefixOperation) e).getExpr();
+        }
+        return e;
+    }
+
     // ENG-30516: written NOT (p IS NOT NULL) unless --avoid-known-bugs is false, as in generateIsNull
     @Override
     public VoltDBExpression isNull(VoltDBExpression expr) {
         if (avoidKnownBugs) {
             return new VoltDBUnaryPrefixOperation(
-                    new VoltDBUnaryPostfixOperation(expr, VoltDBUnaryPostfixOperator.IS_NOT_NULL),
+                    new VoltDBUnaryPostfixOperation(withoutNot(expr), VoltDBUnaryPostfixOperator.IS_NOT_NULL),
                     VoltDBUnaryPrefixOperator.NOT);
         }
         return new VoltDBUnaryPostfixOperation(expr, VoltDBUnaryPostfixOperator.IS_NULL);
