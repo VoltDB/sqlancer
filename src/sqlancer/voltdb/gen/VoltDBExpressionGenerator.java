@@ -173,7 +173,7 @@ public final class VoltDBExpressionGenerator
                 // NOT (NOT (b OR c)), (NOT (b OR c)) IS NOT NULL or (NOT (b OR c)) = TRUE
                 return negated;
             }
-            return new VoltDBUnaryPrefixOperation(negated, VoltDBUnaryPrefixOperator.NOT);
+            return not(negated);
         case IS_NULL:
             return generateIsNull(depth);
         case BETWEEN:
@@ -583,7 +583,18 @@ public final class VoltDBExpressionGenerator
 
     @Override
     public VoltDBExpression negatePredicate(VoltDBExpression predicate) {
-        return new VoltDBUnaryPrefixOperation(predicate, VoltDBUnaryPrefixOperator.NOT);
+        return not(predicate);
+    }
+
+    // ENG-30504: NOT (NOT (x OR y)) also fails when the OR is hidden behind a constant that the join planner folds
+    // away, as in NOT (NOT ((1 = 1) AND (x OR y))), so unless --avoid-known-bugs is false NOT (NOT q) is written q,
+    // which is the same in three-valued logic
+    private VoltDBExpression not(VoltDBExpression expr) {
+        if (avoidKnownBugs && expr instanceof VoltDBUnaryPrefixOperation && ((VoltDBUnaryPrefixOperation) expr)
+                .getOperatorRepresentation().equals(VoltDBUnaryPrefixOperator.NOT.getTextRepresentation())) {
+            return ((VoltDBUnaryPrefixOperation) expr).getExpr();
+        }
+        return new VoltDBUnaryPrefixOperation(expr, VoltDBUnaryPrefixOperator.NOT);
     }
 
     // ENG-30516: written NOT (p IS NOT NULL) unless --avoid-known-bugs is false, as in generateIsNull
