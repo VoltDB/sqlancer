@@ -45,7 +45,7 @@ public class VoltDBTLPAggregateOracle implements TestOracle<VoltDBGlobalState> {
 
     public VoltDBTLPAggregateOracle(VoltDBGlobalState state, ExpectedErrors errors) {
         this.state = state;
-        this.gen = new VoltDBExpressionGenerator(state);
+        this.gen = new VoltDBExpressionGenerator(state).setUngroupedAggregates(true);
         this.errors = errors;
     }
 

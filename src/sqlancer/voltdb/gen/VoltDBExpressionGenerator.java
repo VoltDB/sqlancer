@@ -117,6 +117,8 @@ public final class VoltDBExpressionGenerator
     private boolean aggregated;
     // ENG-30531 (see setNoFullJoins)
     private boolean noFullJoins;
+    // ENG-30533 (see setUngroupedAggregates)
+    private boolean ungroupedAggregates;
 
     public VoltDBExpressionGenerator(VoltDBGlobalState state) {
         this.state = state;
@@ -520,7 +522,13 @@ public final class VoltDBExpressionGenerator
         try {
             List<VoltDBExpression> args;
             if (function != VoltDBAggregateFunction.COUNT) {
-                args = List.of(generateExpression(kind, 1));
+                VoltDBExpression arg = generateExpression(kind, 1);
+                if (avoidsMinMaxShortcut() && arg instanceof VoltDBColumnReference) {
+                    arg = kind == Kind.STRING
+                            ? new VoltDBBinaryOperation(arg, new VoltDBConstant("''"), VoltDBBinaryOperator.CONCAT)
+                            : new VoltDBBinaryOperation(arg, new VoltDBConstant("0"), VoltDBBinaryOperator.ADD);
+                }
+                args = List.of(arg);
             } else if (Randomly.getBoolean()) {
                 args = List.of(); // COUNT(*)
             } else {
@@ -573,8 +581,12 @@ public final class VoltDBExpressionGenerator
             anchor = fromTables.remove(fromTables.size() - 1);
         }
         List<VoltDBTable> explicitlyJoined = new ArrayList<>();
+        // with partitioned tables joined, a LEFT JOIN of a replicated table whose ON condition folds to FALSE is "not
+        // plannable" once a WHERE clause on that table makes it an inner join, and a FULL JOIN is left out for
+        // ENG-30531, so such a generator keeps replicated tables in the FROM list
+        boolean mayJoinReplicated = !(avoidKnownBugs && noFullJoins && !partitionJoined.isEmpty());
         for (VoltDBTable t : new ArrayList<>(fromTables)) {
-            if (Randomly.getBooleanWithRatherLowProbability()) {
+            if (mayJoinReplicated && Randomly.getBooleanWithRatherLowProbability()) {
                 fromTables.remove(t);
                 explicitlyJoined.add(t);
             }
@@ -591,8 +603,7 @@ public final class VoltDBExpressionGenerator
             // a chain of INNER JOINs with partitioned tables, where a replicated table's ON condition folds to FALSE,
             // loses the partitioning columns' equality ("This query is not plannable"); an outer join keeps it
             VoltDBJoin.JoinType type = partitionJoined.isEmpty() ? randomJoinType()
-                    : avoidKnownBugs && noFullJoins ? VoltDBJoin.JoinType.LEFT
-                            : Randomly.fromOptions(VoltDBJoin.JoinType.LEFT, VoltDBJoin.JoinType.FULL);
+                    : Randomly.fromOptions(VoltDBJoin.JoinType.LEFT, VoltDBJoin.JoinType.FULL);
             joins.add(new VoltDBJoin(new VoltDBTableReference(t), type, joinCondition(anchor, t)));
             all.addAll(t.getColumns());
         }
@@ -620,6 +631,20 @@ public final class VoltDBExpressionGenerator
     public VoltDBExpressionGenerator setNoFullJoins(boolean noFullJoins) {
         this.noFullJoins = noFullJoins;
         return this;
+    }
+
+    // ENG-30533: MIN or MAX of a column without GROUP BY, with a WHERE clause that makes it the leading column of a
+    // multi-column index's range, skips rows whose next index column is NULL. The shortcut applies to a bare column
+    // only, so unless --avoid-known-bugs is false, a generator of aggregates without GROUP BY writes a numeric column c
+    // as (c + 0) and a string column as (c || ''), and leaves out MIN and MAX of VARBINARY and temporal values, which
+    // have no such identity.
+    public VoltDBExpressionGenerator setUngroupedAggregates(boolean ungroupedAggregates) {
+        this.ungroupedAggregates = ungroupedAggregates;
+        return this;
+    }
+
+    private boolean avoidsMinMaxShortcut() {
+        return avoidKnownBugs && ungroupedAggregates;
     }
 
     // ENG-12656: an index lookup on a VARBINARY(n) column fails for a longer value, so unless --avoid-known-bugs is
@@ -718,7 +743,22 @@ public final class VoltDBExpressionGenerator
         if (groupable.isEmpty()) {
             throw new IgnoreMeException();
         }
-        return Randomly.nonEmptySubset(groupable).stream().map(VoltDBColumnReference::new).collect(Collectors.toList());
+        List<VoltDBColumn> grouping = Randomly.nonEmptySubset(groupable);
+        if (avoidKnownBugs) {
+            // ENG-30529: a multi-partition GROUP BY or DISTINCT groups by only one of two columns of the same name,
+            // such
+            // as t0.c0 and t1.c0; aliases avoid it only for columns in the SELECT list, so the grouping columns have
+            // distinct names
+            List<String> names = new ArrayList<>();
+            grouping = grouping.stream().filter(c -> {
+                if (names.contains(c.getName())) {
+                    return false;
+                }
+                names.add(c.getName());
+                return true;
+            }).collect(Collectors.toList());
+        }
+        return grouping.stream().map(VoltDBColumnReference::new).collect(Collectors.toList());
     }
 
     // 1 to 3 aggregates of random kinds
@@ -728,7 +768,8 @@ public final class VoltDBExpressionGenerator
             Kind kind;
             do {
                 kind = getRandomType();
-            } while (!canAggregate(kind));
+            } while (!canAggregate(kind)
+                    || avoidsMinMaxShortcut() && (kind == Kind.VARBINARY || kind == Kind.TEMPORAL));
             aggregates.add(generateAggregate(kind));
         } while (aggregates.size() < 3 && Randomly.getBooleanWithRatherLowProbability());
         return aggregates;
@@ -777,8 +818,8 @@ public final class VoltDBExpressionGenerator
         return not(predicate);
     }
 
-    // ENG-30529: a multi-partition GROUP BY or DISTINCT groups by only one of two output columns of the same name, such
-    // as t0.c0 and t1.c0, unless --avoid-known-bugs is false, every output column is given its own alias
+    // ENG-30529 (see generateGroupingColumns): unless --avoid-known-bugs is false, every output column of a GROUP BY or
+    // DISTINCT query is also given its own alias
     public List<VoltDBExpression> aliased(List<VoltDBExpression> fetchColumns) {
         if (!avoidKnownBugs) {
             return fetchColumns;

@@ -310,6 +310,7 @@ Each is listed in `VoltDBErrors` with its reason. The run fails on any other err
 | SELECT | `Invalid result value` | A FLOAT result is infinite or NaN. |
 | SELECT | `will overflow BigInt storage`, `causing overflow/underflow`, `out of range for the destination type` | Integer, DECIMAL or cast overflow. |
 | SELECT | `Numeric conversion error to type DECIMAL` | DECIMAL overflow in an expression of constants, which the planner folds. The message quotes a truncated value. |
+| SELECT | `has more than 38 digits of precision` | The same, when the folded value has more digits than DECIMAL holds. |
 | SELECT | `Character I is neither a decimal digit number` | FLOAT overflow to infinity in an expression of constants, which the parser folds (ENG-30522: an internal error instead of "Invalid result value"). |
 
 The two NoREC queries can evaluate an expression on different rows (the optimized query may skip rows through an index
@@ -369,9 +370,10 @@ The bugs below were found while building the TLP DISTINCT, HAVING and AGGREGATE 
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
-| ENG-30529 | A multi-partition GROUP BY or DISTINCT groups by only one of two output columns with the same name, such as `t0.c0` and `t1.c0`, merging groups. Found while checking the SQL these oracles generate. Wrong rows. | Every output column of a DISTINCT or GROUP BY query has its own alias (`AS a0`, `AS a1`, ...). |
+| ENG-30529 | A multi-partition GROUP BY or DISTINCT groups by only one of two columns with the same name, such as `t0.c0` and `t1.c0`, merging groups. Found while checking the SQL these oracles generate; TLP HAVING found the form where the grouped columns are not selected. Wrong rows. | Grouping and DISTINCT columns have distinct names, and every output column of such a query has its own alias (`AS a0`, `AS a1`, ...). |
 | ENG-30530 | GROUP BY or DISTINCT on the partitioning column of a table an outer join null-extends returns one NULL group per partition, because the planner leaves out the coordinator's aggregation. Found by TLP DISTINCT. Wrong rows. | With an outer join, partitioning columns are not grouped by. |
-| ENG-30531 | GROUP BY or DISTINCT on an indexed column, inlined into a FULL JOIN as a serial aggregation, returns the NULL group twice: the null-extended rows come after the index-ordered ones. Related to the closed ENG-13603. Found by TLP DISTINCT in the 30-minute acceptance run. Wrong rows. | TLP DISTINCT and TLP HAVING make no FULL JOINs. |
+| ENG-30531 | GROUP BY or DISTINCT on an indexed column, inlined into a FULL JOIN as a serial aggregation, returns the NULL group twice: the null-extended rows come after the index-ordered ones. Related to the closed ENG-13603. Found by TLP DISTINCT in the 30-minute acceptance run. Wrong rows. | TLP DISTINCT and TLP HAVING make no FULL JOINs. Where partitioned tables are joined, they also keep replicated tables in the FROM list rather than joining them, since a LEFT JOIN there can be "not plannable" (see the join rule above). |
+| ENG-30533 | MIN or MAX of a column without GROUP BY, with a WHERE clause on that column as the leading column of a multi-column index, skips rows whose next index column is NULL: with an index on `(a, b)` and the row `(5, NULL)`, `MIN(a) WHERE a = 5` is NULL. Found by TLP AGGREGATE in the 30-minute acceptance run. Wrong result. | TLP AGGREGATE writes a numeric column `c` as `(c + 0)` and a string column as `(c \|\| '')`, which the shortcut does not apply to, and leaves out MIN and MAX of VARBINARY and temporal values. |
 | ENG-30504 | In a HAVING clause, `NOT (a OR b)` fails with the BOOLEAN cast error even as the whole clause (commented on the ticket). Found by TLP HAVING. | TLP HAVING's `NOT p` partition pushes the NOT down: `NOT (a OR b)` becomes `(NOT a) AND (NOT b)`. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
