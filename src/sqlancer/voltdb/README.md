@@ -4,9 +4,9 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 3.** The provider creates schemas and data and runs two logic-bug oracles: NoREC (the default,
+**Status: milestone 4.** The provider creates schemas and data and runs two logic-bug oracles: NoREC (the default,
 milestone 2) and TLP WHERE (milestone 3). `SMOKE`, from milestone 1, only reads every table and checks that the queries
-succeed.
+succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a cluster, runs SQLancer against it and saves the results.
 
 ## Versions
 
@@ -27,7 +27,62 @@ mvn package -DskipTests
 
 The jar is `target/sqlancer-*.jar`, with its dependencies in `target/lib`.
 
-## Start a VoltDB server
+## Run everything with one script
+
+`voltdb/run-sqlancer.sh`, at the top of the repository, does a whole run:
+1. It starts a VoltDB cluster on this machine from a kit or build.
+2. It runs SQLancer against the cluster for a set time with a fixed seed.
+3. It stops the cluster and saves everything to one directory.
+
+It builds SQLancer first if `target/` has no jar.
+
+```bash
+# one node, 8 sites per host, NoREC and TLP WHERE for 30 minutes
+voltdb/run-sqlancer.sh --voltdb ~/workspace/VoltDB/internal --seed 20261103
+
+# three nodes with k-safety 1, one hour, reduce failures
+voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 --use-reducer
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--voltdb DIR` | `$VOLTDB_HOME` | A VoltDB kit or build: the directory holding `bin/voltdb`. |
+| `--nodes N` | 1 | Nodes, all on this machine. |
+| `--kfactor K` | 0 for one node, else 1 | K-safety. |
+| `--sites N` | 8 | Sites per host. |
+| `--oracle LIST` | `NOREC,TLP_WHERE` | Comma-separated oracles. With several, each thread takes turns among them. |
+| `--duration SECS` | 1800 | How long SQLancer runs. |
+| `--seed N` | the current time | The random seed. It is in the manifest either way, so any run can be repeated. |
+| `--threads N` | 4 | SQLancer threads. |
+| `--queries N` | 100 | Oracle checks per generated database. |
+| `--port-base N` | 52000 | The cluster's first port. Node *i* uses the 6 ports from N + 10*i (client, admin, internal, zookeeper, replication, metrics). The script refuses to start if any is in use, and it never touches other servers. |
+| `--results DIR` | `./sqlancer-results` | Where the run's directory is created. |
+| `--use-reducer` | off | Reduce each failure before saving it (see [Reducing a failure](#reducing-a-failure)). |
+| `--keep-cluster` | off | Leave the cluster running, with its data, after the run. |
+| `-- ...` | | Everything after `--` goes to the provider, for example `-- --avoid-known-bugs false`. |
+
+The exit code is 0 for PASS, 1 for FAIL, and 2 when the run could not be set up (bad options, a busy port, a cluster
+that did not start). Each run writes `<results>/sqlancer-<UTC time>-seed<N>/`:
+
+| Path | Contents |
+| --- | --- |
+| `summary.txt` | `RESULT: PASS` or `FAIL`, the progress line, and the oracle's report for each failed database. |
+| `manifest.txt` | Run id, host, command line, SQLancer commit, VoltDB version, Java version, cluster shape and ports, oracles, duration, seed and threads. |
+| `run.log` | The script's own steps. |
+| `deployment.xml` | The cluster's configuration. |
+| `servers/node<i>/` | Each node's `volt.log` and its `voltdb init` and `voltdb start` output. |
+| `sqlancer/` | SQLancer's output (`out.log`) and its `logs/voltdb/` directory (see [Reading the results](#reading-the-results)). |
+| `reproductions/` | The log of each database whose thread failed: the statements that set it up, then the failing queries. With `--use-reducer`, these are reduced, and `<db>-reduce.log` shows the steps. |
+
+A run FAILs if any of these happens:
+- SQLancer exits non-zero, or any thread fails.
+- A node is down at the end.
+- A server log has a FATAL line.
+
+The cluster's data is deleted after the logs are copied, unless `--keep-cluster` is given. Several runs can share a
+machine if each has its own `--port-base`.
+
+## Start a VoltDB server by hand
 
 The provider needs a server with security disabled. Several sites per host exercise partitioned execution on one
 machine:
