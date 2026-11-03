@@ -100,6 +100,16 @@ The exit code is 0 when no thread failed. To reproduce a failure, start from an 
 A TLP WHERE failure ends with the original query, the partition queries, and the rows that only one side returned
 ("the rows of these queries mismatch").
 
+### Reducing a failure
+
+Add `--use-reducer` (a SQLancer option, before `voltdb`) to have SQLancer reduce each failure before reporting it. It
+reruns the database's statements on an empty prefix, leaving out one at a time (or a chunk), and keeps a statement only
+if the failure no longer happens without it. The reduced statements replace the originals in `<db>.log`, and
+`logs/voltdb/reduce/<db>-reduce.log` records each step. Both TLP WHERE and NoREC support it, for wrong rows and for
+unexpected errors. The reducer removes statements but does not simplify the failing query itself, so check the
+remaining query by hand: drop its parts while the failure persists, then retry it on fresh tables without SQLancer's
+naming before filing.
+
 A NoREC failure ends with the two queries, `-- optimized:` and `-- unoptimized:`, and either the two counts that differ
 ("the row counts of the following queries mismatch") or the unexpected error.
 
