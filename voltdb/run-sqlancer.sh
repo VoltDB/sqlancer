@@ -134,7 +134,10 @@ stop_cluster() {
         return 0
     fi
     log "Stopping the cluster"
-    "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port 0)" >>"$results/run.log" 2>&1
+    # by port only once this run's node 0 is known to be up, so that it cannot reach another server on that port
+    if grep -q "Server completed initialization" "$cluster/node0/voltdbroot/log/volt.log" 2>/dev/null; then
+        "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port 0)" >>"$results/run.log" 2>&1
+    fi
     # only processes started for this run carry its directory on their command line
     for _ in $(seq 1 30); do
         pgrep -f "$cluster/" >/dev/null || break
