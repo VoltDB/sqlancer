@@ -115,6 +115,8 @@ public final class VoltDBExpressionGenerator
     // whether an aggregate was generated
     private List<VoltDBColumn> aggregateColumns;
     private boolean aggregated;
+    // ENG-30531 (see setNoFullJoins)
+    private boolean noFullJoins;
 
     public VoltDBExpressionGenerator(VoltDBGlobalState state) {
         this.state = state;
@@ -589,7 +591,8 @@ public final class VoltDBExpressionGenerator
             // a chain of INNER JOINs with partitioned tables, where a replicated table's ON condition folds to FALSE,
             // loses the partitioning columns' equality ("This query is not plannable"); an outer join keeps it
             VoltDBJoin.JoinType type = partitionJoined.isEmpty() ? randomJoinType()
-                    : Randomly.fromOptions(VoltDBJoin.JoinType.LEFT, VoltDBJoin.JoinType.FULL);
+                    : avoidKnownBugs && noFullJoins ? VoltDBJoin.JoinType.LEFT
+                            : Randomly.fromOptions(VoltDBJoin.JoinType.LEFT, VoltDBJoin.JoinType.FULL);
             joins.add(new VoltDBJoin(new VoltDBTableReference(t), type, joinCondition(anchor, t)));
             all.addAll(t.getColumns());
         }
@@ -602,10 +605,21 @@ public final class VoltDBExpressionGenerator
     // as its index range, dropping rows; unless --avoid-known-bugs is false, joins are INNER, LEFT or FULL (a RIGHT
     // JOIN is a LEFT JOIN with the tables swapped)
     private VoltDBJoin.JoinType randomJoinType() {
+        if (avoidKnownBugs && noFullJoins) {
+            return Randomly.fromOptions(VoltDBJoin.JoinType.INNER, VoltDBJoin.JoinType.LEFT);
+        }
         if (avoidKnownBugs) {
             return Randomly.fromOptions(VoltDBJoin.JoinType.INNER, VoltDBJoin.JoinType.LEFT, VoltDBJoin.JoinType.FULL);
         }
         return VoltDBJoin.JoinType.getRandom();
+    }
+
+    // ENG-30531: GROUP BY or DISTINCT on an indexed column, inlined into a FULL JOIN as a serial aggregation, returns
+    // the NULL group twice, as the null-extended rows come after the index-ordered ones. Unless --avoid-known-bugs is
+    // false, a generator for such queries makes no FULL JOINs.
+    public VoltDBExpressionGenerator setNoFullJoins(boolean noFullJoins) {
+        this.noFullJoins = noFullJoins;
+        return this;
     }
 
     // ENG-12656: an index lookup on a VARBINARY(n) column fails for a longer value, so unless --avoid-known-bugs is

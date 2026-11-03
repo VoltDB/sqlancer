@@ -60,7 +60,7 @@ public class VoltDBTLPOracle implements TestOracle<VoltDBGlobalState> {
     public VoltDBTLPOracle(VoltDBGlobalState state, ExpectedErrors errors, Mode mode) {
         this.mode = mode;
         this.state = state;
-        this.gen = new VoltDBExpressionGenerator(state);
+        this.gen = new VoltDBExpressionGenerator(state).setNoFullJoins(mode != Mode.WHERE);
         this.errors = errors;
     }
 
@@ -179,7 +179,8 @@ public class VoltDBTLPOracle implements TestOracle<VoltDBGlobalState> {
             return new Result(original, combined);
         }
 
-        // each row as its values joined with " | ", a NULL as NULL
+        // each row as its values joined with " | ", a NULL as null, and a FLOAT to 12 significant digits: a FLOAT SUM
+        // in a HAVING query's output adds the same values in an order that can differ between the queries
         private List<String> rows(VoltDBGlobalState s, String sql) throws SQLException {
             SQLQueryAdapter q = new SQLQueryAdapter(sql, errors);
             List<String> rows = new ArrayList<>();
@@ -190,7 +191,9 @@ public class VoltDBTLPOracle implements TestOracle<VoltDBGlobalState> {
                 while (rs.next()) {
                     List<String> values = new ArrayList<>();
                     for (int i = 1; i <= columns; i++) {
-                        values.add(String.valueOf(rs.getString(i)));
+                        Object value = rs.getObject(i);
+                        values.add(value instanceof Double ? String.format("%.12g", value)
+                                : String.valueOf(rs.getString(i)));
                     }
                     rows.add(String.join(" | ", values));
                 }

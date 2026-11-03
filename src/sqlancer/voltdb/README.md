@@ -248,7 +248,8 @@ as one `UNION` query.
 to 3 aggregates, and sometimes has a WHERE clause. Each partition adds `HAVING p`, `HAVING NOT p` or `HAVING p IS
 NULL`, where `p` is a predicate over the grouping columns and aggregates (MIN, MAX, SUM and COUNT of expressions over
 the FROM clause's columns). Every group makes `p` exactly one of TRUE, FALSE or NULL, so the partitions' rows must equal
-the original's. VoltDB requires an aggregate in a HAVING clause, so `p` always has one.
+the original's. VoltDB requires an aggregate in a HAVING clause, so `p` always has one. FLOAT values in the rows are
+compared to 12 significant digits, since a FLOAT SUM adds the same values in an order that can differ between queries.
 
 **TLP AGGREGATE** (`oracle/VoltDBTLPAggregateOracle`) checks aggregation. The original query computes 1 to 3 of MIN,
 MAX, SUM, COUNT(x) and COUNT(*) over all rows, with no GROUP BY. Each partition computes the same with `WHERE p`,
@@ -370,6 +371,7 @@ The bugs below were found while building the TLP DISTINCT, HAVING and AGGREGATE 
 | --- | --- | --- |
 | ENG-30529 | A multi-partition GROUP BY or DISTINCT groups by only one of two output columns with the same name, such as `t0.c0` and `t1.c0`, merging groups. Found while checking the SQL these oracles generate. Wrong rows. | Every output column of a DISTINCT or GROUP BY query has its own alias (`AS a0`, `AS a1`, ...). |
 | ENG-30530 | GROUP BY or DISTINCT on the partitioning column of a table an outer join null-extends returns one NULL group per partition, because the planner leaves out the coordinator's aggregation. Found by TLP DISTINCT. Wrong rows. | With an outer join, partitioning columns are not grouped by. |
+| ENG-30531 | GROUP BY or DISTINCT on an indexed column, inlined into a FULL JOIN as a serial aggregation, returns the NULL group twice: the null-extended rows come after the index-ordered ones. Related to the closed ENG-13603. Found by TLP DISTINCT in the 30-minute acceptance run. Wrong rows. | TLP DISTINCT and TLP HAVING make no FULL JOINs. |
 | ENG-30504 | In a HAVING clause, `NOT (a OR b)` fails with the BOOLEAN cast error even as the whole clause (commented on the ticket). Found by TLP HAVING. | TLP HAVING's `NOT p` partition pushes the NOT down: `NOT (a OR b)` becomes `(NOT a) AND (NOT b)`. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
