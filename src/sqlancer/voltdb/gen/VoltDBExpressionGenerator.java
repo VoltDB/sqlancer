@@ -102,6 +102,8 @@ public final class VoltDBExpressionGenerator
     private List<VoltDBTable> fromTables = new ArrayList<>();
     private List<VoltDBJoin> joins = new ArrayList<>();
     private boolean hasOuterJoin;
+    // whether the FROM clause reads only replicated tables, which VoltDB can combine with UNION ALL
+    private boolean replicatedOnly;
     // ENG-30513: which numeric types the current comparison draws its operands from (see inNumericDomain)
     private NumericDomain numericDomain = NumericDomain.ANY;
     // how many comparison or IN operands enclose the expression being generated
@@ -500,6 +502,7 @@ public final class VoltDBExpressionGenerator
             }
             // a partitioned table whose partitioning column cannot be compared with the anchor's is left out
         }
+        replicatedOnly = anchor == null;
         if (anchor == null) {
             anchor = fromTables.remove(fromTables.size() - 1);
         }
@@ -583,9 +586,24 @@ public final class VoltDBExpressionGenerator
         return new VoltDBUnaryPrefixOperation(predicate, VoltDBUnaryPrefixOperator.NOT);
     }
 
+    // ENG-30516: written NOT (p IS NOT NULL) unless --avoid-known-bugs is false, as in generateIsNull
     @Override
     public VoltDBExpression isNull(VoltDBExpression expr) {
+        if (avoidKnownBugs) {
+            return new VoltDBUnaryPrefixOperation(
+                    new VoltDBUnaryPostfixOperation(expr, VoltDBUnaryPostfixOperator.IS_NOT_NULL),
+                    VoltDBUnaryPrefixOperator.NOT);
+        }
         return new VoltDBUnaryPostfixOperation(expr, VoltDBUnaryPostfixOperator.IS_NULL);
+    }
+
+    // a random non-empty subset of the columns of the FROM clause, in random order
+    public List<VoltDBExpression> generateFetchColumns() {
+        return Randomly.nonEmptySubset(columns).stream().map(VoltDBColumnReference::new).collect(Collectors.toList());
+    }
+
+    public boolean isReplicatedOnly() {
+        return replicatedOnly;
     }
 
     // A WHERE predicate always references a column. VoltDB does not support a join filter that depends on none of the

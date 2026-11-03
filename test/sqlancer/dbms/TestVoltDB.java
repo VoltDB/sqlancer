@@ -28,4 +28,13 @@ public class TestVoltDB {
                         "--oracle", "NOREC" }));
     }
 
+    @Test
+    public void testVoltDBTLPWhere() {
+        assumeTrue(TestConfig.isEnvironmentTrue(TestConfig.VOLTDB_ENV));
+        assertEquals(0,
+                Main.executeMain(new String[] { "--random-seed", "0", "--timeout-seconds", TestConfig.SECONDS,
+                        "--num-threads", "2", "--num-queries", "100", "--username", "", "--password", "", "voltdb",
+                        "--oracle", "TLP_WHERE" }));
+    }
+
 }

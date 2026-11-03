@@ -7,6 +7,7 @@ import sqlancer.common.query.ExpectedErrors;
 import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 import sqlancer.voltdb.gen.VoltDBExpressionGenerator;
 import sqlancer.voltdb.oracle.VoltDBSmokeOracle;
+import sqlancer.voltdb.oracle.VoltDBTLPWhereOracle;
 
 public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
 
@@ -31,6 +32,19 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
             ExpectedErrors errors = ExpectedErrors.newErrors().build();
             VoltDBErrors.addExpressionErrors(errors);
             return new NoRECOracle<>(globalState, new VoltDBExpressionGenerator(globalState), errors);
+        }
+    },
+
+    /**
+     * Checks that a query returns the same rows as the union of the three queries that add WHERE p, WHERE NOT p and
+     * WHERE p IS NULL for a random predicate p (Ternary Logic Partitioning).
+     */
+    TLP_WHERE {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            ExpectedErrors errors = ExpectedErrors.newErrors().build();
+            VoltDBErrors.addExpressionErrors(errors);
+            return new VoltDBTLPWhereOracle(globalState, errors);
         }
     }
 

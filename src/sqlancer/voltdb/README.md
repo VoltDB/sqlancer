@@ -4,9 +4,9 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 2.** The provider creates schemas and data and runs the NoREC logic-bug oracle (the default).
-`SMOKE`, from milestone 1, only reads every table and checks that the queries succeed. TLP WHERE comes next
-(milestone 3).
+**Status: milestone 3.** The provider creates schemas and data and runs two logic-bug oracles: NoREC (the default,
+milestone 2) and TLP WHERE (milestone 3). `SMOKE`, from milestone 1, only reads every table and checks that the queries
+succeed.
 
 ## Versions
 
@@ -63,12 +63,12 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | --- | --- |
 | `--num-threads`, `--num-tries` | Threads that run at once, and how many run in total. Use the same number for both. Every thread is one SQLancer "database". VoltDB runs one DDL statement at a time, so more than about 4 threads mostly wait. |
 | `--timeout-seconds` | How long the run lasts. |
-| `--num-queries` | Oracle checks per database before a thread drops it and generates a new one. 100 suits NoREC; with `SMOKE`, keep it small so schemas keep changing. |
+| `--num-queries` | Oracle checks per database before a thread drops it and generates a new one. 100 suits NoREC and TLP WHERE; with `SMOKE`, keep it small so schemas keep changing. |
 | `--random-seed` | Thread *n* uses seed + *n*. A seed and the same server state give the same statements, but thread timing is not deterministic. |
 | `--username`, `--password` | Empty for a server without security (SQLancer's default is `sqlancer`). |
 | `--host`, `--port` | A server's client port. Defaults: localhost, 21212. |
 | `--database-prefix` | Prefix of each thread's table names. Default `database`; `db` keeps the logs short. |
-| `--oracle` | `NOREC` (the default) or `SMOKE`. |
+| `--oracle` | `NOREC` (the default), `TLP_WHERE` or `SMOKE`. |
 | `--max-num-tables` | Tables per database, 1 to this (default 3). |
 | `--max-num-indexes` | CREATE INDEX statements per database, 0 to this (default 4). |
 | `--retry-seconds` | How long a statement rejected because of another thread's schema change is retried (default 120). |
@@ -96,6 +96,9 @@ Logs are in `logs/voltdb/` under the directory you run from:
 
 The exit code is 0 when no thread failed. To reproduce a failure, start from an empty server and run the statements in
 `<db>.log` in order (with `sqlcmd`, for example).
+
+A TLP WHERE failure ends with the original query, the partition queries, and the rows that only one side returned
+("the rows of these queries mismatch").
 
 A NoREC failure ends with the two queries, `-- optimized:` and `-- unoptimized:`, and either the two counts that differ
 ("the row counts of the following queries mismatch") or the unexpected error.
@@ -130,6 +133,36 @@ supports:
   IN predicate is never the operand of a comparison or another IN (`x = (y IN (1))` is a syntax error).
 - **Every WHERE clause references a column.** VoltDB does not support a join filter that depends on none of the joined
   tables.
+
+## The TLP WHERE oracle
+
+Ternary Logic Partitioning ([Rigger and Su, 2020](https://doi.org/10.1145/3428279)) relies on every row making a
+predicate exactly one of TRUE, FALSE or NULL. A query without a WHERE clause must therefore return the same rows as
+the three queries that add `WHERE p`, `WHERE NOT p` and `WHERE p IS NULL`:
+
+```sql
+-- original
+SELECT t1.c2, t0.c0 FROM t0, t1 LEFT JOIN t2 ON ...;
+-- partitions
+SELECT t1.c2, t0.c0 FROM t0, t1 LEFT JOIN t2 ON ... WHERE p;
+SELECT t1.c2, t0.c0 FROM t0, t1 LEFT JOIN t2 ON ... WHERE NOT p;
+SELECT t1.c2, t0.c0 FROM t0, t1 LEFT JOIN t2 ON ... WHERE NOT (p IS NOT NULL);
+```
+
+Unlike NoREC, it compares values, not just counts, so it also catches a query that returns the right number of
+wrong rows. The predicate `p`, the FROM clause and the joins come from the same generator as NoREC's, with the same
+rules and known-bug workarounds. The fetched columns are a random subset of the FROM clause's columns, and sometimes
+the partitions have an ORDER BY.
+
+`oracle/VoltDBTLPWhereOracle` differs from SQLancer's shared `TLPWhereOracle` in two ways:
+
+- **UNION ALL only over replicated tables.** VoltDB does not run a set operation over partitioned tables ("Statements
+  are too complex in set"), so when the query reads one, the three partitions run as separate queries. Over replicated
+  tables alone they run as one `UNION ALL` query, which exercises VoltDB's set operations too.
+- **Whole rows.** The two sides are compared as multisets of whole rows. The shared oracle compares the set of values
+  in the first column only.
+
+An expected error in any of the queries skips the check, as for NoREC.
 
 ## How the provider maps SQLancer onto VoltDB
 
@@ -184,7 +217,7 @@ index ..." at WARN. The statement succeeds, so the provider ignores it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30489 | Closing a JDBC connection twice closes the client every other connection to the same URL shares, failing their in-flight calls. SQLancer closes each connection twice. | `VoltDBConnection.close()` is idempotent. |
-| ENG-4643 | JDBC `getString` on a NULL returns the type's NULL sentinel (INTEGER, TINYINT, FLOAT) or throws (DECIMAL, BOOLEAN, DATE, TIMESTAMP). | Not needed: NoREC reads only counts. TLP compares values and will need one. |
+| ENG-4643 | JDBC `getString` on a NULL returns the type's NULL sentinel (INTEGER, TINYINT, FLOAT) or throws (DECIMAL, BOOLEAN, DATE, TIMESTAMP). | The connection wraps every result set so that `getString` checks `wasNull()` and returns null for a NULL. |
 | ENG-12656 | An index scan for `<`, `<=`, `>`, `>=` or BETWEEN on a VARBINARY(n) column, and for `=` when the column leads a multi-column unique index, fails ("Type VARCHAR can't be cast as VARBINARY") when the value, a constant or another table's column, is longer than n bytes. Found again by NoREC. | While `--avoid-known-bugs` is true, VARBINARY values are never compared with `<`, `>`, `<=`, `>=` or BETWEEN, a VARBINARY comparison has a constant on one side, VARBINARY constants are at most one byte, and VARBINARY partitioning columns are joined only when their sizes match. |
 | ENG-22880 | A BIGINT literal at the type's minimum is stored as NULL instead of rejected. A FLOAT at -1.7976931348623157E308 and an INTEGER expression equal to INTEGER's minimum do the same. | Never generated. |
 
@@ -214,7 +247,7 @@ avoids each one as described; set it to false to check whether a fix works.
 | ENG-30513 | Comparing a FLOAT with a DECIMAL of magnitude 2^63 or more gives wrong results; the DECIMAL appears to wrap through a 64-bit integer. Such DECIMALs come from the data and from arithmetic. | A numeric comparison, BETWEEN or IN uses only FLOAT operands or only exact ones (integers and DECIMAL). |
 | ENG-30514 | A primary key column that is not declared NOT NULL accepts NULL, but the planner assumes it is never NULL: `LEFT JOIN t ON ... WHERE t.pk IS NULL` drops the ON condition. Wrong rows. | Primary key columns are NOT NULL. |
 | ENG-30515 | INDEX COUNT clamps a bound above the column type's range to the type's maximum and misses rows holding it: TINYINT `c < 32767` does not count 127. | Constants in ordered numeric comparisons and BETWEEN lie between -126 and 126. |
-| ENG-30516 | `WHERE c IS NULL AND c = 5` on an indexed column drops the IS NULL when `c = 5` becomes the index lookup. Wrong rows. | IS NULL is written `NOT (x IS NOT NULL)`. |
+| ENG-30516 | `WHERE c IS NULL AND c = 5` on an indexed column drops the IS NULL when `c = 5` becomes the index lookup. Wrong rows. | IS NULL is written `NOT (x IS NOT NULL)`, in the predicate and in TLP's third partition. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
