@@ -12,6 +12,16 @@ import sqlancer.voltdb.VoltDBToStringVisitor;
 public class VoltDBSelect extends SelectBase<VoltDBExpression>
         implements VoltDBExpression, Select<VoltDBJoin, VoltDBExpression, VoltDBTable, VoltDBColumn> {
 
+    private boolean distinct;
+
+    public boolean isDistinct() {
+        return distinct;
+    }
+
+    public void setDistinct(boolean distinct) {
+        this.distinct = distinct;
+    }
+
     @Override
     public void setJoinClauses(List<VoltDBJoin> joinStatements) {
         setJoinList(joinStatements.stream().map(j -> (VoltDBExpression) j).collect(Collectors.toList()));

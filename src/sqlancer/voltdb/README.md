@@ -4,9 +4,10 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 4.** The provider creates schemas and data and runs two logic-bug oracles: NoREC (the default,
-milestone 2) and TLP WHERE (milestone 3). `SMOKE`, from milestone 1, only reads every table and checks that the queries
-succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a cluster, runs SQLancer against it and saves the results.
+**Status: milestone 5.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+milestone 2), TLP WHERE (milestone 3), and TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5). `SMOKE`, from
+milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
+cluster, runs SQLancer against it and saves the results.
 
 ## Versions
 
@@ -50,7 +51,7 @@ voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 -
 | `--nodes N` | 1 | Nodes, all on this machine. |
 | `--kfactor K` | 0 for one node, else 1 | K-safety. |
 | `--sites N` | 8 | Sites per host. |
-| `--oracle LIST` | `NOREC,TLP_WHERE` | Comma-separated oracles. With several, each thread takes turns among them. |
+| `--oracle LIST` | `NOREC,TLP_WHERE` | Comma-separated oracles, for example `NOREC,TLP_WHERE,TLP_DISTINCT,TLP_HAVING,TLP_AGGREGATE`. With several, each thread takes turns among them. |
 | `--duration SECS` | 1800 | How long SQLancer runs. |
 | `--seed N` | the current time | The random seed. It is in the manifest either way, so any run can be repeated. |
 | `--threads N` | 4 | SQLancer threads. |
@@ -123,7 +124,7 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | `--username`, `--password` | Empty for a server without security (SQLancer's default is `sqlancer`). |
 | `--host`, `--port` | A server's client port. Defaults: localhost, 21212. |
 | `--database-prefix` | Prefix of each thread's table names. Default `database`; `db` keeps the logs short. |
-| `--oracle` | `NOREC` (the default), `TLP_WHERE` or `SMOKE`. |
+| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE` or `SMOKE`; several are comma-separated. |
 | `--max-num-tables` | Tables per database, 1 to this (default 3). |
 | `--max-num-indexes` | CREATE INDEX statements per database, 0 to this (default 4). |
 | `--retry-seconds` | How long a statement rejected because of another thread's schema change is retried (default 120). |
@@ -152,15 +153,17 @@ Logs are in `logs/voltdb/` under the directory you run from:
 The exit code is 0 when no thread failed. To reproduce a failure, start from an empty server and run the statements in
 `<db>.log` in order (with `sqlcmd`, for example).
 
-A TLP WHERE failure ends with the original query, the partition queries, and the rows that only one side returned
-("the rows of these queries mismatch").
+A TLP WHERE, DISTINCT or HAVING failure ends with the original query, the partition queries, and the rows that only one
+side returned ("the rows of these queries mismatch"). A TLP AGGREGATE failure ends with the queries, the original
+query's aggregates, the ones combined from the partitions, and each partition's own ("the aggregates of these queries
+mismatch").
 
 ### Reducing a failure
 
 Add `--use-reducer` (a SQLancer option, before `voltdb`) to have SQLancer reduce each failure before reporting it. It
 reruns the database's statements on an empty prefix, leaving out one at a time (or a chunk), and keeps a statement only
 if the failure no longer happens without it. The reduced statements replace the originals in `<db>.log`, and
-`logs/voltdb/reduce/<db>-reduce.log` records each step. Both TLP WHERE and NoREC support it, for wrong rows and for
+`logs/voltdb/reduce/<db>-reduce.log` records each step. Every oracle but SMOKE supports it, for wrong results and for
 unexpected errors. The reducer removes statements but does not simplify the failing query itself, so check the
 remaining query by hand: drop its parts while the failure persists, then retry it on fresh tables without SQLancer's
 naming before filing.
@@ -220,7 +223,7 @@ wrong rows. The predicate `p`, the FROM clause and the joins come from the same 
 rules and known-bug workarounds. The fetched columns are a random subset of the FROM clause's columns, and sometimes
 the partitions have an ORDER BY.
 
-`oracle/VoltDBTLPWhereOracle` differs from SQLancer's shared `TLPWhereOracle` in two ways:
+`oracle/VoltDBTLPOracle` differs from SQLancer's shared `TLPWhereOracle` in two ways:
 
 - **UNION ALL only over replicated tables.** VoltDB does not run a set operation over partitioned tables ("Statements
   are too complex in set"), so when the query reads one, the three partitions run as separate queries. Over replicated
@@ -229,6 +232,36 @@ the partitions have an ORDER BY.
   in the first column only.
 
 An expected error in any of the queries skips the check, as for NoREC.
+
+## The TLP DISTINCT, HAVING and AGGREGATE oracles
+
+These apply the same partitioning to other parts of a query, as in the TLP paper. All three use the FROM clauses, joins
+and predicates of TLP WHERE.
+
+**TLP DISTINCT** (`oracle/VoltDBTLPOracle`, mode `DISTINCT`) checks duplicate elimination. The original query is a
+`SELECT DISTINCT` of some columns or, half the time, the same columns with `GROUP BY` and no aggregate. Each partition
+adds `WHERE p`, `WHERE NOT p` or `WHERE p IS NULL`. A row can come from more than one partition, so the partitions'
+rows, without duplicates, must equal the original's, which must have none. Over replicated tables, the partitions run
+as one `UNION` query.
+
+**TLP HAVING** (mode `HAVING`) checks groups. The original query groups by some columns, selects some of them and 1
+to 3 aggregates, and sometimes has a WHERE clause. Each partition adds `HAVING p`, `HAVING NOT p` or `HAVING p IS
+NULL`, where `p` is a predicate over the grouping columns and aggregates (MIN, MAX, SUM and COUNT of expressions over
+the FROM clause's columns). Every group makes `p` exactly one of TRUE, FALSE or NULL, so the partitions' rows must equal
+the original's. VoltDB requires an aggregate in a HAVING clause, so `p` always has one.
+
+**TLP AGGREGATE** (`oracle/VoltDBTLPAggregateOracle`) checks aggregation. The original query computes 1 to 3 of MIN,
+MAX, SUM, COUNT(x) and COUNT(*) over all rows, with no GROUP BY. Each partition computes the same with `WHERE p`,
+`WHERE NOT p` or `WHERE p IS NULL`. Combined, the partitions must give the original's values: the least of the MINs,
+the greatest of the MAXes, and the sum of the SUMs and of the COUNTs.
+
+- **Combined in Java.** The shared oracles combine the partitions in SQL, as an outer aggregate over a `UNION ALL`,
+  which VoltDB rejects over partitioned tables. This oracle combines them in Java for every query.
+- **Exact where VoltDB is.** Integer and DECIMAL SUMs are added exactly. FLOAT SUMs may differ by a relative 1e-9, as
+  they add the same values in a different order. VARCHAR values are ordered by their UTF-8 bytes, VARBINARY by their
+  bytes.
+- **Left out.** AVG cannot be combined from the partitions' AVGs. MIN and MAX of BOOLEAN values are left out because of
+  ENG-30493.
 
 ## How the provider maps SQLancer onto VoltDB
 
@@ -256,6 +289,12 @@ These are VoltDB rules, not bugs. The generator stays inside them rather than ex
   -1.7976931348623157E308. Neither is generated: see ENG-22880 below.
 - FLOAT has no infinities. DECIMAL is fixed at precision 38, scale 12 (26 digits before the point).
 - DATE and TIMESTAMP accept years 1583 to 9999.
+- VoltDB does not GROUP BY a BOOLEAN expression, nor take DISTINCT of one ("A GROUP BY clause does not allow a BOOLEAN
+  expression"). Grouping columns and DISTINCT columns are never BOOLEAN.
+- A HAVING clause must have an aggregate ("does not support HAVING clause without aggregation").
+- An aggregate query whose WHERE clause folds to FALSE returns no row instead of one with COUNT 0 and NULL for the
+  others: the planner adds LIMIT 0 (ENG-19957, closed as won't fix). TLP AGGREGATE treats a partition with no row as
+  that row. The original query has no WHERE clause, so it must return a row.
 
 ### Expected errors
 
@@ -324,6 +363,14 @@ The bugs below were found by TLP WHERE in milestone 3.
 | ENG-30522 | A constant FLOAT expression that overflows to infinity fails in the parser with an internal NumberFormatException. | An expected error. |
 
 ENG-30504 was also found again in new forms; see its row above.
+
+The bugs below were found while building the TLP DISTINCT, HAVING and AGGREGATE oracles in milestone 5.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30529 | A multi-partition GROUP BY or DISTINCT groups by only one of two output columns with the same name, such as `t0.c0` and `t1.c0`, merging groups. Found while checking the SQL these oracles generate. Wrong rows. | Every output column of a DISTINCT or GROUP BY query has its own alias (`AS a0`, `AS a1`, ...). |
+| ENG-30530 | GROUP BY or DISTINCT on the partitioning column of a table an outer join null-extends returns one NULL group per partition, because the planner leaves out the coordinator's aggregation. Found by TLP DISTINCT. Wrong rows. | With an outer join, partitioning columns are not grouped by. |
+| ENG-30504 | In a HAVING clause, `NOT (a OR b)` fails with the BOOLEAN cast error even as the whole clause (commented on the ticket). Found by TLP HAVING. | TLP HAVING's `NOT p` partition pushes the NOT down: `NOT (a OR b)` becomes `(NOT a) AND (NOT b)`. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.

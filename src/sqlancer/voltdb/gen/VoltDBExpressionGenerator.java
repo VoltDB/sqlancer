@@ -17,6 +17,9 @@ import sqlancer.voltdb.VoltDBSchema.VoltDBCompositeDataType;
 import sqlancer.voltdb.VoltDBSchema.VoltDBDataType;
 import sqlancer.voltdb.VoltDBSchema.VoltDBTable;
 import sqlancer.voltdb.VoltDBToStringVisitor;
+import sqlancer.voltdb.ast.VoltDBAggregate;
+import sqlancer.voltdb.ast.VoltDBAggregate.VoltDBAggregateFunction;
+import sqlancer.voltdb.ast.VoltDBAlias;
 import sqlancer.voltdb.ast.VoltDBBetweenOperation;
 import sqlancer.voltdb.ast.VoltDBBinaryOperation;
 import sqlancer.voltdb.ast.VoltDBBinaryOperation.VoltDBBinaryOperator;
@@ -108,6 +111,10 @@ public final class VoltDBExpressionGenerator
     private NumericDomain numericDomain = NumericDomain.ANY;
     // how many comparison or IN operands enclose the expression being generated
     private int comparandNesting;
+    // while a HAVING clause is generated: the columns aggregates read (columns then holds the grouping columns), and
+    // whether an aggregate was generated
+    private List<VoltDBColumn> aggregateColumns;
+    private boolean aggregated;
 
     public VoltDBExpressionGenerator(VoltDBGlobalState state) {
         this.state = state;
@@ -478,8 +485,58 @@ public final class VoltDBExpressionGenerator
 
     @Override
     protected VoltDBExpression generateColumn(Kind kind) {
-        return new VoltDBColumnReference(
-                Randomly.fromList(columns.stream().filter(c -> isUsable(c, kind)).collect(Collectors.toList())));
+        List<VoltDBColumn> usable = columns.stream().filter(c -> isUsable(c, kind)).collect(Collectors.toList());
+        if (aggregateColumns != null && canAggregate(kind) && (usable.isEmpty() || Randomly.getBoolean())) {
+            return generateAggregate(kind);
+        }
+        return new VoltDBColumnReference(Randomly.fromList(usable));
+    }
+
+    // MIN and MAX of BOOLEAN values are left out: VoltDB orders them TRUE < FALSE (ENG-30493). COUNT is exact, and
+    // SUM, MIN and MAX of a FLOAT expression always exist, since an expression can be a constant.
+    private static boolean canAggregate(Kind kind) {
+        return kind != Kind.BOOLEAN;
+    }
+
+    // An aggregate of the given kind over the FROM clause's columns (or, inside a HAVING clause, over aggregateColumns)
+    public VoltDBExpression generateAggregate(Kind kind) {
+        List<VoltDBAggregateFunction> functions = new ArrayList<>(
+                List.of(VoltDBAggregateFunction.MIN, VoltDBAggregateFunction.MAX));
+        if (kind == Kind.NUMERIC) {
+            functions.add(VoltDBAggregateFunction.SUM);
+            if (numericDomain != NumericDomain.FLOAT) {
+                functions.add(VoltDBAggregateFunction.COUNT);
+            }
+        }
+        VoltDBAggregateFunction function = Randomly.fromList(functions);
+        List<VoltDBColumn> groupingColumns = columns;
+        List<VoltDBColumn> outerAggregateColumns = aggregateColumns;
+        if (aggregateColumns != null) {
+            columns = aggregateColumns;
+            aggregateColumns = null; // no aggregate inside an aggregate
+        }
+        try {
+            List<VoltDBExpression> args;
+            if (function != VoltDBAggregateFunction.COUNT) {
+                args = List.of(generateExpression(kind, 1));
+            } else if (Randomly.getBoolean()) {
+                args = List.of(); // COUNT(*)
+            } else {
+                // a COUNT is exact whatever it counts, so its argument may be FLOAT in an exact comparison
+                NumericDomain domain = numericDomain;
+                numericDomain = NumericDomain.ANY;
+                try {
+                    args = List.of(generateExpression(getRandomType(), 1));
+                } finally {
+                    numericDomain = domain;
+                }
+            }
+            aggregated = true;
+            return new VoltDBAggregate(args, function);
+        } finally {
+            columns = groupingColumns;
+            aggregateColumns = outerAggregateColumns;
+        }
     }
 
     @Override
@@ -489,7 +546,7 @@ public final class VoltDBExpressionGenerator
 
     @Override
     protected boolean canGenerateColumnOfType(Kind kind) {
-        return columns.stream().anyMatch(c -> isUsable(c, kind));
+        return columns.stream().anyMatch(c -> isUsable(c, kind)) || aggregateColumns != null && canAggregate(kind);
     }
 
     @Override
@@ -633,6 +690,90 @@ public final class VoltDBExpressionGenerator
     // a random non-empty subset of the columns of the FROM clause, in random order
     public List<VoltDBExpression> generateFetchColumns() {
         return Randomly.nonEmptySubset(columns).stream().map(VoltDBColumnReference::new).collect(Collectors.toList());
+    }
+
+    // VoltDB rejects GROUP BY on a BOOLEAN expression, and so DISTINCT too ("A GROUP BY clause does not allow a
+    // BOOLEAN expression"); grouping columns are a random non-empty subset of the others.
+    // ENG-30530: grouping by the partitioning column of a table an outer join null-extends gives one NULL group per
+    // partition, so unless --avoid-known-bugs is false, partitioning columns are not grouped by with an outer join
+    public List<VoltDBExpression> generateGroupingColumns() {
+        List<VoltDBColumn> groupable = columns.stream()
+                .filter(c -> Kind.fromType(c.getType().getType()) != Kind.BOOLEAN)
+                .filter(c -> !(avoidKnownBugs && hasOuterJoin && c.getName().equals(c.getTable().getPartitionColumn())))
+                .collect(Collectors.toList());
+        if (groupable.isEmpty()) {
+            throw new IgnoreMeException();
+        }
+        return Randomly.nonEmptySubset(groupable).stream().map(VoltDBColumnReference::new).collect(Collectors.toList());
+    }
+
+    // 1 to 3 aggregates of random kinds
+    public List<VoltDBExpression> generateAggregates() {
+        List<VoltDBExpression> aggregates = new ArrayList<>();
+        do {
+            Kind kind;
+            do {
+                kind = getRandomType();
+            } while (!canAggregate(kind));
+            aggregates.add(generateAggregate(kind));
+        } while (aggregates.size() < 3 && Randomly.getBooleanWithRatherLowProbability());
+        return aggregates;
+    }
+
+    // A predicate for HAVING, over the grouping columns and aggregates of the FROM clause's columns. VoltDB requires an
+    // aggregate in a HAVING clause ("does not support HAVING clause without aggregation").
+    public VoltDBExpression generateHavingPredicate(List<VoltDBExpression> groupingColumns) {
+        List<VoltDBColumn> all = columns;
+        columns = groupingColumns.stream().map(c -> ((VoltDBColumnReference) c).getColumn())
+                .collect(Collectors.toList());
+        aggregateColumns = all;
+        try {
+            for (int i = 0; i < 100; i++) {
+                aggregated = false;
+                VoltDBExpression predicate = generateExpression(Kind.BOOLEAN);
+                if (aggregated) {
+                    return predicate;
+                }
+            }
+            throw new IgnoreMeException();
+        } finally {
+            columns = all;
+            aggregateColumns = null;
+        }
+    }
+
+    // ENG-30504: in a HAVING clause, NOT (a OR b) fails even as the whole clause ("Unable to determine cast type for
+    // 'VoltType.BOOLEAN' and 'VoltType.BOOLEAN' types"), so unless --avoid-known-bugs is false, a HAVING predicate is
+    // negated by pushing the NOT down to the operands of AND and OR (De Morgan's laws hold in three-valued logic)
+    public VoltDBExpression negateHavingPredicate(VoltDBExpression predicate) {
+        if (!avoidKnownBugs) {
+            return negatePredicate(predicate);
+        }
+        if (predicate instanceof VoltDBBinaryOperation) {
+            VoltDBBinaryOperation op = (VoltDBBinaryOperation) predicate;
+            String text = op.getOperatorRepresentation();
+            if (text.equals(VoltDBBinaryOperator.AND.getTextRepresentation())
+                    || text.equals(VoltDBBinaryOperator.OR.getTextRepresentation())) {
+                VoltDBBinaryOperator dual = text.equals(VoltDBBinaryOperator.AND.getTextRepresentation())
+                        ? VoltDBBinaryOperator.OR : VoltDBBinaryOperator.AND;
+                return new VoltDBBinaryOperation(negateHavingPredicate(op.getLeft()),
+                        negateHavingPredicate(op.getRight()), dual);
+            }
+        }
+        return not(predicate);
+    }
+
+    // ENG-30529: a multi-partition GROUP BY or DISTINCT groups by only one of two output columns of the same name, such
+    // as t0.c0 and t1.c0, unless --avoid-known-bugs is false, every output column is given its own alias
+    public List<VoltDBExpression> aliased(List<VoltDBExpression> fetchColumns) {
+        if (!avoidKnownBugs) {
+            return fetchColumns;
+        }
+        List<VoltDBExpression> result = new ArrayList<>();
+        for (int i = 0; i < fetchColumns.size(); i++) {
+            result.add(new VoltDBAlias(fetchColumns.get(i), "a" + i));
+        }
+        return result;
     }
 
     public boolean isReplicatedOnly() {

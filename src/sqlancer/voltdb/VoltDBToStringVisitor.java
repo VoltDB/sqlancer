@@ -2,6 +2,7 @@ package sqlancer.voltdb;
 
 import sqlancer.common.ast.newast.NewFunctionNode;
 import sqlancer.common.ast.newast.NewToStringVisitor;
+import sqlancer.voltdb.ast.VoltDBAggregate;
 import sqlancer.voltdb.ast.VoltDBConstant;
 import sqlancer.voltdb.ast.VoltDBExpression;
 import sqlancer.voltdb.ast.VoltDBJoin;
@@ -28,7 +29,11 @@ public class VoltDBToStringVisitor extends NewToStringVisitor<VoltDBExpression> 
     @Override
     public void visit(NewFunctionNode<VoltDBExpression, ?> funcCall) {
         sb.append("(");
-        super.visit(funcCall);
+        if (funcCall instanceof VoltDBAggregate && funcCall.getArgs().isEmpty()) {
+            sb.append(funcCall.getFunc()).append("(*)");
+        } else {
+            super.visit(funcCall);
+        }
         sb.append(")");
     }
 
@@ -41,6 +46,9 @@ public class VoltDBToStringVisitor extends NewToStringVisitor<VoltDBExpression> 
 
     private void visit(VoltDBSelect select) {
         sb.append("SELECT ");
+        if (select.isDistinct()) {
+            sb.append("DISTINCT ");
+        }
         visit(select.getFetchColumns());
         sb.append(" FROM ");
         // the joins attach to the last table of the FROM list, which is the one their ON conditions reference
@@ -51,6 +59,14 @@ public class VoltDBToStringVisitor extends NewToStringVisitor<VoltDBExpression> 
         if (select.getWhereClause() != null) {
             sb.append(" WHERE ");
             visit(select.getWhereClause());
+        }
+        if (!select.getGroupByExpressions().isEmpty()) {
+            sb.append(" GROUP BY ");
+            visit(select.getGroupByExpressions());
+        }
+        if (select.getHavingClause() != null) {
+            sb.append(" HAVING ");
+            visit(select.getHavingClause());
         }
         if (!select.getOrderByClauses().isEmpty()) {
             sb.append(" ORDER BY ");

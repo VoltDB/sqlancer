@@ -83,20 +83,25 @@ public class VoltDBConnection extends SQLConnection {
                 }));
     }
 
-    // wraps a result set so that getString() returns null for a NULL value (ENG-4643); getObject() also returns the
-    // sentinel, but wasNull() is right after it
+    // wraps a result set so that getString() and getObject() return null for a NULL value (ENG-4643); getObject()
+    // returns the type's sentinel, but wasNull() is right after it
     private static ResultSet nullReading(ResultSet rs) {
         return (ResultSet) Proxy.newProxyInstance(ResultSet.class.getClassLoader(), new Class<?>[] { ResultSet.class },
                 (proxy, method, args) -> {
                     try {
-                        if ("getString".equals(method.getName())) {
+                        if ("getString".equals(method.getName())
+                                || "getObject".equals(method.getName()) && args.length == 1) {
+                            Object value;
                             if (args[0] instanceof Integer) {
-                                rs.getObject((Integer) args[0]);
+                                value = rs.getObject((Integer) args[0]);
                             } else {
-                                rs.getObject((String) args[0]);
+                                value = rs.getObject((String) args[0]);
                             }
                             if (rs.wasNull()) {
                                 return null;
+                            }
+                            if ("getObject".equals(method.getName())) {
+                                return value;
                             }
                         }
                         return method.invoke(rs, args);
