@@ -5,6 +5,7 @@ import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.concurrent.ThreadLocalRandom;
@@ -21,6 +22,8 @@ import sqlancer.SQLConnection;
  * <li>close() is idempotent. SQLancer closes each connection twice, and the VoltDB driver treats every close() as one
  * user leaving the client that all connections to the same URL share, so a second close() shuts that client down under
  * the other threads (ENG-30489).</li>
+ * <li>getString() returns null for a NULL value. The VoltDB driver returns the type's NULL sentinel instead, such as
+ * -2147483648 for an INTEGER, or throws for a DECIMAL, BOOLEAN or TIMESTAMP (ENG-4643).</li>
  * </ul>
  */
 public class VoltDBConnection extends SQLConnection {
@@ -64,7 +67,8 @@ public class VoltDBConnection extends SQLConnection {
                     long deadline = System.currentTimeMillis() + retryMillis;
                     while (true) {
                         try {
-                            return method.invoke(statement, args);
+                            Object result = method.invoke(statement, args);
+                            return result instanceof ResultSet ? nullReading((ResultSet) result) : result;
                         } catch (InvocationTargetException e) {
                             Throwable cause = e.getCause();
                             if (method.getName().startsWith("execute") && cause instanceof SQLException
@@ -77,6 +81,29 @@ public class VoltDBConnection extends SQLConnection {
                         }
                     }
                 }));
+    }
+
+    // wraps a result set so that getString() returns null for a NULL value (ENG-4643); getObject() also returns the
+    // sentinel, but wasNull() is right after it
+    private static ResultSet nullReading(ResultSet rs) {
+        return (ResultSet) Proxy.newProxyInstance(ResultSet.class.getClassLoader(), new Class<?>[] { ResultSet.class },
+                (proxy, method, args) -> {
+                    try {
+                        if ("getString".equals(method.getName())) {
+                            if (args[0] instanceof Integer) {
+                                rs.getObject((Integer) args[0]);
+                            } else {
+                                rs.getObject((String) args[0]);
+                            }
+                            if (rs.wasNull()) {
+                                return null;
+                            }
+                        }
+                        return method.invoke(rs, args);
+                    } catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
     }
 
 }

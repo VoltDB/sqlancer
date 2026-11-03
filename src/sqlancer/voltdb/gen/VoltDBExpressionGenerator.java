@@ -102,6 +102,8 @@ public final class VoltDBExpressionGenerator
     private List<VoltDBTable> fromTables = new ArrayList<>();
     private List<VoltDBJoin> joins = new ArrayList<>();
     private boolean hasOuterJoin;
+    // whether the FROM clause reads only replicated tables, which VoltDB can combine with UNION ALL
+    private boolean replicatedOnly;
     // ENG-30513: which numeric types the current comparison draws its operands from (see inNumericDomain)
     private NumericDomain numericDomain = NumericDomain.ANY;
     // how many comparison or IN operands enclose the expression being generated
@@ -171,7 +173,7 @@ public final class VoltDBExpressionGenerator
                 // NOT (NOT (b OR c)), (NOT (b OR c)) IS NOT NULL or (NOT (b OR c)) = TRUE
                 return negated;
             }
-            return new VoltDBUnaryPrefixOperation(negated, VoltDBUnaryPrefixOperator.NOT);
+            return not(negated);
         case IS_NULL:
             return generateIsNull(depth);
         case BETWEEN:
@@ -273,7 +275,10 @@ public final class VoltDBExpressionGenerator
 
     // A constant bound for an ordered comparison or BETWEEN. ENG-30515: INDEX COUNT clamps a bound outside the
     // column type's range to the type's limit and then misses rows holding that limit (TINYINT c < 32767 does not
-    // count 127), so numeric bounds lie inside every integer type's range: -126 to 126.
+    // count 127), so numeric bounds lie inside every integer type's range: -126 to 126. ENG-30521: exact bounds have no
+    // fraction unless --avoid-known-bugs is false, since a DECIMAL literal compares wrongly with a DECIMAL expression
+    // of
+    // 2^63 or more.
     private VoltDBConstant generateRangeBound(Kind kind) {
         if (kind != Kind.NUMERIC) {
             return (VoltDBConstant) generateConstant(kind, false);
@@ -283,7 +288,7 @@ public final class VoltDBExpressionGenerator
         String text;
         if (numericDomain == NumericDomain.FLOAT) {
             text = whole + "." + r.getInteger(0, 1000) + "E0";
-        } else if (Randomly.getBoolean()) {
+        } else if (Randomly.getBoolean() && !avoidKnownBugs) {
             text = whole + "." + r.getInteger(0, 1000);
         } else {
             text = Long.toString(whole);
@@ -308,7 +313,7 @@ public final class VoltDBExpressionGenerator
     private VoltDBExpression generateIsNull(int depth) {
         Kind kind = getRandomType();
         VoltDBExpression operand = hasOuterJoin && avoidKnownBugs ? generateLeafNode(kind)
-                : generateExpression(kind, depth + 1);
+                : withoutNot(generateExpression(kind, depth + 1));
         VoltDBUnaryPostfixOperator op = Randomly.fromOptions(VoltDBUnaryPostfixOperator.values());
         if (op == VoltDBUnaryPostfixOperator.IS_NULL && avoidKnownBugs) {
             return new VoltDBUnaryPrefixOperation(
@@ -451,10 +456,14 @@ public final class VoltDBExpressionGenerator
             return VoltDBDataType.BOOLEAN;
         case NUMERIC:
             VoltDBDataType type;
+            // ENG-30521: when a join's statement keeps its literals inline, a DECIMAL expression of 2^63 or more
+            // compares wrongly with any DECIMAL literal (a non-integer, or an integer outside BIGINT's range), so
+            // unless --avoid-known-bugs is false the exact side of a comparison, BETWEEN or IN has integer literals
             do {
                 type = Randomly.fromOptions(VoltDBDataType.TINYINT, VoltDBDataType.SMALLINT, VoltDBDataType.INTEGER,
                         VoltDBDataType.BIGINT, VoltDBDataType.FLOAT, VoltDBDataType.DECIMAL);
-            } while (!numericDomain.contains(type));
+            } while (!numericDomain.contains(type)
+                    || type == VoltDBDataType.DECIMAL && numericDomain == NumericDomain.EXACT && avoidKnownBugs);
             return type;
         case STRING:
             return VoltDBDataType.VARCHAR;
@@ -500,6 +509,7 @@ public final class VoltDBExpressionGenerator
             }
             // a partitioned table whose partitioning column cannot be compared with the anchor's is left out
         }
+        replicatedOnly = anchor == null;
         if (anchor == null) {
             anchor = fromTables.remove(fromTables.size() - 1);
         }
@@ -519,7 +529,11 @@ public final class VoltDBExpressionGenerator
             all.addAll(t.getColumns());
         }
         for (VoltDBTable t : explicitlyJoined) {
-            joins.add(new VoltDBJoin(new VoltDBTableReference(t), randomJoinType(), joinCondition(anchor, t)));
+            // a chain of INNER JOINs with partitioned tables, where a replicated table's ON condition folds to FALSE,
+            // loses the partitioning columns' equality ("This query is not plannable"); an outer join keeps it
+            VoltDBJoin.JoinType type = partitionJoined.isEmpty() ? randomJoinType()
+                    : Randomly.fromOptions(VoltDBJoin.JoinType.LEFT, VoltDBJoin.JoinType.FULL);
+            joins.add(new VoltDBJoin(new VoltDBTableReference(t), type, joinCondition(anchor, t)));
             all.addAll(t.getColumns());
         }
         this.columns = all;
@@ -580,12 +594,49 @@ public final class VoltDBExpressionGenerator
 
     @Override
     public VoltDBExpression negatePredicate(VoltDBExpression predicate) {
-        return new VoltDBUnaryPrefixOperation(predicate, VoltDBUnaryPrefixOperator.NOT);
+        return not(predicate);
     }
 
+    // ENG-30504: NOT (NOT (x OR y)) also fails when the OR is hidden behind a constant that the join planner folds
+    // away, as in NOT (NOT ((1 = 1) AND (x OR y))), so unless --avoid-known-bugs is false NOT (NOT q) is written q,
+    // which is the same in three-valued logic
+    private VoltDBExpression not(VoltDBExpression expr) {
+        if (avoidKnownBugs && expr instanceof VoltDBUnaryPrefixOperation && ((VoltDBUnaryPrefixOperation) expr)
+                .getOperatorRepresentation().equals(VoltDBUnaryPrefixOperator.NOT.getTextRepresentation())) {
+            return ((VoltDBUnaryPrefixOperation) expr).getExpr();
+        }
+        return new VoltDBUnaryPrefixOperation(expr, VoltDBUnaryPrefixOperator.NOT);
+    }
+
+    // ENG-30504: (NOT (K AND (x OR y))) IS NOT NULL fails too once the planner folds K away, so unless
+    // --avoid-known-bugs is false, the operand of IS [NOT] NULL loses its leading NOTs; (NOT q) IS NULL is q IS NULL
+    private VoltDBExpression withoutNot(VoltDBExpression expr) {
+        VoltDBExpression e = expr;
+        while (avoidKnownBugs && e instanceof VoltDBUnaryPrefixOperation && ((VoltDBUnaryPrefixOperation) e)
+                .getOperatorRepresentation().equals(VoltDBUnaryPrefixOperator.NOT.getTextRepresentation())) {
+            e = ((VoltDBUnaryPrefixOperation) e).getExpr();
+        }
+        return e;
+    }
+
+    // ENG-30516: written NOT (p IS NOT NULL) unless --avoid-known-bugs is false, as in generateIsNull
     @Override
     public VoltDBExpression isNull(VoltDBExpression expr) {
+        if (avoidKnownBugs) {
+            return new VoltDBUnaryPrefixOperation(
+                    new VoltDBUnaryPostfixOperation(withoutNot(expr), VoltDBUnaryPostfixOperator.IS_NOT_NULL),
+                    VoltDBUnaryPrefixOperator.NOT);
+        }
         return new VoltDBUnaryPostfixOperation(expr, VoltDBUnaryPostfixOperator.IS_NULL);
+    }
+
+    // a random non-empty subset of the columns of the FROM clause, in random order
+    public List<VoltDBExpression> generateFetchColumns() {
+        return Randomly.nonEmptySubset(columns).stream().map(VoltDBColumnReference::new).collect(Collectors.toList());
+    }
+
+    public boolean isReplicatedOnly() {
+        return replicatedOnly;
     }
 
     // A WHERE predicate always references a column. VoltDB does not support a join filter that depends on none of the
