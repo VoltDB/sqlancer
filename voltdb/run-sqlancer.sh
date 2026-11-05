@@ -17,7 +17,8 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
   --nodes N          nodes, all on this machine (default 1)
   --kfactor K        k-safety (default 0 for one node, 1 for more)
   --sites N          sites per host (default 8)
-  --oracle LIST      comma-separated oracles: NOREC, TLP_WHERE, SMOKE (default NOREC,TLP_WHERE)
+  --oracle LIST      comma-separated oracles: NOREC, TLP_WHERE, TLP_DISTINCT, TLP_HAVING,
+                     TLP_AGGREGATE, PQS, SMOKE (default NOREC,TLP_WHERE)
   --duration SECS    how long SQLancer runs (default 1800)
   --seed N           random seed (default: the current time; recorded in the manifest either way)
   --threads N        SQLancer threads (default 4)

@@ -19,7 +19,8 @@ import sqlancer.voltdb.VoltDBSchema.VoltDBCompositeDataType;
  * <li>Each integer type's minimum value is VoltDB's NULL for that type, so the valid range starts one above it (for
  * example TINYINT is -127 to 127). Some paths reject the minimum and others silently store NULL (ENG-22880), so the
  * minimum is never generated.</li>
- * <li>FLOAT's NULL is -Double.MAX_VALUE, and infinite values are not accepted, so neither is generated.</li>
+ * <li>FLOAT's NULL is -Double.MAX_VALUE, and infinite values are not accepted, so neither is generated. Nor are
+ * subnormal values (ENG-30551).</li>
  * <li>DECIMAL is fixed at precision 38, scale 12: at most 26 digits before the point.</li>
  * <li>DATE and TIMESTAMP accept years 1583 to 9999 only.</li>
  * </ul>
@@ -92,7 +93,9 @@ public final class VoltDBConstantGenerator {
         double d;
         do {
             d = r.getFiniteDouble();
-        } while (d <= -Double.MAX_VALUE);
+            // ENG-30551: a subnormal FLOAT constant in a statement that is not parameterized makes its plan fail to
+            // load, and re-running it after DDL crashes the node; such values are never generated
+        } while (d <= -Double.MAX_VALUE || d != 0 && Math.abs(d) < Double.MIN_NORMAL);
         String s = Double.toString(d);
         // without an exponent VoltDB reads the literal as a DECIMAL, which holds only 12 digits after the point
         return s.contains("E") ? s : s + "E0";
@@ -115,6 +118,10 @@ public final class VoltDBConstantGenerator {
         String s = r.getString();
         if (s.codePointCount(0, s.length()) > size) {
             s = s.substring(0, s.offsetByCodePoints(0, size));
+        }
+        if (s.equals("\\N")) {
+            // ENG-30552: the literal '\N' is stored and read as NULL
+            s = "N";
         }
         return "'" + s.replace("'", "''") + "'";
     }

@@ -46,4 +46,13 @@ public class TestVoltDB {
                         "--oracle", "TLP_DISTINCT,TLP_HAVING,TLP_AGGREGATE" }));
     }
 
+    @Test
+    public void testVoltDBPQS() {
+        assumeTrue(TestConfig.isEnvironmentTrue(TestConfig.VOLTDB_ENV));
+        assertEquals(0,
+                Main.executeMain(new String[] { "--random-seed", "0", "--timeout-seconds", TestConfig.SECONDS,
+                        "--num-threads", "2", "--num-queries", "100", "--username", "", "--password", "", "voltdb",
+                        "--oracle", "PQS" }));
+    }
+
 }

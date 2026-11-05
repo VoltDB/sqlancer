@@ -6,6 +6,7 @@ import sqlancer.common.oracle.TestOracle;
 import sqlancer.common.query.ExpectedErrors;
 import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 import sqlancer.voltdb.gen.VoltDBExpressionGenerator;
+import sqlancer.voltdb.oracle.VoltDBPivotedQuerySynthesisOracle;
 import sqlancer.voltdb.oracle.VoltDBSmokeOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPAggregateOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPOracle;
@@ -75,6 +76,18 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBTLPAggregateOracle(globalState, expressionErrors());
+        }
+    },
+
+    /**
+     * Pivoted Query Synthesis: picks a row of each table, evaluates random predicates on it in Java, and checks that a
+     * query whose WHERE clause and ON conditions are rewritten to be TRUE for that row returns it, with the evaluated
+     * values of random expressions.
+     */
+    PQS {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBPivotedQuerySynthesisOracle(globalState, expressionErrors());
         }
     };
 
