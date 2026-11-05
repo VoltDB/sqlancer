@@ -4,8 +4,9 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 5.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
-milestone 2), TLP WHERE (milestone 3), and TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5). `SMOKE`, from
+**Status: milestone 6.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), and PQS (milestone 6).
+`SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results.
 
@@ -124,7 +125,7 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | `--username`, `--password` | Empty for a server without security (SQLancer's default is `sqlancer`). |
 | `--host`, `--port` | A server's client port. Defaults: localhost, 21212. |
 | `--database-prefix` | Prefix of each thread's table names. Default `database`; `db` keeps the logs short. |
-| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE` or `SMOKE`; several are comma-separated. |
+| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS` or `SMOKE`; several are comma-separated. |
 | `--max-num-tables` | Tables per database, 1 to this (default 3). |
 | `--max-num-indexes` | CREATE INDEX statements per database, 0 to this (default 4). |
 | `--retry-seconds` | How long a statement rejected because of another thread's schema change is retried (default 120). |
@@ -264,6 +265,44 @@ the greatest of the MAXes, and the sum of the SUMs and of the COUNTs.
 - **Left out.** AVG cannot be combined from the partitions' AVGs. MIN and MAX of BOOLEAN values are left out because of
   ENG-30493.
 
+## The PQS oracle
+
+Pivoted Query Synthesis (`oracle/VoltDBPivotedQuerySynthesisOracle`) checks a query against values computed outside
+VoltDB, which the other oracles never do: they compare VoltDB with itself, so a comparison or function that is wrong
+the same way everywhere passes them.
+
+1. **Pivot row.** It reads every row of the query's tables and picks one row of each, the pivot row. Partitioned
+   tables are joined on their partitioning columns, so their rows of the pivot row share a partitioning value.
+2. **Rectified predicates.** It generates a WHERE predicate, and an ON condition for each joined replicated table,
+   evaluates each on the pivot row in Java, and rewrites it to be TRUE there: `p`, `NOT p` or `p IS NULL`.
+3. **Expressions.** It adds up to three random expressions (numbers, strings, booleans, ...) to the SELECT list, with
+   their values on the pivot row.
+4. **Check.** The query fetches every column, so the pivot row must be among its rows, and the expressions must have
+   the computed values on it.
+
+The join types are TLP WHERE's: INNER, LEFT and FULL joins all return the pivot row, as their ON conditions are TRUE for
+it. SQLancer's tables are small, so the rows are read and checked in Java; a query whose tables could produce more than
+50,000 rows is skipped.
+
+**The evaluator** (`oracle/VoltDBExpressionEvaluator`) follows VoltDB's execution engine, as checked against it:
+
+- Integer arithmetic is BIGINT and truncates division toward zero. DECIMAL keeps scale 12 and truncates multiplication
+  and division toward zero. FLOAT is IEEE double arithmetic. An integer with a DECIMAL is a DECIMAL, with a FLOAT a
+  FLOAT.
+- Comparisons, AND, OR, NOT, BETWEEN, IN and LIKE follow SQL's three-valued logic. VARCHAR compares exactly, by UTF-8
+  bytes; LIKE is case-sensitive, `_` is one character and nothing escapes `%` or `_`. A DATE compares with a TIMESTAMP
+  as midnight.
+- A string literal goes through UTF-8 first, as the driver sends it: a character UTF-8 cannot encode, such as a lone
+  surrogate in SQLancer's random strings, reaches VoltDB as `?`.
+
+What it cannot predict, it does not check: an expression is left out of the SELECT list, and a predicate skips the
+check. That covers errors (VoltDB evaluates every operand, so an error anywhere fails the query), results equal to an
+integer or FLOAT NULL sentinel, a DECIMAL mixed or compared with a FLOAT, and ordered comparisons of BOOLEAN values
+(ENG-30493). Its unit tests are `test/sqlancer/voltdb/oracle/TestVoltDBExpressionEvaluator.java`.
+
+A failure reports the query, the pivot row, and the expected and actual values. Its reducer checks that every table
+still holds its row of the pivot row before re-running the query.
+
 ## How the provider maps SQLancer onto VoltDB
 
 - **One schema, many databases.** A VoltDB cluster has a single schema, so each SQLancer database is the set of tables
@@ -377,10 +416,29 @@ The bugs below were found while building the TLP DISTINCT, HAVING and AGGREGATE 
 | ENG-30534 | Aggregates of `x''` and of `''` in a GROUP BY join whose ON condition holds `x''` fail with "Type VARCHAR can't be cast as VARBINARY" (or the reverse), as if the two were one expression. Found by TLP HAVING in the 30-minute acceptance run. | VARBINARY constants inside an aggregate are never empty. |
 | ENG-30504 | In a HAVING clause, `NOT (a OR b)` fails with the BOOLEAN cast error even as the whole clause (commented on the ticket). Found by TLP HAVING. | TLP HAVING's `NOT p` partition pushes the NOT down: `NOT (a OR b)` becomes `(NOT a) AND (NOT b)`. |
 
+The bugs below were found while building the PQS oracle in milestone 6. Each is a value VoltDB gets wrong the same way
+in every query, which only an oracle that computes values outside VoltDB sees.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30545 | Comparing a DATE with a TIMESTAMP converts the right operand to the left one's type, so with the DATE on the left the TIMESTAMP is truncated to its date: `dt = ts` is TRUE and `ts = dt` FALSE for `2020-01-02` and `2020-01-02 12:00`. Found while checking the evaluator's semantics. Wrong rows. | A temporal comparison, BETWEEN or IN uses only DATE operands or only TIMESTAMP ones. |
+| ENG-30546 | A concatenation whose result is empty is NULL at run time: `v \|\| v` and `CONCAT(v, v)` with `v = ''`. The planner folds `'' \|\| ''` to `''`. Found by PQS in its first trial. Wrong result. | A concatenation's right operand is a constant of one character. |
+| ENG-30547 | The planner folds `+` and `-` of integer constants in 32 bits: `2147483647 + 1` is NULL and `2135068309 + 1293734779` is -866164208, where the EE computes in BIGINT. In a WHERE clause too. Found by PQS. Wrong result. | PQS does not check a value that depends on a folded integer sum outside INTEGER's range. |
+| ENG-30548 | DECIMAL constant folding differs from run-time DECIMAL arithmetic: `1 / 3.0` folds to 0.3333, and folded multiplication rounds where the EE truncates. Found while checking the evaluator's semantics. Wrong result. | None needed: no DECIMAL literals are generated while ENG-30521 is avoided. |
+| ENG-30550 | ABS of a BIGINT multiplication is typed DECIMAL, so a division inside or after it keeps a fraction: `ABS((b * 1) / 2)` is 3.5 for `b = 7`, while `(b * 1) / 2` is 3. Found by PQS in a 5-minute trial. Wrong result. | No multiplication inside ABS. |
+| ENG-30549 | The planner folds a comparison of two string constants ignoring trailing spaces (`'a' = 'a '` is TRUE), while the EE compares exactly. Found by PQS. Wrong result. | PQS does not check a folded string comparison that trailing spaces decide. |
+
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
 
 ## Tests
+
+`test/sqlancer/voltdb/oracle/TestVoltDBExpressionEvaluator.java` checks the PQS evaluator against VoltDB's semantics
+as observed, without a server:
+
+```bash
+mvn -Djacoco.skip=true -Dtest=TestVoltDBExpressionEvaluator test
+```
 
 `test/sqlancer/dbms/TestVoltDB.java` runs the provider for `TestConfig.SECONDS` against a server on localhost:21212. It
 is skipped unless `VOLTDB_AVAILABLE=true`:

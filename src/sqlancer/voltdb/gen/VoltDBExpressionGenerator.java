@@ -123,6 +123,8 @@ public final class VoltDBExpressionGenerator
     private boolean ungroupedAggregates;
     // whether an aggregate's argument is being generated (ENG-30534)
     private boolean inAggregate;
+    // how many ABS calls enclose the expression being generated (ENG-30550)
+    private int absNesting;
 
     public VoltDBExpressionGenerator(VoltDBGlobalState state) {
         this.state = state;
@@ -385,11 +387,23 @@ public final class VoltDBExpressionGenerator
             return new VoltDBUnaryPrefixOperation(generateExpression(Kind.NUMERIC, depth + 1),
                     VoltDBUnaryPrefixOperator.MINUS);
         case ARITHMETIC:
+            VoltDBBinaryOperator op = Randomly.fromOptions(VoltDBBinaryOperator.ADD, VoltDBBinaryOperator.SUBTRACT,
+                    VoltDBBinaryOperator.MULTIPLY, VoltDBBinaryOperator.DIVIDE);
+            if (op == VoltDBBinaryOperator.MULTIPLY && absNesting > 0 && avoidKnownBugs) {
+                // ENG-30550: ABS of a BIGINT multiplication is typed DECIMAL, so a division inside or after it keeps a
+                // fraction, as in ABS((b * 1) / 2) = 3.5; there is no multiplication inside ABS
+                op = Randomly.fromOptions(VoltDBBinaryOperator.ADD, VoltDBBinaryOperator.SUBTRACT,
+                        VoltDBBinaryOperator.DIVIDE);
+            }
             return new VoltDBBinaryOperation(generateExpression(Kind.NUMERIC, depth + 1),
-                    generateExpression(Kind.NUMERIC, depth + 1), Randomly.fromOptions(VoltDBBinaryOperator.ADD,
-                            VoltDBBinaryOperator.SUBTRACT, VoltDBBinaryOperator.MULTIPLY, VoltDBBinaryOperator.DIVIDE));
+                    generateExpression(Kind.NUMERIC, depth + 1), op);
         case ABS:
-            return new VoltDBFunction(List.of(generateExpression(Kind.NUMERIC, depth + 1)), VoltDBFunctionName.ABS);
+            absNesting++;
+            try {
+                return new VoltDBFunction(List.of(generateExpression(Kind.NUMERIC, depth + 1)), VoltDBFunctionName.ABS);
+            } finally {
+                absNesting--;
+            }
         default:
             throw new AssertionError();
         }
