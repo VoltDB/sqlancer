@@ -193,11 +193,14 @@ public final class VoltDBExpressionEvaluator {
                 checkFoldedStrings(op.getLeft(), left, op.getRight(), right);
             }
             Object value = binary(operator, left, right);
-            if (avoidKnownBugs && (operator == VoltDBBinaryOperator.ADD || operator == VoltDBBinaryOperator.SUBTRACT)
-                    && value instanceof Long && ((Long) value < -Integer.MAX_VALUE || (Long) value > Integer.MAX_VALUE)
+            if (avoidKnownBugs
+                    && (operator == VoltDBBinaryOperator.ADD || operator == VoltDBBinaryOperator.SUBTRACT
+                            || operator == VoltDBBinaryOperator.MULTIPLY)
+                    && value instanceof Long && (beyondInteger(value) || beyondInteger(left) || beyondInteger(right))
                     && isConstant(expr)) {
-                // ENG-30547: the planner folds + and - of integer constants in 32 bits, wrapping around or giving NULL
-                throw new Unpredictable("ENG-30547: folded integer sum outside INTEGER's range");
+                // ENG-30547: the planner folds + and - of integer constants in 32 bits, wrapping around or giving NULL,
+                // and types a multiplication with a BIGINT operand as DECIMAL, so a division by it keeps a fraction
+                throw new Unpredictable("ENG-30547: folded integer arithmetic beyond INTEGER's range");
             }
             return value;
         }
@@ -266,6 +269,10 @@ public final class VoltDBExpressionEvaluator {
         Arrays.fill(px, x.length, px.length, (byte) ' ');
         Arrays.fill(py, y.length, py.length, (byte) ' ');
         return Arrays.compareUnsigned(px, py);
+    }
+
+    private static boolean beyondInteger(Object v) {
+        return v instanceof Long && ((Long) v < -Integer.MAX_VALUE || (Long) v > Integer.MAX_VALUE);
     }
 
     // whether the expression has no column, so that the planner folds it

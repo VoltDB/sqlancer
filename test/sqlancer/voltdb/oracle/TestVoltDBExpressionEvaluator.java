@@ -91,7 +91,12 @@ public class TestVoltDBExpressionEvaluator {
         VoltDBExpressionEvaluator avoiding = new VoltDBExpressionEvaluator(Map.of(), true);
         assertThrows(Unpredictable.class, () -> avoiding.evaluate(sum));
         assertEquals(2147483647L, avoiding.evaluate(op(c("2147483646"), VoltDBBinaryOperator.ADD, c("1"))));
-        assertEquals(4294967296L, avoiding.evaluate(op(c("65536"), VoltDBBinaryOperator.MULTIPLY, c("65536"))));
+        // a folded multiplication with a BIGINT operand or result is typed DECIMAL
+        assertThrows(Unpredictable.class,
+                () -> avoiding.evaluate(op(c("2"), VoltDBBinaryOperator.MULTIPLY, c("3000000000"))));
+        assertThrows(Unpredictable.class,
+                () -> avoiding.evaluate(op(c("65536"), VoltDBBinaryOperator.MULTIPLY, c("65536"))));
+        assertEquals(6L, avoiding.evaluate(op(c("2"), VoltDBBinaryOperator.MULTIPLY, c("3"))));
     }
 
     @Test
