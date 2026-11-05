@@ -416,8 +416,8 @@ The bugs below were found while building the TLP DISTINCT, HAVING and AGGREGATE 
 | ENG-30534 | Aggregates of `x''` and of `''` in a GROUP BY join whose ON condition holds `x''` fail with "Type VARCHAR can't be cast as VARBINARY" (or the reverse), as if the two were one expression. Found by TLP HAVING in the 30-minute acceptance run. | VARBINARY constants inside an aggregate are never empty. |
 | ENG-30504 | In a HAVING clause, `NOT (a OR b)` fails with the BOOLEAN cast error even as the whole clause (commented on the ticket). Found by TLP HAVING. | TLP HAVING's `NOT p` partition pushes the NOT down: `NOT (a OR b)` becomes `(NOT a) AND (NOT b)`. |
 
-The bugs below were found while building the PQS oracle in milestone 6. Each is a value VoltDB gets wrong the same way
-in every query, which only an oracle that computes values outside VoltDB sees.
+The bugs below were found while building the PQS oracle in milestone 6. Most are values VoltDB gets wrong the same way
+in every query, which only an oracle that computes values outside VoltDB sees; ENG-30551 crashes a node.
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
