@@ -4,11 +4,12 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 6.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 7.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), and PQS (milestone 6).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
-cluster, runs SQLancer against it and saves the results.
+cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
+see [The nightly lab job](#the-nightly-lab-job).
 
 ## Versions
 
@@ -49,6 +50,7 @@ voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 -
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--voltdb DIR` | `$VOLTDB_HOME` | A VoltDB kit or build: the directory holding `bin/voltdb`. |
+| `--license FILE` | none | The license `voltdb init` gets. An enterprise kit needs one; a build from source does not. |
 | `--nodes N` | 1 | Nodes, all on this machine. |
 | `--kfactor K` | 0 for one node, else 1 | K-safety. |
 | `--sites N` | 8 | Sites per host. |
@@ -83,6 +85,39 @@ A run FAILs if any of these happens:
 
 The cluster's data is deleted after the logs are copied, unless `--keep-cluster` is given. Several runs can share a
 machine if each has its own `--port-base`.
+
+## The nightly lab job
+
+`matrix-systemtest-apprunner-sqlancer` on jenkins-st runs this script against master's kit as part of the nightly
+system test (`matrix-systemtest/master`, on the nights the rotation in `internal`'s
+`jenkins-lab/systemtest/trigger-job-for-systemtest` gives master). Its pipeline is `internal`'s
+`jenkins-lab/systemtest/apprunner/sqlancer/Jenkinsfile`; the script it calls is `pro`'s
+`tests/apptests/jenkins-scripts/run-jenkins-sqlancer-test.sh`.
+
+The job fetches this repository at the commit in its `SQLANCER_REF` parameter. That commit is pinned in the Jenkinsfile,
+so a change here reaches the nightly run only when the Jenkinsfile is changed to name it. It then builds SQLancer with
+the kit's runtime JDK and makes two runs, one after the other, every node on the agent:
+
+| Run (triagedb name) | Cluster | Oracles | Time |
+| --- | --- | --- | --- |
+| `sqlancer-3n-k1` | 3 nodes, k=1, 8 sites per host | all six (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS) | 45 minutes |
+| `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
+
+Both runs use `--use-reducer`. The first run's seed is the UTC time as `yyyymmddHHMM`, and the second's is one more.
+`--avoid-known-bugs` stays on, so a failure is a new bug, or a known one in a new form.
+
+Each run is one row in the triagedb, with the seed in its run arguments. A failing row's reason is the oracle's account
+of the first failed database (or what else failed the run), and the run's whole results directory is archived on the
+build as `savedlogs/sqlancer/<name>-PASS.tar.gz` or `-FAIL.tar.gz`. A failing bundle is also copied to
+`gs://cloudtest-storage/apprunner-failures/<branch>/<build tag>/`, like other apprunner suites' bundles.
+
+To repeat a failure on your machine, take the seed and oracles from the bundle's `manifest.txt` and run the script with
+them against the same build. The reproduction in `reproductions/` is usually quicker: run its statements on an empty
+server.
+
+The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor`, default `3:1 1:0`), `DURATION` (seconds
+per run, default 2700), `ORACLES`, `SEED`, `EXTRA_ARGS` (provider options) and `SQLANCER_REF`. A run of the job alone
+needs a kit: give `releasedir`, for example `releases/one-offs/16.1.0-SNAPSHOT-master/<kit build>`.
 
 ## Start a VoltDB server by hand
 
