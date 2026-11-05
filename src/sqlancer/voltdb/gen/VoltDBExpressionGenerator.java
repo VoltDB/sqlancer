@@ -279,10 +279,11 @@ public final class VoltDBExpressionGenerator
     // BETWEEN or IN draws all its operands from either FLOAT or the exact types (integers and DECIMAL).
     // ENG-30545: comparing a DATE with a TIMESTAMP truncates the TIMESTAMP to its date when the DATE is the left
     // operand, so unless --avoid-known-bugs is false, a temporal comparison, BETWEEN or IN draws all its operands from
-    // either DATE or TIMESTAMP.
+    // either DATE or TIMESTAMP. ENG-30560: a DATE constant in a statement makes its DECIMAL literals FLOAT and its
+    // folded DECIMAL constants fail to compile, and a comparison needs constants, so that is TIMESTAMP.
     private VoltDBExpression inDomain(Kind kind, Supplier<VoltDBExpression> generator) {
         if (kind == Kind.TEMPORAL && avoidKnownBugs && temporalType == null) {
-            temporalType = Randomly.fromOptions(VoltDBDataType.DATE, VoltDBDataType.TIMESTAMP);
+            temporalType = VoltDBDataType.TIMESTAMP;
             try {
                 return generator.get();
             } finally {
@@ -457,9 +458,10 @@ public final class VoltDBExpressionGenerator
     private VoltDBExpression generateConstant(Kind kind, boolean mayBeNull) {
         VoltDBDataType type = randomDataType(kind);
         if (kind == Kind.TEMPORAL && avoidKnownBugs) {
-            // ENG-30499: the planner crashes folding a comparison of a DATE constant with a TIMESTAMP constant, so
-            // constants are TIMESTAMPs, or DATEs where every operand is one (ENG-30545)
-            type = temporalType == VoltDBDataType.DATE ? VoltDBDataType.DATE : VoltDBDataType.TIMESTAMP;
+            // ENG-30499: the planner crashes folding a comparison of a DATE constant with a TIMESTAMP constant, and
+            // ENG-30560 makes a statement's DECIMAL literals FLOAT when it holds a DATE constant: constants are
+            // TIMESTAMPs
+            type = VoltDBDataType.TIMESTAMP;
         }
         // ENG-30495: a WHERE clause that folds to a constant NULL crashes the planner, and only NULL literals can make
         // it fold to NULL (ENG-30500 and ENG-30503 are wrong results with NULLs in IN lists). Unless
