@@ -100,6 +100,17 @@ public class TestVoltDBExpressionEvaluator {
     }
 
     @Test
+    public void testSubnormalConstants() {
+        VoltDBExpression tiny = op(c("0.28E0"), VoltDBBinaryOperator.DIVIDE, c("1.7976931348623157E308"));
+        assertEquals(0.28 / Double.MAX_VALUE, eval(tiny));
+        // ENG-30551: unpredictable while the bug is avoided, as written or folded
+        VoltDBExpressionEvaluator avoiding = new VoltDBExpressionEvaluator(Map.of(), true);
+        assertThrows(Unpredictable.class, () -> avoiding.evaluate(tiny));
+        assertThrows(Unpredictable.class, () -> avoiding.evaluate(c("4.9E-324")));
+        assertEquals(0.0, avoiding.evaluate(c("0.0E0")));
+    }
+
+    @Test
     public void testFoldedStringComparisons() {
         VoltDBExpression padded = op(c("'a'"), VoltDBBinaryOperator.EQUALS, c("'a '"));
         assertEquals(false, eval(padded));

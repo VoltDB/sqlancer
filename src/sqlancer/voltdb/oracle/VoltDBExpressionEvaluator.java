@@ -172,6 +172,18 @@ public final class VoltDBExpressionEvaluator {
     }
 
     public Object evaluate(VoltDBExpression expr) {
+        Object value = evaluateNode(expr);
+        if (avoidKnownBugs && value instanceof Double && (Double) value != 0
+                && Math.abs((Double) value) < Double.MIN_NORMAL && isConstant(expr)) {
+            // ENG-30551: a subnormal FLOAT constant, as written or as folded by the planner, makes the plan fail to
+            // load ("JSON parse failure") when the statement is not parameterized, and re-running it after any DDL
+            // crashes the node, so a query must not hold one
+            throw new Unpredictable("ENG-30551: subnormal FLOAT constant");
+        }
+        return value;
+    }
+
+    private Object evaluateNode(VoltDBExpression expr) {
         if (expr instanceof VoltDBConstant) {
             return parseConstant(expr.toString());
         }
