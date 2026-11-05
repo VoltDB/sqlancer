@@ -111,6 +111,16 @@ public class TestVoltDBExpressionEvaluator {
     }
 
     @Test
+    public void testBackslashN() {
+        VoltDBExpression folded = op(c("'\\'"), VoltDBBinaryOperator.CONCAT, c("'N'"));
+        assertEquals("\\N", eval(folded));
+        // ENG-30552: unpredictable while the bug is avoided
+        VoltDBExpressionEvaluator avoiding = new VoltDBExpressionEvaluator(Map.of(), true);
+        assertThrows(Unpredictable.class, () -> avoiding.evaluate(folded));
+        assertEquals("\\n", avoiding.evaluate(c("'\\n'")));
+    }
+
+    @Test
     public void testFoldedStringComparisons() {
         VoltDBExpression padded = op(c("'a'"), VoltDBBinaryOperator.EQUALS, c("'a '"));
         assertEquals(false, eval(padded));

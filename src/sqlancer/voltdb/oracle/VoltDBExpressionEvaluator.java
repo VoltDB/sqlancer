@@ -180,6 +180,10 @@ public final class VoltDBExpressionEvaluator {
             // crashes the node, so a query must not hold one
             throw new Unpredictable("ENG-30551: subnormal FLOAT constant");
         }
+        if (avoidKnownBugs && "\\N".equals(value) && isConstant(expr)) {
+            // ENG-30552: a string constant '\N', as written or as folded by the planner, reaches the EE as NULL
+            throw new Unpredictable("ENG-30552: string constant \\N");
+        }
         return value;
     }
 

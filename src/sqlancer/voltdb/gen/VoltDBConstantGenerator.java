@@ -119,6 +119,10 @@ public final class VoltDBConstantGenerator {
         if (s.codePointCount(0, s.length()) > size) {
             s = s.substring(0, s.offsetByCodePoints(0, size));
         }
+        if (s.equals("\\N")) {
+            // ENG-30552: the literal '\N' is stored and read as NULL
+            s = "N";
+        }
         return "'" + s.replace("'", "''") + "'";
     }
 
