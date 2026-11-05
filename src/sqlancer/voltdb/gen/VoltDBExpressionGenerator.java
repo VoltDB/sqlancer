@@ -389,11 +389,12 @@ public final class VoltDBExpressionGenerator
         case ARITHMETIC:
             VoltDBBinaryOperator op = Randomly.fromOptions(VoltDBBinaryOperator.ADD, VoltDBBinaryOperator.SUBTRACT,
                     VoltDBBinaryOperator.MULTIPLY, VoltDBBinaryOperator.DIVIDE);
-            if (op == VoltDBBinaryOperator.MULTIPLY && absNesting > 0 && avoidKnownBugs) {
-                // ENG-30550: ABS of a BIGINT multiplication is typed DECIMAL, so a division inside or after it keeps a
-                // fraction, as in ABS((b * 1) / 2) = 3.5; there is no multiplication inside ABS
-                op = Randomly.fromOptions(VoltDBBinaryOperator.ADD, VoltDBBinaryOperator.SUBTRACT,
-                        VoltDBBinaryOperator.DIVIDE);
+            if ((op == VoltDBBinaryOperator.MULTIPLY || op == VoltDBBinaryOperator.DIVIDE) && absNesting > 0
+                    && avoidKnownBugs) {
+                // ENG-30550: ABS pushes its argument's type into the operands, so an integer division inside it keeps a
+                // fraction when the argument is DECIMAL or FLOAT, as in ABS((7 / i) - d), and a BIGINT multiplication
+                // makes ABS DECIMAL, as in ABS(b * 1) / 2 = 3.5; there is no multiplication or division inside ABS
+                op = Randomly.fromOptions(VoltDBBinaryOperator.ADD, VoltDBBinaryOperator.SUBTRACT);
             }
             return new VoltDBBinaryOperation(generateExpression(Kind.NUMERIC, depth + 1),
                     generateExpression(Kind.NUMERIC, depth + 1), op);
