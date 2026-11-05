@@ -107,8 +107,10 @@ public final class VoltDBExpressionGenerator
     private boolean hasOuterJoin;
     // whether the FROM clause reads only replicated tables, which VoltDB can combine with UNION ALL
     private boolean replicatedOnly;
-    // ENG-30513: which numeric types the current comparison draws its operands from (see inNumericDomain)
+    // ENG-30513: which numeric types the current comparison draws its operands from (see inDomain)
     private NumericDomain numericDomain = NumericDomain.ANY;
+    // ENG-30545: the one temporal type the current comparison draws its operands from, or null for both
+    private VoltDBDataType temporalType;
     // how many comparison or IN operands enclose the expression being generated
     private int comparandNesting;
     // while a HAVING clause is generated: the columns aggregates read (columns then holds the grouping columns), and
@@ -139,8 +141,12 @@ public final class VoltDBExpressionGenerator
             return generateNumericExpression(depth);
         case STRING:
             if (Randomly.getBoolean()) {
-                return new VoltDBBinaryOperation(generateExpression(Kind.STRING, depth + 1),
-                        generateExpression(Kind.STRING, depth + 1), VoltDBBinaryOperator.CONCAT);
+                // ENG-30546: a concatenation whose result is empty, such as v || v with v = '', is NULL at run time,
+                // so unless --avoid-known-bugs is false its right operand is a constant that is not empty
+                VoltDBExpression right = avoidKnownBugs ? generateNonEmptyStringConstant()
+                        : generateExpression(Kind.STRING, depth + 1);
+                return new VoltDBBinaryOperation(generateExpression(Kind.STRING, depth + 1), right,
+                        VoltDBBinaryOperator.CONCAT);
             }
             return generateLeafNode(kind);
         default:
@@ -164,7 +170,7 @@ public final class VoltDBExpressionGenerator
                 return new VoltDBBinaryOperation(generateComparand(kind, depth), generateConstant(kind, false), op);
             }
             VoltDBBinaryOperator comparison = op;
-            return inNumericDomain(kind, () -> {
+            return inDomain(kind, () -> {
                 if (kind == Kind.NUMERIC && comparison.isOrdering() && avoidKnownBugs) {
                     // ENG-30511: an index range scan on a narrower integer column with a key from a wider column that
                     // is below the narrower type's range matches every row; constant keys are handled correctly
@@ -198,7 +204,7 @@ public final class VoltDBExpressionGenerator
                 // ENG-30511 as for comparisons, and ENG-30512: COUNT(*) over an empty index range, such as
                 // x BETWEEN 9 AND 1, is negative; the bounds are constants in ascending order
                 Kind boundsKind = betweenKind;
-                return inNumericDomain(boundsKind, () -> {
+                return inDomain(boundsKind, () -> {
                     VoltDBConstant low = generateRangeBound(boundsKind);
                     VoltDBConstant high = generateRangeBound(boundsKind);
                     if (compareConstants(boundsKind, low, high) > 0) {
@@ -225,7 +231,7 @@ public final class VoltDBExpressionGenerator
                 return generateIsNull(depth);
             }
             Kind inKind = getRandomType();
-            return inNumericDomain(inKind, () -> {
+            return inDomain(inKind, () -> {
                 List<VoltDBExpression> list = new ArrayList<>();
                 int n = 1 + Randomly.smallNumber();
                 for (int i = 0; i < n; i++) {
@@ -269,7 +275,18 @@ public final class VoltDBExpressionGenerator
     // ENG-30513: comparing a FLOAT with a DECIMAL of magnitude 2^63 or more gives wrong results, and such DECIMALs come
     // from the data and from arithmetic, not only constants. Unless --avoid-known-bugs is false, a numeric comparison,
     // BETWEEN or IN draws all its operands from either FLOAT or the exact types (integers and DECIMAL).
-    private VoltDBExpression inNumericDomain(Kind kind, Supplier<VoltDBExpression> generator) {
+    // ENG-30545: comparing a DATE with a TIMESTAMP truncates the TIMESTAMP to its date when the DATE is the left
+    // operand, so unless --avoid-known-bugs is false, a temporal comparison, BETWEEN or IN draws all its operands from
+    // either DATE or TIMESTAMP.
+    private VoltDBExpression inDomain(Kind kind, Supplier<VoltDBExpression> generator) {
+        if (kind == Kind.TEMPORAL && avoidKnownBugs && temporalType == null) {
+            temporalType = Randomly.fromOptions(VoltDBDataType.DATE, VoltDBDataType.TIMESTAMP);
+            try {
+                return generator.get();
+            } finally {
+                temporalType = null;
+            }
+        }
         if (kind != Kind.NUMERIC || !avoidKnownBugs || numericDomain != NumericDomain.ANY) {
             return generator.get();
         }
@@ -281,9 +298,16 @@ public final class VoltDBExpressionGenerator
         }
     }
 
+    // An expression of the given kind whose operands come from one numeric or temporal domain, as a comparison's do,
+    // for a SELECT list
+    public VoltDBExpression generateExpressionInDomain(Kind kind) {
+        return inDomain(kind, () -> generateExpression(kind));
+    }
+
     private boolean isUsable(VoltDBColumn c, Kind kind) {
         VoltDBDataType type = c.getType().getType();
-        return Kind.fromType(type) == kind && (kind != Kind.NUMERIC || numericDomain.contains(type));
+        return Kind.fromType(type) == kind && (kind != Kind.NUMERIC || numericDomain.contains(type))
+                && (kind != Kind.TEMPORAL || temporalType == null || type == temporalType);
     }
 
     // A constant bound for an ordered comparison or BETWEEN. ENG-30515: INDEX COUNT clamps a bound outside the
@@ -418,8 +442,9 @@ public final class VoltDBExpressionGenerator
     private VoltDBExpression generateConstant(Kind kind, boolean mayBeNull) {
         VoltDBDataType type = randomDataType(kind);
         if (kind == Kind.TEMPORAL && avoidKnownBugs) {
-            // ENG-30499: the planner crashes folding a comparison of a DATE constant with a TIMESTAMP constant
-            type = VoltDBDataType.TIMESTAMP;
+            // ENG-30499: the planner crashes folding a comparison of a DATE constant with a TIMESTAMP constant, so
+            // constants are TIMESTAMPs, or DATEs where every operand is one (ENG-30545)
+            type = temporalType == VoltDBDataType.DATE ? VoltDBDataType.DATE : VoltDBDataType.TIMESTAMP;
         }
         // ENG-30495: a WHERE clause that folds to a constant NULL crashes the planner, and only NULL literals can make
         // it fold to NULL (ENG-30500 and ENG-30503 are wrong results with NULLs in IN lists). Unless
@@ -466,6 +491,13 @@ public final class VoltDBExpressionGenerator
             return new VoltDBConstant("(" + literal + ")");
         }
         return new VoltDBConstant(literal);
+    }
+
+    // a one-character VARCHAR constant (ENG-30509, see generateConstant)
+    private VoltDBExpression generateNonEmptyStringConstant() {
+        String str = state.getRandomly().getString();
+        str = str.isEmpty() ? state.getRandomly().getAlphabeticChar() : str.substring(0, str.offsetByCodePoints(0, 1));
+        return new VoltDBConstant("'" + str.replace("'", "''") + "'");
     }
 
     private VoltDBDataType randomDataType(Kind kind) {
