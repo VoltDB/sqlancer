@@ -399,6 +399,8 @@ A view (`gen/VoltDBViewGenerator`) covers one table:
 - It groups by zero to two non-BOOLEAN columns.
 - It always has `COUNT(*)`, plus up to three more of `COUNT`, `SUM`, `MIN` and `MAX` of the table's columns. MIN and
   MAX are never of BOOLEAN columns (ENG-30493).
+- While `--avoid-known-bugs` is true, SUM is only of NOT NULL TINYINT, SMALLINT and INTEGER columns (ENG-30584 and
+  ENG-30588 below). VoltDB sums those as BIGINT, which can't overflow.
 - While `--avoid-known-bugs` is false, half the views have a random WHERE clause. While it is true, none do (ENG-30583
   below).
 
@@ -591,6 +593,7 @@ The bugs below were found by the VIEWS oracle in milestone 10, in its first tria
 | ENG-30582 | Once a table has a materialized view, VoltDB's view rewriter fails on GROUP BY queries whose WHERE clause and GROUP BY columns match the view's: the same aggregate twice gives "Duplicate key" (a `Collectors.toMap` without a merge function in `MVQueryRewriter.getViewColumnMaps`), and an aggregate of an expression, such as `SUM(x + 0)`, gives a ClassCastException. These queries worked before the view existed, and the other oracles generate them. | A view never has the same aggregate twice, and the other oracles' queries never read a table that has a view. |
 | ENG-30583 | A view whose WHERE clause has a FLOAT constant of 10 or more with a fraction, such as `c0 > 12.5E0`, blocks every later DDL in the database: "May not dynamically modify field 'predicate' of schema object 'MaterializedViewInfo{...}'". Dropping the view recovers. Likewise a predicate in a view's WHERE clause that an index could serve, such as a LIKE or a TIMESTAMP BETWEEN on a column, makes an index on that column fail (comments on the ticket). Found as failed CREATE INDEX statements. | Views have no WHERE clause. |
 | ENG-30584 | Deleting a group's last non-NULL value leaves 0 instead of NULL in a view's SUM. A query the rewriter answers from the view returns the 0 too. Wrong result. | A view sums NOT NULL columns only. |
+| ENG-30588 | An UPDATE of an indexed column fails when it overflows a view's SUM (DECIMAL or BIGINT), as it should, but the row is left out of the index on that column: lookups by the key miss it, and the next UPDATE of the row crashes the node with "Failed to remove tuple from index (during update)". A failed DELETE, or a failed UPDATE of other columns, leaves the index intact. Found by the lab's 45-minute run on 1 node, as a crash. | A view sums TINYINT, SMALLINT and INTEGER columns only. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.

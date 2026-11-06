@@ -10,6 +10,7 @@ import sqlancer.common.query.SQLQueryAdapter;
 import sqlancer.voltdb.VoltDBErrors;
 import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 import sqlancer.voltdb.VoltDBSchema.VoltDBColumn;
+import sqlancer.voltdb.VoltDBSchema.VoltDBDataType;
 import sqlancer.voltdb.VoltDBSchema.VoltDBTable;
 import sqlancer.voltdb.VoltDBToStringVisitor;
 import sqlancer.voltdb.gen.VoltDBExpressionGenerator.Kind;
@@ -41,7 +42,10 @@ public final class VoltDBViewGenerator {
             List<String> functions = new ArrayList<>(List.of("COUNT"));
             // ENG-30584: deleting a group's last non-NULL value leaves 0 in the view's SUM instead of NULL, so unless
             // --avoid-known-bugs is false, a view sums NOT NULL columns only
-            if (kind == Kind.NUMERIC && !(avoidKnownBugs && c.isNullable())) {
+            // ENG-30588: an UPDATE of an indexed column whose view SUM overflows fails, but leaves the row out of the
+            // index, and the next UPDATE of the row crashes the node, so unless --avoid-known-bugs is false, a view
+            // sums TINYINT, SMALLINT and INTEGER columns only, whose sums can't overflow
+            if (kind == Kind.NUMERIC && !(avoidKnownBugs && (c.isNullable() || !sumCannotOverflow(c)))) {
                 functions.add("SUM");
             }
             if (kind != Kind.BOOLEAN) {
@@ -79,6 +83,12 @@ public final class VoltDBViewGenerator {
         VoltDBErrors.addViewErrors(errors);
         return new SQLQueryAdapter("CREATE VIEW " + name + " (" + String.join(", ", columns) + ") AS " + query, errors,
                 true);
+    }
+
+    // VoltDB sums TINYINT, SMALLINT and INTEGER values as BIGINT, which no realistic number of rows can overflow
+    private static boolean sumCannotOverflow(VoltDBColumn c) {
+        VoltDBDataType type = c.getType().getType();
+        return type == VoltDBDataType.TINYINT || type == VoltDBDataType.SMALLINT || type == VoltDBDataType.INTEGER;
     }
 
 }
