@@ -14,6 +14,7 @@ usage() {
 Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
 
   --voltdb DIR       VoltDB kit or build, holding bin/voltdb (default: $VOLTDB_HOME)
+  --license FILE     license for voltdb init, which an enterprise kit needs (default: none)
   --nodes N          nodes, all on this machine (default 1)
   --kfactor K        k-safety (default 0 for one node, 1 for more)
   --sites N          sites per host (default 8)
@@ -42,6 +43,7 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 repo_dir=$(dirname "$script_dir")
 
 voltdb_home=${VOLTDB_HOME:-}
+license=
 nodes=1
 kfactor=
 sites=8
@@ -60,6 +62,7 @@ command_line="$0 $*"
 while [ $# -gt 0 ]; do
     case $1 in
     --voltdb) voltdb_home=$2; shift 2 ;;
+    --license) license=$2; shift 2 ;;
     --nodes) nodes=$2; shift 2 ;;
     --kfactor) kfactor=$2; shift 2 ;;
     --sites) sites=$2; shift 2 ;;
@@ -80,6 +83,11 @@ done
 
 [ -n "$voltdb_home" ] || die "--voltdb (or VOLTDB_HOME) is required"
 [ -x "$voltdb_home/bin/voltdb" ] || die "no bin/voltdb in $voltdb_home"
+license_args=()
+if [ -n "$license" ]; then
+    [ -r "$license" ] || die "cannot read the license $license"
+    license_args=(--license "$license")
+fi
 for n in "$nodes" "$sites" "$duration" "$threads" "$queries" "$port_base"; do
     case $n in '' | *[!0-9]*) die "not a number: '$n'" ;; esac
 done
@@ -169,6 +177,7 @@ sqlancer_dirty=$(git -C "$repo_dir" status --porcelain 2>/dev/null | grep -v '^?
     echo "sqlancer commit:  $sqlancer_commit$([ "$sqlancer_dirty" = 0 ] || echo " (plus $sqlancer_dirty uncommitted changes)")"
     echo "voltdb:           $voltdb_home"
     echo "voltdb version:   $("$voltdb_home/bin/voltdb" --version 2>&1 | tail -1)"
+    echo "license:          ${license:-none}"
     echo "java:             $("$java" -version 2>&1 | head -1)"
     echo "nodes:            $nodes"
     echo "kfactor:          $kfactor"
@@ -197,7 +206,7 @@ EOF
 log "Starting $nodes node(s), k=$kfactor, $sites sites per host"
 for ((i = 0; i < nodes; i++)); do
     node=$cluster/node$i
-    "$voltdb_home/bin/voltdb" init --force -D "$node" -C "$cluster/deployment.xml" >"$cluster/init$i.log" 2>&1 ||
+    "$voltdb_home/bin/voltdb" init --force -D "$node" -C "$cluster/deployment.xml" ${license_args[@]+"${license_args[@]}"} >"$cluster/init$i.log" 2>&1 ||
         die "voltdb init failed for node $i; see $cluster/init$i.log"
 done
 cluster_started=true

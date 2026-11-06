@@ -123,7 +123,14 @@ public final class VoltDBConstantGenerator {
             // ENG-30552: the literal '\N' is stored and read as NULL
             s = "N";
         }
-        return "'" + s.replace("'", "''") + "'";
+        return quote(s);
+    }
+
+    // A VARCHAR literal. ENG-30562: VoltDB reads a backslash before a quote as escaping it, so after a literal ending
+    // in
+    // one it strips /*...*/ and -- from the statement's later literals; a backslash there is written as a slash.
+    static String quote(String s) {
+        return "'" + s.replaceAll("\\\\(?='|$)", "/").replace("'", "''") + "'";
     }
 
     private static String varbinary(Randomly r, int size) {

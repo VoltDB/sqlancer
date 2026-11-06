@@ -279,10 +279,11 @@ public final class VoltDBExpressionGenerator
     // BETWEEN or IN draws all its operands from either FLOAT or the exact types (integers and DECIMAL).
     // ENG-30545: comparing a DATE with a TIMESTAMP truncates the TIMESTAMP to its date when the DATE is the left
     // operand, so unless --avoid-known-bugs is false, a temporal comparison, BETWEEN or IN draws all its operands from
-    // either DATE or TIMESTAMP.
+    // either DATE or TIMESTAMP. ENG-30560: a DATE constant in a statement makes its DECIMAL literals FLOAT and its
+    // folded DECIMAL constants fail to compile, and a comparison needs constants, so that is TIMESTAMP.
     private VoltDBExpression inDomain(Kind kind, Supplier<VoltDBExpression> generator) {
         if (kind == Kind.TEMPORAL && avoidKnownBugs && temporalType == null) {
-            temporalType = Randomly.fromOptions(VoltDBDataType.DATE, VoltDBDataType.TIMESTAMP);
+            temporalType = VoltDBDataType.TIMESTAMP;
             try {
                 return generator.get();
             } finally {
@@ -446,7 +447,7 @@ public final class VoltDBExpressionGenerator
         if (!wildcard || Randomly.getBoolean()) {
             sb.append(Randomly.fromOptions("%", "_"));
         }
-        return new VoltDBConstant("'" + sb.toString().replace("'", "''") + "'");
+        return new VoltDBConstant(VoltDBConstantGenerator.quote(sb.toString()));
     }
 
     @Override
@@ -457,9 +458,10 @@ public final class VoltDBExpressionGenerator
     private VoltDBExpression generateConstant(Kind kind, boolean mayBeNull) {
         VoltDBDataType type = randomDataType(kind);
         if (kind == Kind.TEMPORAL && avoidKnownBugs) {
-            // ENG-30499: the planner crashes folding a comparison of a DATE constant with a TIMESTAMP constant, so
-            // constants are TIMESTAMPs, or DATEs where every operand is one (ENG-30545)
-            type = temporalType == VoltDBDataType.DATE ? VoltDBDataType.DATE : VoltDBDataType.TIMESTAMP;
+            // ENG-30499: the planner crashes folding a comparison of a DATE constant with a TIMESTAMP constant, and
+            // ENG-30560 makes a statement's DECIMAL literals FLOAT when it holds a DATE constant: constants are
+            // TIMESTAMPs
+            type = VoltDBDataType.TIMESTAMP;
         }
         // ENG-30495: a WHERE clause that folds to a constant NULL crashes the planner, and only NULL literals can make
         // it fold to NULL (ENG-30500 and ENG-30503 are wrong results with NULLs in IN lists). Unless
@@ -481,7 +483,7 @@ public final class VoltDBExpressionGenerator
             if (str.codePointCount(0, str.length()) > 1) {
                 str = str.substring(0, str.offsetByCodePoints(0, 1));
             }
-            return new VoltDBConstant("'" + str.replace("'", "''") + "'");
+            return new VoltDBConstant(VoltDBConstantGenerator.quote(str));
         }
         if (kind == Kind.VARBINARY && avoidKnownBugs) {
             // ENG-12656: an index scan for <, <=, >, >= or BETWEEN on a VARBINARY(n) column fails ("Type VARCHAR can't
@@ -512,7 +514,7 @@ public final class VoltDBExpressionGenerator
     private VoltDBExpression generateNonEmptyStringConstant() {
         String str = state.getRandomly().getString();
         str = str.isEmpty() ? state.getRandomly().getAlphabeticChar() : str.substring(0, str.offsetByCodePoints(0, 1));
-        return new VoltDBConstant("'" + str.replace("'", "''") + "'");
+        return new VoltDBConstant(VoltDBConstantGenerator.quote(str));
     }
 
     private VoltDBDataType randomDataType(Kind kind) {
@@ -657,7 +659,8 @@ public final class VoltDBExpressionGenerator
         }
         for (VoltDBTable t : explicitlyJoined) {
             // a chain of INNER JOINs with partitioned tables, where a replicated table's ON condition folds to FALSE,
-            // loses the partitioning columns' equality ("This query is not plannable"); an outer join keeps it
+            // always loses the partitioning columns' equality ("This query is not plannable"); an outer join loses it
+            // only with some WHERE clauses, and the error is expected (VoltDBErrors)
             VoltDBJoin.JoinType type = partitionJoined.isEmpty() ? randomJoinType()
                     : Randomly.fromOptions(VoltDBJoin.JoinType.LEFT, VoltDBJoin.JoinType.FULL);
             joins.add(new VoltDBJoin(new VoltDBTableReference(t), type, joinCondition(anchor, t)));
@@ -736,6 +739,9 @@ public final class VoltDBExpressionGenerator
         List<VoltDBColumn> joinColumns = new ArrayList<>(anchor.getColumns());
         joinColumns.addAll(t.getColumns());
         VoltDBExpressionGenerator gen = new VoltDBExpressionGenerator(state).setColumns(joinColumns);
+        // ENG-30497 applies to ON conditions too: a later join's condition sees the null-extended rows of the outer
+        // joins before it, as (t0.b OR t2.b) IS NOT NULL in t1 LEFT JOIN t2 ... FULL JOIN t0 ON ... did
+        gen.hasOuterJoin = true;
         return gen.generatePredicateWithColumn();
     }
 

@@ -4,11 +4,12 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 6.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 7.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), and PQS (milestone 6).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
-cluster, runs SQLancer against it and saves the results.
+cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
+see [The nightly lab job](#the-nightly-lab-job).
 
 ## Versions
 
@@ -49,6 +50,7 @@ voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 -
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--voltdb DIR` | `$VOLTDB_HOME` | A VoltDB kit or build: the directory holding `bin/voltdb`. |
+| `--license FILE` | none | The license `voltdb init` gets. An enterprise kit needs one; a build from source does not. |
 | `--nodes N` | 1 | Nodes, all on this machine. |
 | `--kfactor K` | 0 for one node, else 1 | K-safety. |
 | `--sites N` | 8 | Sites per host. |
@@ -83,6 +85,39 @@ A run FAILs if any of these happens:
 
 The cluster's data is deleted after the logs are copied, unless `--keep-cluster` is given. Several runs can share a
 machine if each has its own `--port-base`.
+
+## The nightly lab job
+
+`matrix-systemtest-apprunner-sqlancer` on jenkins-st runs this script against master's kit as part of the nightly
+system test (`matrix-systemtest/master`, on the nights the rotation in `internal`'s
+`jenkins-lab/systemtest/trigger-job-for-systemtest` gives master). Its pipeline is `internal`'s
+`jenkins-lab/systemtest/apprunner/sqlancer/Jenkinsfile`; the script it calls is `pro`'s
+`tests/apptests/jenkins-scripts/run-jenkins-sqlancer-test.sh`.
+
+The job fetches this repository at the commit in its `SQLANCER_REF` parameter. That commit is pinned in the Jenkinsfile,
+so a change here reaches the nightly run only when the Jenkinsfile is changed to name it. It then builds SQLancer with
+the kit's runtime JDK and makes two runs, one after the other, every node on the agent:
+
+| Run (triagedb name) | Cluster | Oracles | Time |
+| --- | --- | --- | --- |
+| `sqlancer-3n-k1` | 3 nodes, k=1, 8 sites per host | all six (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS) | 45 minutes |
+| `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
+
+Both runs use `--use-reducer`. The first run's seed is the UTC time as `yyyymmddHHMM`, and the second's is one more.
+`--avoid-known-bugs` stays on, so a failure is a new bug, or a known one in a new form.
+
+Each run is one row in the triagedb, with the seed in its run arguments. A failing row's reason is the oracle's account
+of the first failed database (or what else failed the run), and the run's whole results directory is archived on the
+build as `savedlogs/sqlancer/<name>-PASS.tar.gz` or `-FAIL.tar.gz`. A failing bundle is also copied to
+`gs://cloudtest-storage/apprunner-failures/<branch>/<build tag>/`, like other apprunner suites' bundles.
+
+To repeat a failure on your machine, take the seed and oracles from the bundle's `manifest.txt` and run the script with
+them against the same build. The reproduction in `reproductions/` is usually quicker: run its statements on an empty
+server.
+
+The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor`, default `3:1 1:0`), `DURATION` (seconds
+per run, default 2700), `ORACLES`, `SEED`, `EXTRA_ARGS` (provider options) and `SQLANCER_REF`. A run of the job alone
+needs a kit: give `releasedir`, for example `releases/one-offs/16.1.0-SNAPSHOT-master/<kit build>`.
 
 ## Start a VoltDB server by hand
 
@@ -197,7 +232,9 @@ supports:
   partitioning column cannot be compared with the anchor's is left out. Replicated tables are in the FROM list or,
   sometimes, joined explicitly (INNER, LEFT, RIGHT or FULL; RIGHT only when `--avoid-known-bugs` is false) with a random
   ON condition. When partitioned tables are joined, those explicit joins are LEFT or FULL: in a chain of INNER JOINs,
-  a replicated table's ON condition that folds to FALSE takes the partitioning columns' equality with it too.
+  a replicated table's ON condition that folds to FALSE takes the partitioning columns' equality with it too. An outer
+  join can lose it as well, with some WHERE clauses on the replicated table, so "This query is not plannable" is an
+  expected error (see below).
 - **Typed NULLs.** A NULL constant is `CAST(NULL AS type)`; VoltDB rejects a bare NULL whose type it cannot infer.
 - **Syntax.** Negative constants are in parentheses (`- -5` is a syntax error), `MOD` is never written as `%`, and an
   IN predicate is never the operand of a comparison or another IN (`x = (y IN (1))` is a syntax error).
@@ -345,6 +382,7 @@ Each is listed in `VoltDBErrors` with its reason. The run fails on any other err
 | INSERT | `CONSTRAINT VIOLATION` | Random values repeat existing keys. |
 | CREATE INDEX | `is not empty` | VoltDB cannot add a UNIQUE index to a table that has rows (an ASSUMEUNIQUE index it can). |
 | SELECT | `Join with filters that do not depend on joined tables is not supported` | A predicate that references a column can still fold to a constant, such as `(FALSE AND t.c) = FALSE`. |
+| SELECT | `This query is not plannable` | VoltDB plans a join of partitioned tables only when it can see the equality of their partitioning columns. The generator joins them on that equality alone, but an outer join of a replicated table whose ON condition folds to FALSE, with a WHERE clause on that table, can take the equality away. The nightly lab job found three such shapes in milestone 7; generating around each one cost coverage and did not end. |
 | SELECT | `Attempted to divide`, `data exception: division by zero` | Division by zero, at run time or in constants the planner folds. |
 | SELECT | `Invalid result value` | A FLOAT result is infinite or NaN. |
 | SELECT | `will overflow BigInt storage`, `causing overflow/underflow`, `out of range for the destination type` | Integer, DECIMAL or cast overflow. |
@@ -377,7 +415,7 @@ avoids each one as described; set it to false to check whether a fix works.
 | ENG-30494 | BOOLEAN literals are passed to the EE as parameters of the wrong value or type: cast errors and wrong rows. | Boolean constants are written `(1 = 1)` and `(1 = 0)`. |
 | ENG-30495 | A WHERE clause that folds to a constant NULL crashes the planner (NPE). | No NULL constants; NULLs come from the data. |
 | ENG-30496 | LIKE inside CASE WHEN crashes the planner when its left operand is a constant or its pattern has no wildcard or is just `%`. | LIKE's left operand is a string column; the pattern has a wildcard and a literal character. |
-| ENG-30497 | With an outer join, a boolean expression over the inner table, such as `(t.c IS NULL) IS NOT NULL` or `(t.c IS NULL) = TRUE`, turns the join into an inner join: wrong rows. | With an outer join, boolean operands of comparisons, IN and IS NULL are columns or constants. |
+| ENG-30497 | With an outer join, a boolean expression over the inner table, such as `(t.c IS NULL) IS NOT NULL` or `(t.c IS NULL) = TRUE`, turns the join into an inner join: wrong rows. In milestone 7 the nightly lab job found it again through a later join's ON condition: `(t0.b OR t2.b) IS NOT NULL` with `t2` null-extended by an earlier join. | With an outer join, boolean operands of comparisons, IN and IS NULL are columns or constants, in WHERE clauses and in every explicit join's ON condition. |
 | ENG-30499 | Comparing a DATE constant with a TIMESTAMP constant crashes the planner (ClassCastException). | Temporal constants are `CAST('...' AS TIMESTAMP)`. |
 | ENG-30500 | A boolean expression `IN (NULL, ...)` gives wrong rows. | IN list elements are constants that are not NULL. |
 | ENG-30502 | Unary minus on a NULL integer or FLOAT gives a non-NULL value. | `0 - x` instead of `-x`. |
@@ -421,7 +459,7 @@ in every query, which only an oracle that computes values outside VoltDB sees; E
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
-| ENG-30545 | Comparing a DATE with a TIMESTAMP converts the right operand to the left one's type, so with the DATE on the left the TIMESTAMP is truncated to its date: `dt = ts` is TRUE and `ts = dt` FALSE for `2020-01-02` and `2020-01-02 12:00`. Found while checking the evaluator's semantics. Wrong rows. | A temporal comparison, BETWEEN or IN uses only DATE operands or only TIMESTAMP ones. |
+| ENG-30545 | Comparing a DATE with a TIMESTAMP converts the right operand to the left one's type, so with the DATE on the left the TIMESTAMP is truncated to its date: `dt = ts` is TRUE and `ts = dt` FALSE for `2020-01-02` and `2020-01-02 12:00`. Found while checking the evaluator's semantics. Wrong rows. | A temporal comparison, BETWEEN or IN uses only DATE operands or only TIMESTAMP ones; since ENG-30560, only TIMESTAMP ones. |
 | ENG-30546 | A concatenation whose result is empty is NULL at run time: `v \|\| v` and `CONCAT(v, v)` with `v = ''`. The planner folds `'' \|\| ''` to `''`. Found by PQS in its first trial. Wrong result. | A concatenation's right operand is a constant of one character. |
 | ENG-30547 | The planner folds `+` and `-` of integer constants in 32 bits: `2147483647 + 1` is NULL and `2135068309 + 1293734779` is -866164208, where the EE computes in BIGINT. In a WHERE clause too. A folded multiplication with an operand beyond INTEGER's range is typed DECIMAL, so `7 / (2 * 3000000000)` keeps a fraction (comment on the ticket). Found by PQS. Wrong result. | PQS does not check a value that depends on folded `+`, `-` or `*` of integer constants with an operand or result outside INTEGER's range. |
 | ENG-30548 | DECIMAL constant folding differs from run-time DECIMAL arithmetic: `1 / 3.0` folds to 0.3333, and folded multiplication rounds where the EE truncates. Found while checking the evaluator's semantics. Wrong result. | None needed: no DECIMAL literals are generated while ENG-30521 is avoided. |
@@ -429,6 +467,14 @@ in every query, which only an oracle that computes values outside VoltDB sees; E
 | ENG-30552 | The string literal `'\N'` in ad hoc SQL becomes NULL, apparently because a parameter string `\N` is read as the NULL token: INSERT stores NULL, `SELECT '\N'` and the folded `'\' \|\| 'N'` return NULL. Found by PQS in the 30-minute 3-node acceptance run. Wrong result, lost data. | The constant generator never writes `'\N'`, and PQS never sends an expression of constants that is `\N`. |
 | ENG-30550 | ABS of a BIGINT multiplication is typed DECIMAL, so a division inside or after it keeps a fraction: `ABS((b * 1) / 2)` is 3.5 for `b = 7`, while `(b * 1) / 2` is 3. More generally ABS pushes a DECIMAL or FLOAT argument's type into an integer division inside it: `ABS((7 / i) - d)` divides 7 by 2 as 3.5 (comment on the ticket). Found by PQS in 5- and 10-minute trials. Wrong result. | No multiplication or division inside ABS. |
 | ENG-30549 | The planner folds a comparison of two string constants ignoring trailing spaces (`'a' = 'a '` is TRUE), while the EE compares exactly. Found by PQS. Wrong result. | PQS does not check a folded string comparison that trailing spaces decide. |
+
+The bugs below were found by the nightly lab job's first runs in milestone 7, or while reducing what they found.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30560 | A DATE constant (`CAST('...' AS DATE)`, or a string compared with a DATE column) anywhere in a statement makes its DECIMAL literals FLOAT: `SELECT 1.5, CAST('2000-01-01' AS DATE)` returns 1.5 as a FLOAT. Folded DECIMAL constants (`0.1 + 0.2`, `CAST(1.5 AS DECIMAL)`, `3000000000 * 2`) then fail to compile: "Numeric conversion error to type DECIMAL for input string". Found by TLP HAVING on 3 nodes, where `SUM(ABS(605228403.497119))` was DECIMAL in the original query and FLOAT in the partitions, whose HAVING clauses held DATE casts. Wrong result. | No DATE constants: temporal comparisons, BETWEEN and IN use TIMESTAMP operands only. DATE columns still appear in SELECT lists and aggregates. |
+| ENG-30561 | `CAST(<TIMESTAMP constant> AS DATE)` folds to an invalid date: in a SELECT list it fails with "Invalid value for MonthOfYear", and `WHERE d = CAST(CAST('2000-01-01 00:00:00' AS TIMESTAMP) AS DATE)` matches nothing. Found by hand while reducing ENG-30560. Wrong rows. | None needed: the generator never casts a constant twice. |
+| ENG-30562 | VoltDB reads a backslash before a quote as escaping it, so after a string literal ending in a backslash (`'a\'`) it strips `/*...*/` and `--` from the statement's later string literals: `INSERT ... VALUES ('a\', 'c/*d*/e')` stores `c e`, and an unclosed `/*` or `--` gives "malformed bit string". Found by TLP HAVING on 1 node, as an unexpected error. Lost data. | No string literal has a backslash at its end or before a quote (`VoltDBConstantGenerator.quote` writes a slash instead), whatever `--avoid-known-bugs` says, as for ENG-30552. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
@@ -440,6 +486,12 @@ as observed, without a server:
 
 ```bash
 mvn -Djacoco.skip=true -Dtest=TestVoltDBExpressionEvaluator test
+```
+
+`test/sqlancer/voltdb/gen/TestVoltDBConstantGenerator.java` checks how string literals are written (ENG-30562):
+
+```bash
+mvn -Djacoco.skip=true -Dtest=TestVoltDBConstantGenerator test
 ```
 
 `test/sqlancer/dbms/TestVoltDB.java` runs the provider for `TestConfig.SECONDS` against a server on localhost:21212. It
