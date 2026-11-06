@@ -231,10 +231,10 @@ supports:
   FALSE, such as `pc = pc AND (1 = 0)`, takes it away ("This query is not plannable"). A partitioned table whose
   partitioning column cannot be compared with the anchor's is left out. Replicated tables are in the FROM list or,
   sometimes, joined explicitly (INNER, LEFT, RIGHT or FULL; RIGHT only when `--avoid-known-bugs` is false) with a random
-  ON condition. When partitioned tables are joined, those explicit joins are FULL: a replicated table's ON condition
-  that folds to FALSE takes the partitioning columns' equality with it in an INNER JOIN, and in a LEFT JOIN once a
-  WHERE clause on the replicated table makes it an inner join. (Until milestone 7 they were LEFT or FULL, and the
-  nightly lab job found the LEFT case.)
+  ON condition. When partitioned tables are joined, those explicit joins are LEFT or FULL: in a chain of INNER JOINs,
+  a replicated table's ON condition that folds to FALSE takes the partitioning columns' equality with it too. An outer
+  join can lose it as well, with some WHERE clauses on the replicated table, so "This query is not plannable" is an
+  expected error (see below).
 - **Typed NULLs.** A NULL constant is `CAST(NULL AS type)`; VoltDB rejects a bare NULL whose type it cannot infer.
 - **Syntax.** Negative constants are in parentheses (`- -5` is a syntax error), `MOD` is never written as `%`, and an
   IN predicate is never the operand of a comparison or another IN (`x = (y IN (1))` is a syntax error).
@@ -382,6 +382,7 @@ Each is listed in `VoltDBErrors` with its reason. The run fails on any other err
 | INSERT | `CONSTRAINT VIOLATION` | Random values repeat existing keys. |
 | CREATE INDEX | `is not empty` | VoltDB cannot add a UNIQUE index to a table that has rows (an ASSUMEUNIQUE index it can). |
 | SELECT | `Join with filters that do not depend on joined tables is not supported` | A predicate that references a column can still fold to a constant, such as `(FALSE AND t.c) = FALSE`. |
+| SELECT | `This query is not plannable` | VoltDB plans a join of partitioned tables only when it can see the equality of their partitioning columns. The generator joins them on that equality alone, but an outer join of a replicated table whose ON condition folds to FALSE, with a WHERE clause on that table, can take the equality away. The nightly lab job found three such shapes in milestone 7; generating around each one cost coverage and did not end. |
 | SELECT | `Attempted to divide`, `data exception: division by zero` | Division by zero, at run time or in constants the planner folds. |
 | SELECT | `Invalid result value` | A FLOAT result is infinite or NaN. |
 | SELECT | `will overflow BigInt storage`, `causing overflow/underflow`, `out of range for the destination type` | Integer, DECIMAL or cast overflow. |

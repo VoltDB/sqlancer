@@ -38,6 +38,10 @@ public final class VoltDBErrors {
         // VoltDB does not support a join whose WHERE clause folds to a filter on none of the joined tables; a
         // predicate that references a column can still fold to a constant, e.g. (FALSE AND t.c) = FALSE
         errors.add("Join with filters that do not depend on joined tables is not supported");
+        // VoltDB plans a join of partitioned tables only when it can see the equality of their partitioning columns.
+        // The generator joins them on that equality alone, but an outer join of a replicated table whose ON condition
+        // folds to FALSE, with a WHERE clause on that table, can take the equality away; the shapes that do are many
+        errors.add("This query is not plannable");
         // ENG-30508: the same rejected filter, when it is an IN with a DECIMAL constant on the left, fails with an
         // internal error instead
         errors.add("NUMERIC constant value type must match a FLOAT, DECIMAL, or integral column, not null");

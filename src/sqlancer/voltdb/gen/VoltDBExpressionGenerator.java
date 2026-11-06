@@ -639,8 +639,9 @@ public final class VoltDBExpressionGenerator
             anchor = fromTables.remove(fromTables.size() - 1);
         }
         List<VoltDBTable> explicitlyJoined = new ArrayList<>();
-        // with partitioned tables joined, only a FULL JOIN of a replicated table is always plannable (see below), and
-        // a FULL JOIN is left out for ENG-30531, so such a generator keeps replicated tables in the FROM list
+        // with partitioned tables joined, a LEFT JOIN of a replicated table whose ON condition folds to FALSE is "not
+        // plannable" once a WHERE clause on that table makes it an inner join, and a FULL JOIN is left out for
+        // ENG-30531, so such a generator keeps replicated tables in the FROM list
         boolean mayJoinReplicated = !(avoidKnownBugs && noFullJoins && !partitionJoined.isEmpty());
         for (VoltDBTable t : new ArrayList<>(fromTables)) {
             if (mayJoinReplicated && Randomly.getBooleanWithRatherLowProbability()) {
@@ -657,10 +658,11 @@ public final class VoltDBExpressionGenerator
             all.addAll(t.getColumns());
         }
         for (VoltDBTable t : explicitlyJoined) {
-            // with partitioned tables joined, an INNER JOIN of a replicated table whose ON condition folds to FALSE
-            // loses the partitioning columns' equality ("This query is not plannable"), and so does a LEFT JOIN once
-            // a WHERE clause on the replicated table makes it an inner join; a FULL JOIN keeps it
-            VoltDBJoin.JoinType type = partitionJoined.isEmpty() ? randomJoinType() : VoltDBJoin.JoinType.FULL;
+            // a chain of INNER JOINs with partitioned tables, where a replicated table's ON condition folds to FALSE,
+            // always loses the partitioning columns' equality ("This query is not plannable"); an outer join loses it
+            // only with some WHERE clauses, and the error is expected (VoltDBErrors)
+            VoltDBJoin.JoinType type = partitionJoined.isEmpty() ? randomJoinType()
+                    : Randomly.fromOptions(VoltDBJoin.JoinType.LEFT, VoltDBJoin.JoinType.FULL);
             joins.add(new VoltDBJoin(new VoltDBTableReference(t), type, joinCondition(anchor, t)));
             all.addAll(t.getColumns());
         }
