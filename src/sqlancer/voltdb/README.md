@@ -1,12 +1,13 @@
 # VoltDB provider
 
 A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for ENG-30396. It generates random
-VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, and runs SQLancer's oracles
+VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 8.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 9.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
-PARAMS, literals against JDBC parameters (milestone 8).
+PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
+upserted and deleted before the oracles run.
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -164,6 +165,8 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS` or `SMOKE`; several are comma-separated. |
 | `--max-num-tables` | Tables per database, 1 to this (default 3). |
 | `--max-num-indexes` | CREATE INDEX statements per database, 0 to this (default 4). |
+| `--max-num-updates` | UPDATE statements per database, 0 to this (default 5). |
+| `--max-num-deletes` | DELETE statements per database, 0 to this (default 2). |
 | `--retry-seconds` | How long a statement rejected because of another thread's schema change is retried (default 120). |
 | `--avoid-known-bugs` | `true` (the default) keeps the generator away from the VoltDB bugs listed below, so a failure is something new. `false` generates them too. |
 
@@ -396,7 +399,15 @@ A failure reports both queries and the parameters' values and types, and `--use-
 - **Types.** TINYINT, SMALLINT, INTEGER, BIGINT, FLOAT, DECIMAL, VARCHAR, VARBINARY, TIMESTAMP, DATE and BOOLEAN.
   VARCHAR and VARBINARY sizes fall on both sides of 64 bytes, where VoltDB moves values out of the row. GEOGRAPHY types
   are not generated yet.
-- **Inserts** are single-row (VoltDB has no multi-row VALUES), and always set every NOT NULL column.
+- **Inserts** are single-row (VoltDB has no multi-row VALUES), and always set every NOT NULL column. About one in
+  ten, into a table with a primary key, is an UPSERT instead (VoltDB supports UPSERT only there).
+- **Updates and deletes** (milestone 9) run among the inserts and CREATE INDEX statements that build a database, so the
+  oracles check data that rows were updated, replaced and deleted to reach, through indexes built before and after.
+  - `UPDATE t SET c = v [, ...] [WHERE p]` sets one to three columns. Each gets a constant of its type or an expression
+    of its kind over the table's columns.
+  - The partitioning column is never set: VoltDB does not support updating it.
+  - `DELETE FROM t [WHERE p]` almost always has a WHERE clause, so a database keeps rows for the oracles.
+  - WHERE clauses come from the same generator as the queries' and avoid the same bugs.
 
 ### Intentional VoltDB differences
 
@@ -420,6 +431,8 @@ Each is listed in `VoltDBErrors` with its reason. The run fails on any other err
 | Statement | Error | Why it cannot be avoided |
 | --- | --- | --- |
 | INSERT | `CONSTRAINT VIOLATION` | Random values repeat existing keys. |
+| UPDATE | `CONSTRAINT VIOLATION` | A random new value repeats a primary key or unique value, or is NULL in a NOT NULL column. VoltDB checks constraints row by row, so even `SET k = k + 1` on a unique `k` fails once one row's new value meets the next row's old one. |
+| UPDATE | `is too wide`, `exceeds the size of the`, `overflows/underflows`, `has an invalid format for a constant <integer type> value` | A new value does not fit its column: too long for a VARCHAR or VARBINARY, out of an integer type's range, or a constant with a fraction set into an integer column. |
 | CREATE INDEX | `is not empty` | VoltDB cannot add a UNIQUE index to a table that has rows (an ASSUMEUNIQUE index it can). |
 | SELECT | `Join with filters that do not depend on joined tables is not supported` | A predicate that references a column can still fold to a constant, such as `(FALSE AND t.c) = FALSE`. |
 | SELECT | `This query is not plannable` | VoltDB plans a join of partitioned tables only when it can see the equality of their partitioning columns. The generator joins them on that equality alone, but an outer join of a replicated table whose ON condition folds to FALSE, with a WHERE clause on that table, can take the equality away. The nightly lab job found three such shapes in milestone 7; generating around each one cost coverage and did not end. |
@@ -525,6 +538,13 @@ The bugs below were found by the PARAMS oracle in milestone 8, in its first two 
 | ENG-30534 (comment) | The milestone 5 bug, wider than filed: in a GROUP BY statement that is not auto-parameterized, an aggregate of a VARCHAR literal and one of a VARBINARY literal with the same text are one expression. `MAX('00')` returns the byte 0x00 beside `MAX(x'00')`, and in the other order the query fails with "VARCHAR can't be cast as VARBINARY". No join or empty string is needed. Found by PARAMS on 1 node and on 3 nodes. Wrong result. | VARBINARY constants are always parameters. |
 | ENG-30551 (seen again) | The milestone 6 node crash: an expression of FLOAT constants that folds to a subnormal value, such as `0.63E0 / 0.70E0 / (0 - 1.8E308)`, makes the plan fail to load ("JSON parse failure"). Every PARAMS query is a statement VoltDB does not auto-parameterize, which is where this bites. Found by PARAMS on 1 node and on 3 nodes. | PARAMS skips a query with an expression of constants the PQS evaluator cannot predict. |
 | ENG-30572 | In HAVING, two aggregates that differ only in their parameters take the first one's value: `HAVING MAX(k + ?) < MAX(k + ?)` with 1 and 2 returns no groups. In the SELECT list, and with literals, they are kept apart. Found by PARAMS: all four failed databases of its second trial. Wrong rows. | Constants in HAVING's aggregates stay literals. |
+
+The bugs below were found by the UPDATE generator in milestone 9, in its first trials.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30494 (comment) | The milestone 2 bug, in UPDATE: a BOOLEAN literal in SET takes another assignment's or the WHERE clause's parameter. `UPDATE t SET b1 = FALSE, b2 = TRUE WHERE k = 1` fails with "BOOLEAN can't be cast as BIGINT", and a second UPDATE of the same shape fails once the first's plan is cached. | A BOOLEAN column is set to `(1 = 1)` or `(1 = 0)`. |
+| ENG-30561 (comment) | The milestone 7 bug, in assignment: a TIMESTAMP constant set into a DATE column, by UPDATE or INSERT, fails to plan with "has an invalid format for a constant date value", quoting the timestamp's microseconds. A TIMESTAMP column converts correctly. | A DATE column is set to a date string. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.

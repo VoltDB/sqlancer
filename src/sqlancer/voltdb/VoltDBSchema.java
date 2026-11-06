@@ -112,10 +112,12 @@ public class VoltDBSchema extends AbstractSchema<VoltDBGlobalState, VoltDBSchema
     public static class VoltDBTable extends AbstractRelationalTable<VoltDBColumn, TableIndex, VoltDBGlobalState> {
 
         private final String partitionColumn;
+        private final List<String> primaryKey;
 
-        public VoltDBTable(String name, List<VoltDBColumn> columns, String partitionColumn) {
+        public VoltDBTable(String name, List<VoltDBColumn> columns, String partitionColumn, List<String> primaryKey) {
             super(name, columns, Collections.emptyList(), false);
             this.partitionColumn = partitionColumn;
+            this.primaryKey = primaryKey;
         }
 
         // The partitioning column's name, or null for a replicated table.
@@ -125,6 +127,11 @@ public class VoltDBSchema extends AbstractSchema<VoltDBGlobalState, VoltDBSchema
 
         public boolean isPartitioned() {
             return partitionColumn != null;
+        }
+
+        // The primary key's column names, empty when the table has none. VoltDB can UPSERT only into a table with one.
+        public List<String> getPrimaryKey() {
+            return primaryKey;
         }
     }
 
@@ -137,7 +144,7 @@ public class VoltDBSchema extends AbstractSchema<VoltDBGlobalState, VoltDBSchema
         List<VoltDBTable> tables = new ArrayList<>();
         for (String[] t : getTables(md, prefix)) {
             List<VoltDBColumn> columns = getColumns(md, t[0]);
-            VoltDBTable table = new VoltDBTable(t[0], columns, t[1]);
+            VoltDBTable table = new VoltDBTable(t[0], columns, t[1], getPrimaryKey(md, t[0]));
             for (VoltDBColumn c : columns) {
                 c.setTable(table);
             }
@@ -162,6 +169,18 @@ public class VoltDBSchema extends AbstractSchema<VoltDBGlobalState, VoltDBSchema
             }
         }
         return tables;
+    }
+
+    private static List<String> getPrimaryKey(DatabaseMetaData md, String table) throws SQLException {
+        List<String> key = new ArrayList<>();
+        try (ResultSet rs = md.getPrimaryKeys(null, null, table)) {
+            while (rs.next()) {
+                if (table.equals(rs.getString("TABLE_NAME"))) {
+                    key.add(rs.getString("COLUMN_NAME"));
+                }
+            }
+        }
+        return key;
     }
 
     private static List<VoltDBColumn> getColumns(DatabaseMetaData md, String table) throws SQLException {

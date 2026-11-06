@@ -21,9 +21,11 @@ import sqlancer.SQLProviderAdapter;
 import sqlancer.StatementExecutor;
 import sqlancer.common.query.SQLQueryAdapter;
 import sqlancer.common.query.SQLQueryProvider;
+import sqlancer.voltdb.gen.VoltDBDeleteGenerator;
 import sqlancer.voltdb.gen.VoltDBIndexGenerator;
 import sqlancer.voltdb.gen.VoltDBInsertGenerator;
 import sqlancer.voltdb.gen.VoltDBTableGenerator;
+import sqlancer.voltdb.gen.VoltDBUpdateGenerator;
 
 /**
  * SQLancer provider for VoltDB, connecting through the VoltDB JDBC driver.
@@ -41,7 +43,8 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
     }
 
     public enum Action implements AbstractAction<VoltDBGlobalState> {
-        INSERT(VoltDBInsertGenerator::getQuery), CREATE_INDEX(VoltDBIndexGenerator::getQuery);
+        INSERT(VoltDBInsertGenerator::getQuery), CREATE_INDEX(VoltDBIndexGenerator::getQuery),
+        UPDATE(VoltDBUpdateGenerator::getQuery), DELETE(VoltDBDeleteGenerator::getQuery);
 
         private final SQLQueryProvider<VoltDBGlobalState> sqlQueryProvider;
 
@@ -62,6 +65,11 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
             return r.getInteger(0, globalState.getOptions().getMaxNumberInserts());
         case CREATE_INDEX:
             return r.getInteger(0, globalState.getDbmsSpecificOptions().maxNumIndexes + 1);
+        // fewer than the inserts, and few deletes, so that a database keeps rows for the oracles
+        case UPDATE:
+            return r.getInteger(0, globalState.getDbmsSpecificOptions().maxNumUpdates + 1);
+        case DELETE:
+            return r.getInteger(0, globalState.getDbmsSpecificOptions().maxNumDeletes + 1);
         default:
             throw new AssertionError(a);
         }
