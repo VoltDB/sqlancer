@@ -6,6 +6,7 @@ import sqlancer.common.oracle.TestOracle;
 import sqlancer.common.query.ExpectedErrors;
 import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 import sqlancer.voltdb.gen.VoltDBExpressionGenerator;
+import sqlancer.voltdb.oracle.VoltDBParameterOracle;
 import sqlancer.voltdb.oracle.VoltDBPivotedQuerySynthesisOracle;
 import sqlancer.voltdb.oracle.VoltDBSmokeOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPAggregateOracle;
@@ -88,6 +89,16 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBPivotedQuerySynthesisOracle(globalState, expressionErrors());
+        }
+    },
+
+    /**
+     * Checks that a query returns the same rows when some of its constants are JDBC parameters instead of literals.
+     */
+    PARAMS {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBParameterOracle(globalState, expressionErrors());
         }
     };
 

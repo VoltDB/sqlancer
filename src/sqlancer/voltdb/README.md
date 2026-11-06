@@ -4,8 +4,9 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 7.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
-milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), and PQS (milestone 6).
+**Status: milestone 8.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
+PARAMS, literals against JDBC parameters (milestone 8).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -100,7 +101,7 @@ the kit's runtime JDK and makes two runs, one after the other, every node on the
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1` | 3 nodes, k=1, 8 sites per host | all six (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS) | 45 minutes |
+| `sqlancer-3n-k1` | 3 nodes, k=1, 8 sites per host | all seven (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS) | 45 minutes |
 | `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
 
 Both runs use `--use-reducer`. The first run's seed is the UTC time as `yyyymmddHHMM`, and the second's is one more.
@@ -160,7 +161,7 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | `--username`, `--password` | Empty for a server without security (SQLancer's default is `sqlancer`). |
 | `--host`, `--port` | A server's client port. Defaults: localhost, 21212. |
 | `--database-prefix` | Prefix of each thread's table names. Default `database`; `db` keeps the logs short. |
-| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS` or `SMOKE`; several are comma-separated. |
+| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS` or `SMOKE`; several are comma-separated. |
 | `--max-num-tables` | Tables per database, 1 to this (default 3). |
 | `--max-num-indexes` | CREATE INDEX statements per database, 0 to this (default 4). |
 | `--retry-seconds` | How long a statement rejected because of another thread's schema change is retried (default 120). |
@@ -340,6 +341,45 @@ integer or FLOAT NULL sentinel, a DECIMAL mixed or compared with a FLOAT, and or
 A failure reports the query, the pivot row, and the expected and actual values. Its reducer checks that every table
 still holds its row of the pivot row before re-running the query.
 
+## The PARAMS oracle
+
+PARAMS (`oracle/VoltDBParameterOracle`) runs each query twice: once with its constants as literals, and once with some
+of them as JDBC parameters of a `PreparedStatement`. Both must return the same rows. VoltDB turns an ad hoc statement's
+literals into parameters itself, or plans the statement with them inline when it cannot, so the two queries reach the
+planner and the executor by different paths, with values typed differently. Most of the bugs found in milestones 6
+and 7 (ENG-30551, ENG-30552, ENG-30560, ENG-30562) were in that literal handling.
+
+The query is a SELECT of columns and up to a few expressions with a WHERE clause, or a GROUP BY query with aggregates
+and maybe WHERE and HAVING clauses, over the same joins as TLP WHERE (GROUP BY queries make no FULL JOINs, for
+ENG-30531, since a parameter can change the plan). Each constant becomes a parameter with probability 3/4, written as:
+
+- `?` when the other operand of its comparison, arithmetic, LIKE, BETWEEN or IN is a column whose type holds the value.
+  VoltDB gives such a parameter the column's type and rejects a value that does not fit ("out of range for the target
+  parameter type"), which is documented behavior, so a value is bare only where it fits.
+- `CAST(? AS T)` otherwise, where T is the literal's own type (INTEGER or BIGINT by size, DECIMAL, FLOAT, VARCHAR,
+  VARBINARY, TIMESTAMP). VoltDB cannot type a bare parameter with no column beside it ("data type cast needed for
+  parameter or null literal"), and types one inside ABS as FLOAT where the literal would be an integer.
+
+Values are bound with the matching setter (`setLong`, `setBigDecimal`, `setDouble`, `setString`, `setBytes`,
+`setTimestamp`). A TIMESTAMP is bound as its instant at UTC, which is how VoltDB reads a TIMESTAMP literal, so the JVM's
+time zone does not shift it.
+
+These stay literals: BOOLEAN constants (ENG-30494) and typed NULLs; and, while `--avoid-known-bugs` is true, the
+operands of an expression of constants alone, which the planner folds differently from how the executor computes
+(ENG-30547, ENG-30548), and constants in a HAVING clause's aggregates (ENG-30572). A statement with parameters is not
+auto-parameterized, so its remaining literals reach the planner as literals, which three known bugs make unsafe. While
+`--avoid-known-bugs` is true, these constants are therefore always parameters, and a query that would have to keep one as a
+literal is skipped:
+- DECIMAL constants: the planner reads them as FLOAT (ENG-30560).
+- VARBINARY constants: an aggregate of one is taken for an aggregate of a VARCHAR literal with the same text (ENG-30534).
+- Strings holding `?`: the JDBC driver counts it as a parameter (ENG-30571).
+
+A query is also skipped when one of its expressions of constants cannot be predicted by the PQS evaluator, such as one
+that folds to a subnormal FLOAT, whose plan then fails to load (ENG-30551) and which can crash the node later.
+
+An expected error in either query skips the check; an unexpected one fails it. Rows are compared as TLP compares them.
+A failure reports both queries and the parameters' values and types, and `--use-reducer` works.
+
 ## How the provider maps SQLancer onto VoltDB
 
 - **One schema, many databases.** A VoltDB cluster has a single schema, so each SQLancer database is the set of tables
@@ -476,6 +516,16 @@ The bugs below were found by the nightly lab job's first runs in milestone 7, or
 | ENG-30561 | `CAST(<TIMESTAMP constant> AS DATE)` folds to an invalid date: in a SELECT list it fails with "Invalid value for MonthOfYear", and `WHERE d = CAST(CAST('2000-01-01 00:00:00' AS TIMESTAMP) AS DATE)` matches nothing. Found by hand while reducing ENG-30560. Wrong rows. | None needed: the generator never casts a constant twice. |
 | ENG-30562 | VoltDB reads a backslash before a quote as escaping it, so after a string literal ending in a backslash (`'a\'`) it strips `/*...*/` and `--` from the statement's later string literals: `INSERT ... VALUES ('a\', 'c/*d*/e')` stores `c e`, and an unclosed `/*` or `--` gives "malformed bit string". Found by TLP HAVING on 1 node, as an unexpected error. Lost data. | No string literal has a backslash at its end or before a quote (`VoltDBConstantGenerator.quote` writes a slash instead), whatever `--avoid-known-bugs` says, as for ENG-30552. |
 
+The bugs below were found by the PARAMS oracle in milestone 8, in its first two 3-minute trials.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30571 | The JDBC driver counts every `?` in a prepared statement's text as a parameter, including one inside a string literal (`(query + ";").split("\\?")` in `JDBC4Statement`), so any prepared statement with a literal such as `'?'` or `'what?'` fails: "Incorrect number of parameters passed". Found by PARAMS: all four failed databases of its first trial. | A string holding `?` is always a parameter. |
+| ENG-30560 (comment) | The milestone 7 bug, wider than filed: any statement VoltDB does not auto-parameterize reads a DECIMAL literal as FLOAT and fails to plan `CAST(1.5 AS DECIMAL)` or `0.1 + 0.2`. That is every prepared statement with parameters and every stored procedure, with or without parameters; a DATE constant was only one way to stop auto-parameterization. Found by PARAMS: all seven failed databases of its two 10-minute trials. | DECIMAL constants are always parameters. |
+| ENG-30534 (comment) | The milestone 5 bug, wider than filed: in a GROUP BY statement that is not auto-parameterized, an aggregate of a VARCHAR literal and one of a VARBINARY literal with the same text are one expression. `MAX('00')` returns the byte 0x00 beside `MAX(x'00')`, and in the other order the query fails with "VARCHAR can't be cast as VARBINARY". No join or empty string is needed. Found by PARAMS on 1 node and on 3 nodes. Wrong result. | VARBINARY constants are always parameters. |
+| ENG-30551 (seen again) | The milestone 6 node crash: an expression of FLOAT constants that folds to a subnormal value, such as `0.63E0 / 0.70E0 / (0 - 1.8E308)`, makes the plan fail to load ("JSON parse failure"). Every PARAMS query is a statement VoltDB does not auto-parameterize, which is where this bites. Found by PARAMS on 1 node and on 3 nodes. | PARAMS skips a query with an expression of constants the PQS evaluator cannot predict. |
+| ENG-30572 | In HAVING, two aggregates that differ only in their parameters take the first one's value: `HAVING MAX(k + ?) < MAX(k + ?)` with 1 and 2 returns no groups. In the SELECT list, and with literals, they are kept apart. Found by PARAMS: all four failed databases of its second trial. Wrong rows. | Constants in HAVING's aggregates stay literals. |
+
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
 
@@ -486,6 +536,12 @@ as observed, without a server:
 
 ```bash
 mvn -Djacoco.skip=true -Dtest=TestVoltDBExpressionEvaluator test
+```
+
+`test/sqlancer/voltdb/oracle/TestVoltDBParameterOracle.java` checks how PARAMS types its parameters:
+
+```bash
+mvn -Djacoco.skip=true -Dtest=TestVoltDBParameterOracle test
 ```
 
 `test/sqlancer/voltdb/gen/TestVoltDBConstantGenerator.java` checks how string literals are written (ENG-30562):
