@@ -23,6 +23,12 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--max-num-indexes", description = "The maximum number of CREATE INDEX statements each database issues")
     public int maxNumIndexes = 4;
 
+    @Parameter(names = "--max-num-updates", description = "The maximum number of UPDATE statements each database issues")
+    public int maxNumUpdates = 5;
+
+    @Parameter(names = "--max-num-deletes", description = "The maximum number of DELETE statements each database issues")
+    public int maxNumDeletes = 2;
+
     @Parameter(names = "--retry-seconds", description = "How long a statement VoltDB rejects because of a concurrent schema change is retried")
     public int retrySeconds = 120;
 

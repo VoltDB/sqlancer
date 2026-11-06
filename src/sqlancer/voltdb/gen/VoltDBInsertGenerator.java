@@ -12,7 +12,10 @@ import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 import sqlancer.voltdb.VoltDBSchema.VoltDBColumn;
 import sqlancer.voltdb.VoltDBSchema.VoltDBTable;
 
-/** Single-row INSERT. VoltDB has no multi-row VALUES, and every NOT NULL column is always given a value. */
+/**
+ * Single-row INSERT, or UPSERT into a table with a primary key (VoltDB supports UPSERT only there). VoltDB has no
+ * multi-row VALUES, and every NOT NULL column, which includes the primary key's, is always given a value.
+ */
 public final class VoltDBInsertGenerator {
 
     private VoltDBInsertGenerator() {
@@ -30,7 +33,9 @@ public final class VoltDBInsertGenerator {
             columns.add(Randomly.fromList(table.getColumns()));
         }
         Randomly r = globalState.getRandomly();
-        String sql = "INSERT INTO " + table.getName() + " ("
+        String verb = !table.getPrimaryKey().isEmpty() && Randomly.getBooleanWithRatherLowProbability() ? "UPSERT"
+                : "INSERT";
+        String sql = verb + " INTO " + table.getName() + " ("
                 + columns.stream().map(VoltDBColumn::getName).collect(Collectors.joining(", ")) + ") VALUES ("
                 + columns.stream().map(c -> VoltDBConstantGenerator.generate(r, c.getType(), c.isNullable()))
                         .collect(Collectors.joining(", "))

@@ -69,6 +69,21 @@ public final class VoltDBErrors {
         errors.add("CONSTRAINT VIOLATION");
     }
 
+    public static void addUpdateErrors(ExpectedErrors errors) {
+        // a random new value can repeat a primary key or unique value, or be NULL in a NOT NULL column; VoltDB checks
+        // constraints row by row, so even SET k = k + 1 on a unique k fails once one row's new value meets the next
+        errors.add("CONSTRAINT VIOLATION");
+        // a value does not fit the column: a constant at planning time, or a computed value when it is stored
+        errors.add("is too wide");
+        errors.add("exceeds the size of the");
+        errors.add("overflows/underflows");
+        // a constant with a fraction, such as (0 - 0.42E0), set into an integer column is rejected when planned; not
+        // the same message for a DATE column, which is ENG-30561
+        for (String type : new String[] { "tinyint", "smallint", "integer", "bigint" }) {
+            errors.add("has an invalid format for a constant " + type + " value");
+        }
+    }
+
     public static void addIndexErrors(ExpectedErrors errors) {
         // VoltDB cannot add a UNIQUE index (an ASSUMEUNIQUE one it can) to a table that already holds rows
         errors.add("is not empty");
