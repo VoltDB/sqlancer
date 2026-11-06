@@ -231,8 +231,10 @@ supports:
   FALSE, such as `pc = pc AND (1 = 0)`, takes it away ("This query is not plannable"). A partitioned table whose
   partitioning column cannot be compared with the anchor's is left out. Replicated tables are in the FROM list or,
   sometimes, joined explicitly (INNER, LEFT, RIGHT or FULL; RIGHT only when `--avoid-known-bugs` is false) with a random
-  ON condition. When partitioned tables are joined, those explicit joins are LEFT or FULL: in a chain of INNER JOINs,
-  a replicated table's ON condition that folds to FALSE takes the partitioning columns' equality with it too.
+  ON condition. When partitioned tables are joined, those explicit joins are FULL: a replicated table's ON condition
+  that folds to FALSE takes the partitioning columns' equality with it in an INNER JOIN, and in a LEFT JOIN once a
+  WHERE clause on the replicated table makes it an inner join. (Until milestone 7 they were LEFT or FULL, and the
+  nightly lab job found the LEFT case.)
 - **Typed NULLs.** A NULL constant is `CAST(NULL AS type)`; VoltDB rejects a bare NULL whose type it cannot infer.
 - **Syntax.** Negative constants are in parentheses (`- -5` is a syntax error), `MOD` is never written as `%`, and an
   IN predicate is never the operand of a comparison or another IN (`x = (y IN (1))` is a syntax error).
