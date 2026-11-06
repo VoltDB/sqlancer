@@ -97,6 +97,10 @@ public final class VoltDBExpressionEvaluator {
             return Arrays.hashCode(bytes);
         }
 
+        byte[] getBytes() {
+            return bytes.clone();
+        }
+
         int compareTo(Binary other) {
             return Arrays.compareUnsigned(bytes, other.bytes);
         }
@@ -292,7 +296,7 @@ public final class VoltDBExpressionEvaluator {
     }
 
     // whether the expression has no column, so that the planner folds it
-    private static boolean isConstant(VoltDBExpression expr) {
+    static boolean isConstant(VoltDBExpression expr) {
         if (expr instanceof VoltDBConstant) {
             return true;
         }
