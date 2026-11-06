@@ -737,6 +737,9 @@ public final class VoltDBExpressionGenerator
         List<VoltDBColumn> joinColumns = new ArrayList<>(anchor.getColumns());
         joinColumns.addAll(t.getColumns());
         VoltDBExpressionGenerator gen = new VoltDBExpressionGenerator(state).setColumns(joinColumns);
+        // ENG-30497 applies to ON conditions too: a later join's condition sees the null-extended rows of the outer
+        // joins before it, as (t0.b OR t2.b) IS NOT NULL in t1 LEFT JOIN t2 ... FULL JOIN t0 ON ... did
+        gen.hasOuterJoin = true;
         return gen.generatePredicateWithColumn();
     }
 
