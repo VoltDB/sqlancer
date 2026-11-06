@@ -4,11 +4,12 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 10.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 11.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
-VIEWS oracle checks.
+VIEWS oracle checks. Since milestone 11 expressions also use CASE, COALESCE, MOD, FLOOR, CEILING, CHAR_LENGTH,
+SUBSTRING, UPPER, LOWER and TRIM, and the LIMIT oracle checks LIMIT and OFFSET.
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -163,7 +164,7 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | `--username`, `--password` | Empty for a server without security (SQLancer's default is `sqlancer`). |
 | `--host`, `--port` | A server's client port. Defaults: localhost, 21212. |
 | `--database-prefix` | Prefix of each thread's table names. Default `database`; `db` keeps the logs short. |
-| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS` or `SMOKE`; several are comma-separated. |
+| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT` or `SMOKE`; several are comma-separated. |
 | `--max-num-tables` | Tables per database, 1 to this (default 3). |
 | `--max-num-indexes` | CREATE INDEX statements per database, 0 to this (default 4). |
 | `--max-num-updates` | UPDATE statements per database, 0 to this (default 5). |
@@ -338,11 +339,19 @@ it. SQLancer's tables are small, so the rows are read and checked in Java; a que
   as midnight.
 - A string literal goes through UTF-8 first, as the driver sends it: a character UTF-8 cannot encode, such as a lone
   surrogate in SQLancer's random strings, reaches VoltDB as `?`.
+- CASE and COALESCE take the widest type of their results: integers and DECIMAL give DECIMAL, and any FLOAT gives
+  FLOAT. FLOOR, CEILING and ABS keep their argument's type; MOD (of integers) and CHAR_LENGTH are integers, and MOD
+  takes the dividend's sign.
+- Strings are counted in characters. `SUBSTRING(s, start, length)` is positions start to start + length - 1, counting
+  from 1, so a start of 0 or less shortens it; it is empty, never NULL, past the end. TRIM, LTRIM and RTRIM remove
+  spaces only.
 
 What it cannot predict, it does not check: an expression is left out of the SELECT list, and a predicate skips the
 check. That covers errors (VoltDB evaluates every operand, so an error anywhere fails the query), results equal to an
 integer or FLOAT NULL sentinel, a DECIMAL mixed or compared with a FLOAT, and ordered comparisons of BOOLEAN values
-(ENG-30493). Its unit tests are `test/sqlancer/voltdb/oracle/TestVoltDBExpressionEvaluator.java`.
+(ENG-30493). An error in a CASE or COALESCE branch that is not taken counts too: VoltDB skips the branch at run time,
+but fails on it when the planner folds it. So does UPPER or LOWER of a string beyond ASCII, which VoltDB leaves as it
+is (`UPPER('é')` is `'é'`). Its unit tests are `test/sqlancer/voltdb/oracle/TestVoltDBExpressionEvaluator.java`.
 
 A failure reports the query, the pivot row, and the expected and actual values. Its reducer checks that every table
 still holds its row of the pivot row before re-running the query.
@@ -422,6 +431,24 @@ per-partition rows when it is read, so a view of a partitioned table also has on
 the three queries and the rows that differ, and `--use-reducer` works. A view whose CREATE VIEW failed with an expected
 error is skipped.
 
+## The LIMIT oracle
+
+LIMIT (`oracle/VoltDBLimitOracle`) checks LIMIT and OFFSET. A query ordered by every one of its output columns has one
+order, up to rows that are the same in every column, so `LIMIT n OFFSET m` must return exactly rows m + 1 to m + n of
+the query without them, in the same order.
+
+- The query reads the FROM clauses and joins of TLP WHERE, has a WHERE clause half the time, and is DISTINCT about one
+  time in four (without FULL joins then, for ENG-30531).
+- It outputs columns, or one to three expressions that read a column, of any kind but BOOLEAN, which VoltDB orders
+  wrongly (ENG-30493). VoltDB rejects ORDER BY of a constant.
+- ORDER BY names every output by position, each ascending or descending. LIMIT is 0 to 12, and OFFSET 0 to 12.
+- Rows are compared in order, FLOAT values exactly with -0.0 as 0.0: the two are equal, so they tie, and either may
+  come first.
+
+VoltDB pushes LIMIT and OFFSET down to the partitions of a multi-partition query and merges their sorted results;
+that, and ORDER BY on expressions and DISTINCT, is what this checks. A failure reports both queries, the full query's
+rows, and the expected and actual slices.
+
 ## How the provider maps SQLancer onto VoltDB
 
 - **One schema, many databases.** A VoltDB cluster has a single schema, so each SQLancer database is the set of tables
@@ -440,6 +467,15 @@ error is skipped.
   are not generated yet.
 - **Inserts** are single-row (VoltDB has no multi-row VALUES), and always set every NOT NULL column. About one in
   ten, into a table with a primary key, is an UPSERT instead (VoltDB supports UPSERT only there).
+- **Expressions** (milestone 11). Besides comparisons, AND, OR, NOT, IS NULL, BETWEEN, IN, LIKE, arithmetic, ABS and
+  `||`, the generator writes:
+  - numeric: `FLOOR`, `CEILING`, `MOD` of integers, `CHAR_LENGTH` of a string, `CASE` and `COALESCE`;
+  - string: `SUBSTRING(s, start [, length])` with constant positions, `UPPER`, `LOWER`, `TRIM`, `LTRIM`, `RTRIM`,
+    `CASE` and `COALESCE`.
+
+  A CASE is searched, `CASE WHEN p THEN x [ELSE y] END`. While `--avoid-known-bugs` is true it has one WHEN and an
+  ELSE (ENG-30590 below), and there is no CASE in a query with an outer join (ENG-30497 below). There is no
+  multiplication or division inside ABS, FLOOR, CEILING, MOD, CASE or COALESCE while it is true (ENG-30550 below).
 - **Updates and deletes** (milestone 9) run among the inserts and CREATE INDEX statements that build a database, so the
   oracles check data that rows were updated, replaced and deleted to reach, through indexes built before and after.
   - `UPDATE t SET c = v [, ...] [WHERE p]` sets one to three columns. Each gets a constant of its type or an expression
@@ -477,7 +513,8 @@ Each is listed in `VoltDBErrors` with its reason. The run fails on any other err
 | CREATE INDEX | `is not empty` | VoltDB cannot add a UNIQUE index to a table that has rows (an ASSUMEUNIQUE index it can). |
 | SELECT | `Join with filters that do not depend on joined tables is not supported` | A predicate that references a column can still fold to a constant, such as `(FALSE AND t.c) = FALSE`. |
 | SELECT | `This query is not plannable` | VoltDB plans a join of partitioned tables only when it can see the equality of their partitioning columns. The generator joins them on that equality alone, but an outer join of a replicated table whose ON condition folds to FALSE, with a WHERE clause on that table, can take the equality away. The nightly lab job found three such shapes in milestone 7; generating around each one cost coverage and did not end. |
-| SELECT | `Attempted to divide`, `data exception: division by zero` | Division by zero, at run time or in constants the planner folds. |
+| SELECT | `Attempted to divide`, `division by zero` | Division or MOD by zero, at run time or in constants the planner folds. |
+| SELECT (LIMIT) | `ORDER BY cannot contain constant values` | An output that is constant in a way the oracle does not see, such as a CASE whose condition is `('a') IS NULL`. |
 | SELECT | `Invalid result value` | A FLOAT result is infinite or NaN. |
 | SELECT | `will overflow BigInt storage`, `causing overflow/underflow`, `out of range for the destination type` | Integer, DECIMAL or cast overflow. |
 | SELECT | `Numeric conversion error to type DECIMAL` | DECIMAL overflow in an expression of constants, which the planner folds. The message quotes a truncated value. |
@@ -595,6 +632,18 @@ The bugs below were found by the VIEWS oracle in milestone 10, in its first tria
 | ENG-30583 | A view whose WHERE clause has a FLOAT constant of 10 or more with a fraction, such as `c0 > 12.5E0`, blocks every later DDL in the database: "May not dynamically modify field 'predicate' of schema object 'MaterializedViewInfo{...}'". Dropping the view recovers. Likewise a predicate in a view's WHERE clause that an index could serve, such as a LIKE or a TIMESTAMP BETWEEN on a column, makes an index on that column fail (comments on the ticket). Found as failed CREATE INDEX statements. | Views have no WHERE clause. |
 | ENG-30584 | Deleting a group's last non-NULL value leaves 0 instead of NULL in a view's SUM. A query the rewriter answers from the view returns the 0 too. Wrong result. | A view sums NOT NULL columns only. |
 | ENG-30588 | An UPDATE of an indexed column fails when it overflows a view's SUM (DECIMAL or BIGINT), as it should, but the row is left out of the index on that column: lookups by the key miss it, and the next UPDATE of the row crashes the node with "Failed to remove tuple from index (during update)". A failed DELETE, or a failed UPDATE of other columns, leaves the index intact. Found by the lab's 45-minute run on 1 node, as a crash. | A view sums TINYINT, SMALLINT and INTEGER columns only. |
+
+The bugs below were found in milestone 11, as the generator learned functions and CASE.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30550 (comment) | The milestone 6 bug, wider than ABS: a BIGINT multiplication inside CASE, COALESCE, FLOOR, CEILING or MOD is typed DECIMAL, so a division after the function keeps a fraction (`COALESCE(b * 1, 0) / 2` is 1.5 for b = 3) and MOD rejects it ("incompatible data type in operation"). Wrong result. | No multiplication or division inside those functions. |
+| ENG-30589 | Setting a VARCHAR or VARBINARY column to a CASE or COALESCE, by UPDATE, INSERT or UPSERT, fails to compile: "Asking for fixed size for non-fixed or unknown type:varchar". Inside another function, such as `UPPER(CASE ...)`, it works. | An UPDATE never sets a VARCHAR column to a CASE or COALESCE. |
+| ENG-30590 | A CASE with a DECIMAL literal result keeps the generic NUMERIC type. With two or more WHENs it fails to compile: "Unable to determine cast type for 'VoltType.NUMERIC' and 'VoltType.NUMERIC' types", or a "not boolean" error when a condition is a BOOLEAN column. With one WHEN and no ELSE it fails in the EE: "unsupported type 'NUMERIC'" (comment on the ticket). One WHEN with an ELSE works. | A CASE has one WHEN and an ELSE. |
+| ENG-30497 (comment) | The milestone 2 bug, through CASE: a CASE over an outer join's inner table in WHERE turns the join into an inner join, though the CASE can be non-NULL for the null-extended row. `WHERE (CASE WHEN jb.n > 0 THEN 'a' ELSE 'b' END) = 'b'` drops the row a LEFT JOIN null-extends. COALESCE is handled correctly. Found by TLP WHERE. Wrong result. | With an outer join, the generator writes COALESCE instead of CASE. |
+| ENG-30591 | SUBSTRING of a CASE whose condition has an IN list crashes the SQL parser (NullPointerException in `TableUtil.addAutoColumns`). Other functions of the same CASE work. Found by PARAMS. | SUBSTRING's string argument has no IN predicate. |
+| ENG-30592 | A parameter inside `TRIM(x)` is counted twice: "Incorrect number of parameters passed: expected 2, passed 1". `TRIM(BOTH ' ' FROM x)`, LTRIM and RTRIM take it once. Found by PARAMS: all eight failed databases of its first 10-minute trials. | `TRIM(x)` is written `LTRIM(RTRIM(x))`. |
+| ENG-30494 (comment) | The milestone 2 bug, in CASE: `CASE WHEN k = 1 THEN 1 WHEN bo = TRUE THEN 2 END` is 0 for k = 1. Wrong result. | The generator writes no BOOLEAN literals (already). |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.

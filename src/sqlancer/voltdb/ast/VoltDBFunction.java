@@ -9,7 +9,12 @@ public class VoltDBFunction extends NewFunctionNode<VoltDBExpression, VoltDBFunc
 
     // Functions the generator calls; the name is printed as written.
     public enum VoltDBFunctionName {
-        ABS
+        // numeric
+        ABS, FLOOR, CEILING, MOD, CHAR_LENGTH,
+        // string
+        SUBSTRING, UPPER, LOWER, TRIM, LTRIM, RTRIM,
+        // any type
+        COALESCE
     }
 
     public VoltDBFunction(List<VoltDBExpression> args, VoltDBFunctionName func) {

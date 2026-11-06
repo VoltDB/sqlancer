@@ -24,6 +24,7 @@ import sqlancer.voltdb.ast.VoltDBAlias;
 import sqlancer.voltdb.ast.VoltDBBetweenOperation;
 import sqlancer.voltdb.ast.VoltDBBinaryOperation;
 import sqlancer.voltdb.ast.VoltDBBinaryOperation.VoltDBBinaryOperator;
+import sqlancer.voltdb.ast.VoltDBCase;
 import sqlancer.voltdb.ast.VoltDBColumnReference;
 import sqlancer.voltdb.ast.VoltDBConstant;
 import sqlancer.voltdb.ast.VoltDBExpression;
@@ -96,7 +97,11 @@ public final class VoltDBExpressionGenerator
     }
 
     private enum NumericExpression {
-        UNARY_MINUS, ARITHMETIC, ABS
+        UNARY_MINUS, ARITHMETIC, ABS, FLOOR_CEILING, MOD, CHAR_LENGTH, CASE, COALESCE
+    }
+
+    private enum StringExpression {
+        CONCAT, SUBSTRING, CASE_CONVERSION, TRIM, CASE, COALESCE
     }
 
     private final VoltDBGlobalState state;
@@ -124,8 +129,9 @@ public final class VoltDBExpressionGenerator
     private boolean ungroupedAggregates;
     // whether an aggregate's argument is being generated (ENG-30534)
     private boolean inAggregate;
-    // how many ABS calls enclose the expression being generated (ENG-30550)
-    private int absNesting;
+    // how many functions that type their result from their arguments (ABS, FLOOR, CEILING, MOD, CASE, COALESCE)
+    // enclose the expression being generated (ENG-30550)
+    private int typedFunctionNesting;
 
     public VoltDBExpressionGenerator(VoltDBGlobalState state) {
         this.state = state;
@@ -144,16 +150,109 @@ public final class VoltDBExpressionGenerator
             return generateNumericExpression(depth);
         case STRING:
             if (Randomly.getBoolean()) {
-                // ENG-30546: a concatenation whose result is empty, such as v || v with v = '', is NULL at run time,
-                // so unless --avoid-known-bugs is false its right operand is a constant that is not empty
-                VoltDBExpression right = avoidKnownBugs ? generateNonEmptyStringConstant()
-                        : generateExpression(Kind.STRING, depth + 1);
-                return new VoltDBBinaryOperation(generateExpression(Kind.STRING, depth + 1), right,
-                        VoltDBBinaryOperator.CONCAT);
+                return generateStringExpression(depth);
             }
             return generateLeafNode(kind);
         default:
             return generateLeafNode(kind);
+        }
+    }
+
+    private VoltDBExpression generateStringExpression(int depth) {
+        switch (Randomly.fromOptions(StringExpression.values())) {
+        case CONCAT:
+            // ENG-30546: a concatenation whose result is empty, such as v || v with v = '', is NULL at run time,
+            // so unless --avoid-known-bugs is false its right operand is a constant that is not empty
+            VoltDBExpression right = avoidKnownBugs ? generateNonEmptyStringConstant()
+                    : generateExpression(Kind.STRING, depth + 1);
+            return new VoltDBBinaryOperation(generateExpression(Kind.STRING, depth + 1), right,
+                    VoltDBBinaryOperator.CONCAT);
+        case SUBSTRING:
+            // SUBSTRING(s, start [, length]) counts characters from 1; a start below 1 shortens the length, and a
+            // negative length is an error, so the length is a constant of 0 or more
+            Randomly r = state.getRandomly();
+            List<VoltDBExpression> args = new ArrayList<>();
+            // ENG-30591: an IN predicate anywhere in SUBSTRING's string argument, as in a CASE condition, crashes the
+            // parser, so unless --avoid-known-bugs is false the argument has none, as in a comparison's operands
+            int nesting = comparandNesting;
+            comparandNesting += avoidKnownBugs ? 1 : 0;
+            try {
+                args.add(generateExpression(Kind.STRING, depth + 1));
+            } finally {
+                comparandNesting = nesting;
+            }
+            args.add(integerConstant(r.getInteger(-2, 7)));
+            if (Randomly.getBoolean()) {
+                args.add(integerConstant(r.getInteger(0, 5)));
+            }
+            return new VoltDBFunction(args, VoltDBFunctionName.SUBSTRING);
+        case CASE_CONVERSION:
+            return new VoltDBFunction(List.of(generateExpression(Kind.STRING, depth + 1)),
+                    Randomly.fromOptions(VoltDBFunctionName.UPPER, VoltDBFunctionName.LOWER));
+        case TRIM:
+            VoltDBFunctionName trim = Randomly.fromOptions(VoltDBFunctionName.TRIM, VoltDBFunctionName.LTRIM,
+                    VoltDBFunctionName.RTRIM);
+            VoltDBExpression trimmed = generateExpression(Kind.STRING, depth + 1);
+            if (trim == VoltDBFunctionName.TRIM && avoidKnownBugs) {
+                // ENG-30592: a parameter inside TRIM(x) is counted twice ("Incorrect number of parameters passed"),
+                // so unless --avoid-known-bugs is false, TRIM(x) is written LTRIM(RTRIM(x))
+                return new VoltDBFunction(List.of(new VoltDBFunction(List.of(trimmed), VoltDBFunctionName.RTRIM)),
+                        VoltDBFunctionName.LTRIM);
+            }
+            return new VoltDBFunction(List.of(trimmed), trim);
+        case CASE:
+            return generateCase(Kind.STRING, depth);
+        case COALESCE:
+            return generateCoalesce(Kind.STRING, depth);
+        default:
+            throw new AssertionError();
+        }
+    }
+
+    private static VoltDBConstant integerConstant(long value) {
+        return new VoltDBConstant(value < 0 ? "(" + value + ")" : Long.toString(value));
+    }
+
+    // CASE WHEN c1 THEN e1 [WHEN c2 THEN e2] [ELSE e] END, its results of the given kind
+    private VoltDBExpression generateCase(Kind kind, int depth) {
+        if (hasOuterJoin && avoidKnownBugs) {
+            // ENG-30497 (comment): a CASE over an outer join's inner table in WHERE turns the join into an inner join,
+            // though the CASE can be non-NULL for the null-extended row; COALESCE is handled correctly
+            return generateCoalesce(kind, depth);
+        }
+        List<VoltDBExpression> conditions = new ArrayList<>();
+        List<VoltDBExpression> results = new ArrayList<>();
+        typedFunctionNesting++;
+        try {
+            // ENG-30590: a DECIMAL literal as the result of a CASE with two or more WHENs fails to compile, so unless
+            // --avoid-known-bugs is false a CASE has one WHEN
+            int n = 1 + (!avoidKnownBugs && Randomly.getBooleanWithRatherLowProbability() ? 1 : 0);
+            for (int i = 0; i < n; i++) {
+                conditions.add(generateExpression(Kind.BOOLEAN, depth + 1));
+                results.add(generateExpression(kind, depth + 1));
+            }
+            // ENG-30590 (comment): without an ELSE, a CASE with a DECIMAL literal result fails in the EE
+            // ("unsupported type 'NUMERIC'"), so unless --avoid-known-bugs is false a CASE has an ELSE
+            VoltDBExpression elseResult = !avoidKnownBugs && Randomly.getBooleanWithRatherLowProbability() ? null
+                    : generateExpression(kind, depth + 1);
+            return new VoltDBCase(conditions, results, elseResult);
+        } finally {
+            typedFunctionNesting--;
+        }
+    }
+
+    // COALESCE of two or three expressions of the given kind
+    private VoltDBExpression generateCoalesce(Kind kind, int depth) {
+        List<VoltDBExpression> args = new ArrayList<>();
+        typedFunctionNesting++;
+        try {
+            int n = 2 + (Randomly.getBooleanWithRatherLowProbability() ? 1 : 0);
+            for (int i = 0; i < n; i++) {
+                args.add(generateExpression(kind, depth + 1));
+            }
+            return new VoltDBFunction(args, VoltDBFunctionName.COALESCE);
+        } finally {
+            typedFunctionNesting--;
         }
     }
 
@@ -379,7 +478,8 @@ public final class VoltDBExpressionGenerator
     }
 
     private VoltDBExpression generateNumericExpression(int depth) {
-        switch (Randomly.fromOptions(NumericExpression.values())) {
+        NumericExpression choice = Randomly.fromOptions(NumericExpression.values());
+        switch (choice) {
         case UNARY_MINUS:
             if (avoidKnownBugs) {
                 // ENG-30502: unary minus on a NULL integer or FLOAT gives a non-NULL value; 0 - x does not
@@ -391,25 +491,66 @@ public final class VoltDBExpressionGenerator
         case ARITHMETIC:
             VoltDBBinaryOperator op = Randomly.fromOptions(VoltDBBinaryOperator.ADD, VoltDBBinaryOperator.SUBTRACT,
                     VoltDBBinaryOperator.MULTIPLY, VoltDBBinaryOperator.DIVIDE);
-            if ((op == VoltDBBinaryOperator.MULTIPLY || op == VoltDBBinaryOperator.DIVIDE) && absNesting > 0
+            if ((op == VoltDBBinaryOperator.MULTIPLY || op == VoltDBBinaryOperator.DIVIDE) && typedFunctionNesting > 0
                     && avoidKnownBugs) {
                 // ENG-30550: ABS pushes its argument's type into the operands, so an integer division inside it keeps a
                 // fraction when the argument is DECIMAL or FLOAT, as in ABS((7 / i) - d), and a BIGINT multiplication
-                // makes ABS DECIMAL, as in ABS(b * 1) / 2 = 3.5; there is no multiplication or division inside ABS
+                // makes ABS DECIMAL, as in ABS(b * 1) / 2 = 3.5. FLOOR, CEILING, MOD, CASE and COALESCE do the same
+                // (comment on the ticket): there is no multiplication or division inside them
                 op = Randomly.fromOptions(VoltDBBinaryOperator.ADD, VoltDBBinaryOperator.SUBTRACT);
             }
             return new VoltDBBinaryOperation(generateExpression(Kind.NUMERIC, depth + 1),
                     generateExpression(Kind.NUMERIC, depth + 1), op);
         case ABS:
-            absNesting++;
+        case FLOOR_CEILING:
+            VoltDBFunctionName name = choice == NumericExpression.ABS ? VoltDBFunctionName.ABS
+                    : Randomly.fromOptions(VoltDBFunctionName.FLOOR, VoltDBFunctionName.CEILING);
+            typedFunctionNesting++;
             try {
-                return new VoltDBFunction(List.of(generateExpression(Kind.NUMERIC, depth + 1)), VoltDBFunctionName.ABS);
+                return new VoltDBFunction(List.of(generateExpression(Kind.NUMERIC, depth + 1)), name);
             } finally {
-                absNesting--;
+                typedFunctionNesting--;
             }
+        case MOD:
+            // MOD takes integers only ("incompatible data type in operation"); its result is an integer
+            if (numericDomain == NumericDomain.FLOAT) {
+                return generateLeafNode(Kind.NUMERIC);
+            }
+            typedFunctionNesting++;
+            try {
+                VoltDBExpression divisor = Randomly.getBoolean() ? generateIntegerOperand()
+                        : integerConstant(Randomly.fromOptions(-7L, -3L, -2L, 2L, 3L, 5L, 10L));
+                return new VoltDBFunction(List.of(generateIntegerOperand(), divisor), VoltDBFunctionName.MOD);
+            } finally {
+                typedFunctionNesting--;
+            }
+        case CHAR_LENGTH:
+            // an integer, the length in characters
+            if (numericDomain == NumericDomain.FLOAT) {
+                return generateLeafNode(Kind.NUMERIC);
+            }
+            return new VoltDBFunction(List.of(generateExpression(Kind.STRING, depth + 1)),
+                    VoltDBFunctionName.CHAR_LENGTH);
+        case CASE:
+            return generateCase(Kind.NUMERIC, depth);
+        case COALESCE:
+            return generateCoalesce(Kind.NUMERIC, depth);
         default:
             throw new AssertionError();
         }
+    }
+
+    // An integer column of the FROM clause, or an integer constant: an operand of MOD
+    private VoltDBExpression generateIntegerOperand() {
+        List<VoltDBColumn> integers = columns.stream().filter(c -> isUsable(c, Kind.NUMERIC)).filter(c -> {
+            VoltDBDataType t = c.getType().getType();
+            return t == VoltDBDataType.TINYINT || t == VoltDBDataType.SMALLINT || t == VoltDBDataType.INTEGER
+                    || t == VoltDBDataType.BIGINT;
+        }).collect(Collectors.toList());
+        if (!integers.isEmpty() && Randomly.getBoolean()) {
+            return new VoltDBColumnReference(Randomly.fromList(integers));
+        }
+        return integerConstant(state.getRandomly().getInteger(-1000, 1000));
     }
 
     // ENG-30496: inside CASE WHEN, which is where NoREC's unoptimized query puts the predicate, VoltDB's planner
