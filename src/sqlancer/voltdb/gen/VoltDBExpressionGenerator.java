@@ -3,6 +3,7 @@ package sqlancer.voltdb.gen;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
@@ -624,7 +625,18 @@ public final class VoltDBExpressionGenerator
         hasOuterJoin = false;
         List<VoltDBTable> partitionJoined = new ArrayList<>();
         VoltDBTable anchor = null;
-        for (VoltDBTable t : tables.getTables()) {
+        List<VoltDBTable> candidates = tables.getTables();
+        if (avoidKnownBugs) {
+            // ENG-30582: once a table has a materialized view, VoltDB's view rewriter fails to plan some GROUP BY and
+            // aggregate queries on it ("Duplicate key", ClassCastException), so queries leave such tables to the VIEWS
+            // oracle
+            Set<String> viewed = state.getViews().values().stream().map(v -> v[0]).collect(Collectors.toSet());
+            candidates = candidates.stream().filter(t -> !viewed.contains(t.getName())).collect(Collectors.toList());
+            if (candidates.isEmpty()) {
+                throw new IgnoreMeException();
+            }
+        }
+        for (VoltDBTable t : candidates) {
             if (!t.isPartitioned()) {
                 fromTables.add(t);
             } else if (anchor == null) {

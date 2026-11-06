@@ -4,8 +4,11 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.auto.service.AutoService;
@@ -26,6 +29,7 @@ import sqlancer.voltdb.gen.VoltDBIndexGenerator;
 import sqlancer.voltdb.gen.VoltDBInsertGenerator;
 import sqlancer.voltdb.gen.VoltDBTableGenerator;
 import sqlancer.voltdb.gen.VoltDBUpdateGenerator;
+import sqlancer.voltdb.gen.VoltDBViewGenerator;
 
 /**
  * SQLancer provider for VoltDB, connecting through the VoltDB JDBC driver.
@@ -78,6 +82,9 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
     public static class VoltDBGlobalState extends SQLGlobalState<VoltDBOptions, VoltDBSchema> {
 
         private final AtomicInteger nextIndex = new AtomicInteger();
+        private final AtomicInteger nextView = new AtomicInteger();
+        // name to {base table, defining query}, in the order created; a view whose CREATE VIEW failed is in it too
+        private final Map<String, String[]> views = Collections.synchronizedMap(new LinkedHashMap<>());
 
         // This database's name prefix, for example DATABASE0_.
         public String getPrefix() {
@@ -95,6 +102,21 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
 
         public String getFreeIndexName() {
             return getPrefix() + "I" + nextIndex.getAndIncrement();
+        }
+
+        public String getFreeViewName() {
+            return getPrefix() + "V" + nextView.getAndIncrement();
+        }
+
+        public void addView(String name, String table, String query) {
+            views.put(name, new String[] { table, query });
+        }
+
+        // name to {base table, defining query} of each view generated for this database
+        public Map<String, String[]> getViews() {
+            synchronized (views) {
+                return new LinkedHashMap<>(views);
+            }
         }
 
         @Override
@@ -144,6 +166,17 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
         }
         if (globalState.getSchema().getDatabaseTables().isEmpty()) {
             throw new IgnoreMeException();
+        }
+        // Views come before any rows: VoltDB cannot create some views on a table that holds data ("cannot always be
+        // applied if the table already contains data"), and a view made first is kept up to date through every insert,
+        // update and delete that follows.
+        int nrViews = globalState.getRandomly().getInteger(0, globalState.getDbmsSpecificOptions().maxNumViews + 1);
+        for (int i = 0; i < nrViews; i++) {
+            try {
+                globalState.executeStatement(VoltDBViewGenerator.getQuery(globalState));
+            } catch (IgnoreMeException e) {
+                // no view this time
+            }
         }
         StatementExecutor<VoltDBGlobalState, Action> se = new StatementExecutor<>(globalState, Action.values(),
                 VoltDBProvider::mapActions, q -> {

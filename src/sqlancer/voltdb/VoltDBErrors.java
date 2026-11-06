@@ -67,6 +67,8 @@ public final class VoltDBErrors {
     public static void addInsertErrors(ExpectedErrors errors) {
         // a generated key can repeat an existing primary key or unique value
         errors.add("CONSTRAINT VIOLATION");
+        // keeping a view up to date evaluates its WHERE clause on the new row, which can overflow or divide by zero
+        addExpressionErrors(errors);
     }
 
     public static void addUpdateErrors(ExpectedErrors errors) {
@@ -82,6 +84,12 @@ public final class VoltDBErrors {
         for (String type : new String[] { "tinyint", "smallint", "integer", "bigint" }) {
             errors.add("has an invalid format for a constant " + type + " value");
         }
+    }
+
+    public static void addViewErrors(ExpectedErrors errors) {
+        addExpressionErrors(errors);
+        // a WHERE clause that folds to FALSE makes the planner add LIMIT 0 (ENG-19957, won't fix), which a view rejects
+        errors.add("with a LIMIT or OFFSET clause is not supported");
     }
 
     public static void addIndexErrors(ExpectedErrors errors) {

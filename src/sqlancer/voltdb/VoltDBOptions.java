@@ -29,6 +29,9 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--max-num-deletes", description = "The maximum number of DELETE statements each database issues")
     public int maxNumDeletes = 2;
 
+    @Parameter(names = "--max-num-views", description = "The maximum number of CREATE VIEW statements each database issues")
+    public int maxNumViews = 2;
+
     @Parameter(names = "--retry-seconds", description = "How long a statement VoltDB rejects because of a concurrent schema change is retried")
     public int retrySeconds = 120;
 

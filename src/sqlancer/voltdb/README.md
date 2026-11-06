@@ -4,10 +4,11 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 9.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 10.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
-upserted and deleted before the oracles run.
+upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
+VIEWS oracle checks.
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -162,11 +163,12 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | `--username`, `--password` | Empty for a server without security (SQLancer's default is `sqlancer`). |
 | `--host`, `--port` | A server's client port. Defaults: localhost, 21212. |
 | `--database-prefix` | Prefix of each thread's table names. Default `database`; `db` keeps the logs short. |
-| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS` or `SMOKE`; several are comma-separated. |
+| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS` or `SMOKE`; several are comma-separated. |
 | `--max-num-tables` | Tables per database, 1 to this (default 3). |
 | `--max-num-indexes` | CREATE INDEX statements per database, 0 to this (default 4). |
 | `--max-num-updates` | UPDATE statements per database, 0 to this (default 5). |
 | `--max-num-deletes` | DELETE statements per database, 0 to this (default 2). |
+| `--max-num-views` | CREATE VIEW statements per database, 0 to this (default 2). |
 | `--retry-seconds` | How long a statement rejected because of another thread's schema change is retried (default 120). |
 | `--avoid-known-bugs` | `true` (the default) keeps the generator away from the VoltDB bugs listed below, so a failure is something new. `false` generates them too. |
 
@@ -383,6 +385,40 @@ that folds to a subnormal FLOAT, whose plan then fails to load (ENG-30551) and w
 An expected error in either query skips the check; an unexpected one fails it. Rows are compared as TLP compares them.
 A failure reports both queries and the parameters' values and types, and `--use-reducer` works.
 
+## The VIEWS oracle
+
+VIEWS (`oracle/VoltDBViewOracle`) checks VoltDB's materialized views, which it keeps up to date as their tables
+change rather than computing them again.
+
+**The views.** Each database creates zero to `--max-num-views` views right after its tables, before any rows:
+- VoltDB can't create some views on a table that already holds data ("cannot always be applied if the table already
+  contains data").
+- A view made first is kept up to date through every insert, upsert, update and delete that builds the database.
+
+A view (`gen/VoltDBViewGenerator`) covers one table:
+- It groups by zero to two non-BOOLEAN columns.
+- It always has `COUNT(*)`, plus up to three more of `COUNT`, `SUM`, `MIN` and `MAX` of the table's columns. MIN and
+  MAX are never of BOOLEAN columns (ENG-30493).
+- While `--avoid-known-bugs` is false, half the views have a random WHERE clause. While it is true, none do (ENG-30583
+  below).
+
+While `--avoid-known-bugs` is true, the other oracles' queries never read a table that has a view: VoltDB's view
+rewriter fails to plan some of their GROUP BY and aggregate queries on such a table (ENG-30582 below).
+
+The view's defining query is kept with the database's state.
+
+**The check.** It picks a view. Half the time it first runs one more INSERT, UPDATE or DELETE on the view's table, so
+the check follows a change made right before it. It then compares three results, as multisets, as TLP compares them:
+1. the view's rows, `SELECT * FROM v`;
+2. the defining query with `ORDER BY 1`, which VoltDB's view rewriter (`MVQueryRewriter`) leaves alone, so it is
+   computed from the table;
+3. the defining query as written, which the rewriter may answer from the view itself.
+
+The view and the query as written must both match the query computed from the table. VoltDB combines a view's
+per-partition rows when it is read, so a view of a partitioned table also has one row per group. A failure reports
+the three queries and the rows that differ, and `--use-reducer` works. A view whose CREATE VIEW failed with an expected
+error is skipped.
+
 ## How the provider maps SQLancer onto VoltDB
 
 - **One schema, many databases.** A VoltDB cluster has a single schema, so each SQLancer database is the set of tables
@@ -433,6 +469,8 @@ Each is listed in `VoltDBErrors` with its reason. The run fails on any other err
 | INSERT | `CONSTRAINT VIOLATION` | Random values repeat existing keys. |
 | UPDATE | `CONSTRAINT VIOLATION` | A random new value repeats a primary key or unique value, or is NULL in a NOT NULL column. VoltDB checks constraints row by row, so even `SET k = k + 1` on a unique `k` fails once one row's new value meets the next row's old one. |
 | UPDATE | `is too wide`, `exceeds the size of the`, `overflows/underflows`, `has an invalid format for a constant <integer type> value` | A new value does not fit its column: too long for a VARCHAR or VARBINARY, out of an integer type's range, or a constant with a fraction set into an integer column. |
+| CREATE VIEW | `with a LIMIT or OFFSET clause is not supported` | A view's WHERE clause that folds to FALSE makes the planner add LIMIT 0 (ENG-19957, closed as won't fix), which a view rejects. |
+| INSERT, UPSERT | the SELECT errors below | Keeping a view up to date evaluates its WHERE clause on the new row, which can overflow or divide by zero. |
 | CREATE INDEX | `is not empty` | VoltDB cannot add a UNIQUE index to a table that has rows (an ASSUMEUNIQUE index it can). |
 | SELECT | `Join with filters that do not depend on joined tables is not supported` | A predicate that references a column can still fold to a constant, such as `(FALSE AND t.c) = FALSE`. |
 | SELECT | `This query is not plannable` | VoltDB plans a join of partitioned tables only when it can see the equality of their partitioning columns. The generator joins them on that equality alone, but an outer join of a replicated table whose ON condition folds to FALSE, with a WHERE clause on that table, can take the equality away. The nightly lab job found three such shapes in milestone 7; generating around each one cost coverage and did not end. |
@@ -545,6 +583,14 @@ The bugs below were found by the UPDATE generator in milestone 9, in its first t
 | --- | --- | --- |
 | ENG-30494 (comment) | The milestone 2 bug, in UPDATE: a BOOLEAN literal in SET takes another assignment's or the WHERE clause's parameter. `UPDATE t SET b1 = FALSE, b2 = TRUE WHERE k = 1` fails with "BOOLEAN can't be cast as BIGINT", and a second UPDATE of the same shape fails once the first's plan is cached. | A BOOLEAN column is set to `(1 = 1)` or `(1 = 0)`. |
 | ENG-30561 (comment) | The milestone 7 bug, in assignment: a TIMESTAMP constant set into a DATE column, by UPDATE or INSERT, fails to plan with "has an invalid format for a constant date value", quoting the timestamp's microseconds. A TIMESTAMP column converts correctly. | A DATE column is set to a date string. |
+
+The bugs below were found by the VIEWS oracle in milestone 10, in its first trials.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30582 | Once a table has a materialized view, VoltDB's view rewriter fails on GROUP BY queries whose WHERE clause and GROUP BY columns match the view's: the same aggregate twice gives "Duplicate key" (a `Collectors.toMap` without a merge function in `MVQueryRewriter.getViewColumnMaps`), and an aggregate of an expression, such as `SUM(x + 0)`, gives a ClassCastException. These queries worked before the view existed, and the other oracles generate them. | A view never has the same aggregate twice, and the other oracles' queries never read a table that has a view. |
+| ENG-30583 | A view whose WHERE clause has a FLOAT constant of 10 or more with a fraction, such as `c0 > 12.5E0`, blocks every later DDL in the database: "May not dynamically modify field 'predicate' of schema object 'MaterializedViewInfo{...}'". Dropping the view recovers. Likewise a predicate in a view's WHERE clause that an index could serve, such as a LIKE or a TIMESTAMP BETWEEN on a column, makes an index on that column fail (comments on the ticket). Found as failed CREATE INDEX statements. | Views have no WHERE clause. |
+| ENG-30584 | Deleting a group's last non-NULL value leaves 0 instead of NULL in a view's SUM. A query the rewriter answers from the view returns the 0 too. Wrong result. | A view sums NOT NULL columns only. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
