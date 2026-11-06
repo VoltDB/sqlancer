@@ -286,7 +286,8 @@ and predicates of TLP WHERE.
 `SELECT DISTINCT` of some columns or, half the time, the same columns with `GROUP BY` and no aggregate. Each partition
 adds `WHERE p`, `WHERE NOT p` or `WHERE p IS NULL`. A row can come from more than one partition, so the partitions'
 rows, without duplicates, must equal the original's, which must have none. Over replicated tables, the partitions run
-as one `UNION` query.
+as one `UNION` query. FLOAT values are compared exactly: two that differ only in their last digits, such as
+-32767.000000000004 and -32766.999999999996, are two rows.
 
 **TLP HAVING** (mode `HAVING`) checks groups. The original query groups by some columns, selects some of them and 1
 to 3 aggregates, and sometimes has a WHERE clause. Each partition adds `HAVING p`, `HAVING NOT p` or `HAVING p IS
