@@ -447,7 +447,7 @@ public final class VoltDBExpressionGenerator
         if (!wildcard || Randomly.getBoolean()) {
             sb.append(Randomly.fromOptions("%", "_"));
         }
-        return new VoltDBConstant("'" + sb.toString().replace("'", "''") + "'");
+        return new VoltDBConstant(VoltDBConstantGenerator.quote(sb.toString()));
     }
 
     @Override
@@ -483,7 +483,7 @@ public final class VoltDBExpressionGenerator
             if (str.codePointCount(0, str.length()) > 1) {
                 str = str.substring(0, str.offsetByCodePoints(0, 1));
             }
-            return new VoltDBConstant("'" + str.replace("'", "''") + "'");
+            return new VoltDBConstant(VoltDBConstantGenerator.quote(str));
         }
         if (kind == Kind.VARBINARY && avoidKnownBugs) {
             // ENG-12656: an index scan for <, <=, >, >= or BETWEEN on a VARBINARY(n) column fails ("Type VARCHAR can't
@@ -514,7 +514,7 @@ public final class VoltDBExpressionGenerator
     private VoltDBExpression generateNonEmptyStringConstant() {
         String str = state.getRandomly().getString();
         str = str.isEmpty() ? state.getRandomly().getAlphabeticChar() : str.substring(0, str.offsetByCodePoints(0, 1));
-        return new VoltDBConstant("'" + str.replace("'", "''") + "'");
+        return new VoltDBConstant(VoltDBConstantGenerator.quote(str));
     }
 
     private VoltDBDataType randomDataType(Kind kind) {

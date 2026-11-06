@@ -465,12 +465,13 @@ in every query, which only an oracle that computes values outside VoltDB sees; E
 | ENG-30550 | ABS of a BIGINT multiplication is typed DECIMAL, so a division inside or after it keeps a fraction: `ABS((b * 1) / 2)` is 3.5 for `b = 7`, while `(b * 1) / 2` is 3. More generally ABS pushes a DECIMAL or FLOAT argument's type into an integer division inside it: `ABS((7 / i) - d)` divides 7 by 2 as 3.5 (comment on the ticket). Found by PQS in 5- and 10-minute trials. Wrong result. | No multiplication or division inside ABS. |
 | ENG-30549 | The planner folds a comparison of two string constants ignoring trailing spaces (`'a' = 'a '` is TRUE), while the EE compares exactly. Found by PQS. Wrong result. | PQS does not check a folded string comparison that trailing spaces decide. |
 
-The bugs below were found by the nightly lab job's first run in milestone 7, or while reducing what it found.
+The bugs below were found by the nightly lab job's first runs in milestone 7, or while reducing what they found.
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30560 | A DATE constant (`CAST('...' AS DATE)`, or a string compared with a DATE column) anywhere in a statement makes its DECIMAL literals FLOAT: `SELECT 1.5, CAST('2000-01-01' AS DATE)` returns 1.5 as a FLOAT. Folded DECIMAL constants (`0.1 + 0.2`, `CAST(1.5 AS DECIMAL)`, `3000000000 * 2`) then fail to compile: "Numeric conversion error to type DECIMAL for input string". Found by TLP HAVING on 3 nodes, where `SUM(ABS(605228403.497119))` was DECIMAL in the original query and FLOAT in the partitions, whose HAVING clauses held DATE casts. Wrong result. | No DATE constants: temporal comparisons, BETWEEN and IN use TIMESTAMP operands only. DATE columns still appear in SELECT lists and aggregates. |
 | ENG-30561 | `CAST(<TIMESTAMP constant> AS DATE)` folds to an invalid date: in a SELECT list it fails with "Invalid value for MonthOfYear", and `WHERE d = CAST(CAST('2000-01-01 00:00:00' AS TIMESTAMP) AS DATE)` matches nothing. Found by hand while reducing ENG-30560. Wrong rows. | None needed: the generator never casts a constant twice. |
+| ENG-30562 | VoltDB reads a backslash before a quote as escaping it, so after a string literal ending in a backslash (`'a\'`) it strips `/*...*/` and `--` from the statement's later string literals: `INSERT ... VALUES ('a\', 'c/*d*/e')` stores `c e`, and an unclosed `/*` or `--` gives "malformed bit string". Found by TLP HAVING on 1 node, as an unexpected error. Lost data. | No string literal has a backslash at its end or before a quote (`VoltDBConstantGenerator.quote` writes a slash instead), whatever `--avoid-known-bugs` says, as for ENG-30552. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
@@ -482,6 +483,12 @@ as observed, without a server:
 
 ```bash
 mvn -Djacoco.skip=true -Dtest=TestVoltDBExpressionEvaluator test
+```
+
+`test/sqlancer/voltdb/gen/TestVoltDBConstantGenerator.java` checks how string literals are written (ENG-30562):
+
+```bash
+mvn -Djacoco.skip=true -Dtest=TestVoltDBConstantGenerator test
 ```
 
 `test/sqlancer/dbms/TestVoltDB.java` runs the provider for `TestConfig.SECONDS` against a server on localhost:21212. It
