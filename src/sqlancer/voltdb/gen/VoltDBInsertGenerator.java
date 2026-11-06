@@ -22,7 +22,10 @@ public final class VoltDBInsertGenerator {
     }
 
     public static SQLQueryAdapter getQuery(VoltDBGlobalState globalState) {
-        VoltDBTable table = globalState.getSchema().getRandomTable();
+        return getQuery(globalState, globalState.getSchema().getRandomTable());
+    }
+
+    public static SQLQueryAdapter getQuery(VoltDBGlobalState globalState, VoltDBTable table) {
         List<VoltDBColumn> columns = new ArrayList<>();
         for (VoltDBColumn c : table.getColumns()) {
             if (!c.isNullable() || Randomly.getBoolean()) {

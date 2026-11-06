@@ -11,6 +11,7 @@ import sqlancer.voltdb.oracle.VoltDBPivotedQuerySynthesisOracle;
 import sqlancer.voltdb.oracle.VoltDBSmokeOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPAggregateOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPOracle;
+import sqlancer.voltdb.oracle.VoltDBViewOracle;
 
 public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
 
@@ -99,6 +100,20 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBParameterOracle(globalState, expressionErrors());
+        }
+    },
+
+    /**
+     * Checks that a materialized view holds the rows its defining query returns on the table now, after the inserts,
+     * updates and deletes that built the database and sometimes one more change.
+     */
+    VIEWS {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            ExpectedErrors errors = expressionErrors();
+            // a view whose CREATE VIEW failed with an expected error
+            errors.add("object not found");
+            return new VoltDBViewOracle(globalState, errors);
         }
     };
 

@@ -15,7 +15,10 @@ public final class VoltDBDeleteGenerator {
     }
 
     public static SQLQueryAdapter getQuery(VoltDBGlobalState globalState) {
-        VoltDBTable table = globalState.getSchema().getRandomTable();
+        return getQuery(globalState, globalState.getSchema().getRandomTable());
+    }
+
+    public static SQLQueryAdapter getQuery(VoltDBGlobalState globalState, VoltDBTable table) {
         StringBuilder sql = new StringBuilder("DELETE FROM ").append(table.getName());
         if (!Randomly.getBooleanWithSmallProbability()) {
             VoltDBExpressionGenerator gen = new VoltDBExpressionGenerator(globalState).setColumns(table.getColumns());

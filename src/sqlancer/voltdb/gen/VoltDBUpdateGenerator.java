@@ -27,7 +27,10 @@ public final class VoltDBUpdateGenerator {
     }
 
     public static SQLQueryAdapter getQuery(VoltDBGlobalState globalState) {
-        VoltDBTable table = globalState.getSchema().getRandomTable();
+        return getQuery(globalState, globalState.getSchema().getRandomTable());
+    }
+
+    public static SQLQueryAdapter getQuery(VoltDBGlobalState globalState, VoltDBTable table) {
         List<VoltDBColumn> settable = table.getColumns().stream()
                 .filter(c -> !c.getName().equals(table.getPartitionColumn())).collect(Collectors.toList());
         if (settable.isEmpty()) {
