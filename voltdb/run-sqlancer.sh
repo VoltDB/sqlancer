@@ -159,12 +159,20 @@ stop_cluster() {
     if grep -q "Server completed initialization" "$cluster/node0/voltdbroot/log/volt.log" 2>/dev/null; then
         "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port 0)" >>"$results/run.log" 2>&1
     fi
-    # only processes started for this run carry its directory on their command line
+    # only processes started for this run carry its directory on their command line, and their PIDs are recorded
     for _ in $(seq 1 30); do
         pgrep -f "$cluster/" >/dev/null || break
         sleep 1
     done
     pkill -f "$cluster/" 2>/dev/null
+    for f in "$cluster"/node*.pid; do
+        [ -e "$f" ] && is_server "$(cat "$f")" && kill -9 "$(cat "$f")" 2>/dev/null
+    done
+}
+
+# is_server PID: whether PID is a running VoltDB server (and not another process that reused the PID)
+is_server() {
+    ps -ww -o command= -p "$1" 2>/dev/null | grep -q "org.voltdb.VoltDB"
 }
 
 trap 'stop_cluster' EXIT
@@ -226,11 +234,13 @@ cluster_started=true
 # start_node I LOG: starts node I, or restarts it after a failure, which rejoins it to the running cluster
 start_node() {
     # in the foreground under nohup: "voltdb start --background" allows one server per user (a shared PID file).
-    # In a subshell, so that the server is not one of this script's jobs and its kill -9 is not reported.
+    # In a subshell, so that the server is not one of this script's jobs and its kill -9 is not reported. The
+    # launcher execs the server's JVM, so the PID it starts with is the server's, which node<i>.pid records.
     (nohup "$voltdb_home/bin/voltdb" start -D "$cluster/node$1" -c "$nodes" -H "localhost:$(internal_port 0)" \
         --client="$(client_port $1)" --admin="$(admin_port $1)" --internal="$(internal_port $1)" \
         --zookeeper="$(port $1 3)" --replication="$(port $1 4)" --metrics="$(port $1 5)" \
-        >"$2" 2>&1 &)
+        >"$2" 2>&1 &
+        echo $! >"$cluster/node$1.pid")
 }
 for ((i = 0; i < nodes; i++)); do
     start_node $i "$cluster/start$i.log"
@@ -305,8 +315,10 @@ chaos_loop() {
         done
         i=$((1 + RANDOM % (nodes - 1)))
         n=$((n + 1))
-        pid=$(pgrep -f -- "voltdbroot $cluster/node$i( |\$)" | head -1)
-        if [ -z "$pid" ]; then
+        # the PID start_node recorded; a pattern match on the command line is not reliable, as the server's command
+        # line carries a long classpath before its voltdbroot directory
+        pid=$(cat "$cluster/node$i.pid" 2>/dev/null)
+        if [ -z "$pid" ] || ! is_server "$pid"; then
             echo "$(date '+%H:%M:%S') kill $n: node$i is not running" >>"$results/chaos.log"
             return 1
         fi
@@ -314,7 +326,7 @@ chaos_loop() {
         t0=$(date +%s)
         echo "$(date '+%H:%M:%S') kill $n: node$i (pid $pid)" >>"$results/chaos.log"
         while port_in_use "$(client_port $i)"; do sleep 1; done
-        # the server is "java ... voltdbroot <dir>"; the survivors must notice the failure before it comes back
+        # the survivors must notice the failure before the node comes back
         sleep 5
         if ! rejoin_node "$i" "$n"; then
             echo "$(date '+%H:%M:%S') rejoin $n: node$i did not rejoin within 600 s" >>"$results/chaos.log"

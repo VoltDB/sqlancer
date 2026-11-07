@@ -17,9 +17,14 @@ public final class VoltDBErrors {
      */
     private static final String[] RETRYABLE = { "while another one is in progress",
             "was planned against a catalog version which does not match",
-            // the same while a node fails or rejoins (run-sqlancer.sh --kill-interval): VoltDB rejects DDL until the
-            // failed catalog update is cleaned up and the rejoin is done
-            "while catalog update transaction is in progress", "while node rejoin is in progress" };
+            // the same, raised by the planner itself once a catalog update has replaced it (PlannerTool.planSql), and
+            // for DDL planned against a configuration that is no longer live; and the ad hoc planner's queue being
+            // full. txnid2 (TxnId2Utils) retries the same rejections.
+            "The planner is outdated", "was no longer live", "Ad Hoc Planner task queue is full",
+            // the same while a node fails or rejoins (run-sqlancer.sh --kill-interval): VoltZK's catalog update
+            // blocker refuses DDL, before it starts, while a rejoin, leader promotion, transaction repair or an
+            // interrupted catalog update is in progress ("Can't do catalog update(@AdHoc) while ...")
+            "Can't do catalog update(@AdHoc) while" };
 
     /**
      * Errors a node failure causes while nodes are killed and rejoined during the run (--node-failures). A statement in
@@ -28,8 +33,13 @@ public final class VoltDBErrors {
      */
     private static final String[] NODE_FAILURE = { "Transaction dropped due to change in mastership",
             "OPS request hit sixty second timeout", "Transaction being restarted due to fault recovery",
+            // a transaction a failure interrupted, or whose completion it caught (txnid2 lists both as transient)
+            "Transaction Interrupted", "transaction completion is in progress",
             // a catalog update (DDL) whose verification step was waiting on the dead node
-            "failed, connection lost" };
+            "failed, connection lost",
+            // a DDL statement that one of the errors above interrupted can still commit after its client was told it
+            // failed, so a later CREATE of the same name collides with an object the provider never saw
+            "object name already exists" };
 
     private VoltDBErrors() {
     }
