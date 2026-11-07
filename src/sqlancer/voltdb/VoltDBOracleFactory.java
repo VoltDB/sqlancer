@@ -10,9 +10,11 @@ import sqlancer.voltdb.oracle.VoltDBLimitOracle;
 import sqlancer.voltdb.oracle.VoltDBParameterOracle;
 import sqlancer.voltdb.oracle.VoltDBPivotedQuerySynthesisOracle;
 import sqlancer.voltdb.oracle.VoltDBSmokeOracle;
+import sqlancer.voltdb.oracle.VoltDBSubqueryOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPAggregateOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPOracle;
 import sqlancer.voltdb.oracle.VoltDBViewOracle;
+import sqlancer.voltdb.oracle.VoltDBWindowOracle;
 
 public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
 
@@ -34,7 +36,8 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
     NOREC {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
-            return new NoRECOracle<>(globalState, new VoltDBExpressionGenerator(globalState), expressionErrors());
+            return new NoRECOracle<>(globalState, new VoltDBExpressionGenerator(globalState).setSubqueries(true),
+                    expressionErrors());
         }
     },
 
@@ -128,6 +131,28 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
             // an output that is constant in a way the oracle does not see, such as (CASE WHEN ('a') IS NULL ...)
             errors.add("ORDER BY cannot contain constant values");
             return new VoltDBLimitOracle(globalState, errors);
+        }
+    },
+
+    /**
+     * Checks that a query with an IN, ANY or ALL subquery in its WHERE clause returns the same rows as the query with
+     * the subquery written with EXISTS.
+     */
+    SUBQUERY {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBSubqueryOracle(globalState, expressionErrors());
+        }
+    },
+
+    /**
+     * Checks the values of a windowed RANK, DENSE_RANK, ROW_NUMBER, COUNT, SUM, MIN or MAX against the rows of its own
+     * query, and that the query returns the rows it would without the window function.
+     */
+    WINDOW {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBWindowOracle(globalState, expressionErrors());
         }
     };
 

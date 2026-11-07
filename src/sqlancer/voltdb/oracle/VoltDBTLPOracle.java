@@ -60,7 +60,7 @@ public class VoltDBTLPOracle implements TestOracle<VoltDBGlobalState> {
     public VoltDBTLPOracle(VoltDBGlobalState state, ExpectedErrors errors, Mode mode) {
         this.mode = mode;
         this.state = state;
-        this.gen = new VoltDBExpressionGenerator(state).setNoFullJoins(mode != Mode.WHERE);
+        this.gen = new VoltDBExpressionGenerator(state).setNoFullJoins(mode != Mode.WHERE).setSubqueries(true);
         this.errors = errors;
     }
 
