@@ -120,10 +120,11 @@ handle the errors a node failure causes:
 | Error | What it means | What the provider does |
 | --- | --- | --- |
 | `Transaction dropped due to change in mastership. It is possible the transaction was committed` | The statement was in flight when a partition's leader moved; it may have committed. | Skips the statement, check or database (IgnoreMeException), since it cannot know. |
-| `Transaction being restarted due to fault recovery or shutdown` | The same for a read, aborted by the failure. | The same. |
+| `Transaction being restarted due to fault recovery or shutdown`, `Transaction Interrupted`, `transaction completion is in progress` | The same for a transaction the failure aborted or caught completing. | The same. |
 | `OPS request hit sixty second timeout before all responses were received` | A system request, such as the JDBC metadata calls that read the schema, waited on the dead node. | The same. |
 | `The errors for @VerifyCatalogAndWriteJar from host N: Host N failed, connection lost` | A DDL statement's catalog update was waiting on the dead node. | The same. |
 | `object name already exists` | A DDL statement that a failure interrupted committed after all, so a later CREATE of the same name collides with a table or index the provider never saw. | Skips, as above. Without `--node-failures` this fails the run, as it would be a provider bug. |
+| `Catalog has been updated. The planner is outdated.`, `... was no longer live`, `Ad Hoc Planner task queue is full` | The statement was planned while a catalog update, frequent around a rejoin, replaced the planner, or the planner was busy. VoltDB rejects it before running it. | Retries it, with or without `--node-failures`, like a concurrent schema change. |
 | `Can't do catalog update(@AdHoc) while node rejoin is in progress`, `... while catalog update transaction is in progress` | VoltDB rejects DDL until the rejoin is done, or until a catalog update the failure interrupted is cleaned up. | Retries the statement, like a concurrent schema change, for up to `--retry-seconds`. VoltDB rejects it before running it. |
 
 Without `--node-failures`, these errors fail the run as before. The OPS timeout makes each failure cost up to a minute
