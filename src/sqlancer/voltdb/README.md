@@ -4,14 +4,17 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 13.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 14.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
 VIEWS oracle checks. Since milestone 11 expressions also use CASE, COALESCE, MOD, FLOOR, CEILING, CHAR_LENGTH,
 SUBSTRING, UPPER, LOWER and TRIM, and the LIMIT oracle checks LIMIT and OFFSET. Since milestone 12 the run script
 can kill and rejoin nodes while SQLancer runs (`--kill-interval`), which the nightly job's 3-node run does. Since
-milestone 13 the nightly job also runs a third cluster shape: 3 nodes with k=2 and 2 sites per host.
+milestone 13 the nightly job also runs a third cluster shape: 3 nodes with k=2 and 2 sites per host. Since
+milestone 14 expressions also hold subqueries (EXISTS, IN, ANY, ALL and scalar subqueries), the SUBQUERY oracle checks
+IN, ANY and ALL against EXISTS, and the WINDOW oracle checks window functions; see
+[Subqueries and window functions](#subqueries-and-window-functions).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -144,7 +147,7 @@ the kit's runtime JDK and makes three runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all nine (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all eleven (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW) | 45 minutes |
 | `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
 | `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
 
@@ -212,7 +215,7 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | `--username`, `--password` | Empty for a server without security (SQLancer's default is `sqlancer`). |
 | `--host`, `--port` | A server's client port. Defaults: localhost, 21212. |
 | `--database-prefix` | Prefix of each thread's table names. Default `database`; `db` keeps the logs short. |
-| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT` or `SMOKE`; several are comma-separated. |
+| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT`, `SUBQUERY`, `WINDOW` or `SMOKE`; several are comma-separated. |
 | `--max-num-tables` | Tables per database, 1 to this (default 3). |
 | `--max-num-indexes` | CREATE INDEX statements per database, 0 to this (default 4). |
 | `--max-num-updates` | UPDATE statements per database, 0 to this (default 5). |
@@ -275,6 +278,9 @@ SELECT COALESCE(SUM(c), 0) FROM (SELECT CASE WHEN p THEN 1 ELSE 0 END AS c FROM 
 ```
 
 Half the time the optimized query selects the rows instead of counting them, and the oracle counts the result set.
+When the predicate holds a subquery, the unoptimized query is the inner SELECT alone, and the oracle adds up its rows'
+values: VoltDB rejects a SUM of an expression with a subquery, even through the derived table ("SQL Aggregate function
+calls with subquery expression arguments are not allowed").
 
 The VoltDB expression generator (`gen/VoltDBExpressionGenerator`) builds predicates from columns and constants with
 AND, OR, NOT, the comparisons, BETWEEN, IN, LIKE, IS [NOT] NULL, `+ - * /`, `||` and ABS. To stay inside what VoltDB
@@ -497,6 +503,77 @@ VoltDB pushes LIMIT and OFFSET down to the partitions of a multi-partition query
 that, and ORDER BY on expressions and DISTINCT, is what this checks. A failure reports both queries, the full query's
 rows, and the expected and actual slices.
 
+## Subqueries and window functions
+
+### Subqueries in expressions
+
+Since milestone 14 the expressions of NoREC, TLP WHERE, DISTINCT, HAVING (its WHERE clause) and AGGREGATE, SUBQUERY
+and WINDOW (its WHERE clause) may hold subqueries:
+
+- `EXISTS (SELECT 1 FROM t AS s [WHERE q])`, as a boolean;
+- `x [NOT] IN (SELECT e FROM t AS s [WHERE q])` and `x op ANY|ALL (SELECT e ...)`, with x and e of one kind and, as
+  for comparisons, one numeric or temporal domain;
+- `(SELECT MIN(e) | MAX(e) | COUNT(*) FROM t AS s [WHERE q])`, a scalar subquery, in place of a value.
+
+The WHERE condition q references the outer query's columns (a correlated subquery), and so does the output e while
+`--avoid-known-bugs` is false (ENG-30597 below). A
+subquery can hold another, two deep. Each reads one table under its own alias (`S0`, `S1`, ...), which may be the outer
+query's table too. PQS, PARAMS, VIEWS and LIMIT generate no subqueries, and a generator with subqueries off makes the
+same random choices as before milestone 14.
+
+VoltDB limits where subqueries go, and the generator follows (these are rules, not bugs):
+
+- A subquery reads replicated tables only ("Subquery expressions are only supported for single partition procedures
+  and AdHoc queries referencing only replicated tables"). The outer query may read partitioned tables.
+- No subquery in a HAVING clause ("SQL HAVING clauses with subquery expressions are not allowed"), in an aggregate's
+  argument ("SQL Aggregate function calls with subquery expression arguments are not allowed"), or in a window
+  function's argument or ORDER BY.
+- While `--avoid-known-bugs` is true, a subquery does not read a table with a materialized view (ENG-30582).
+
+### The SUBQUERY oracle
+
+SUBQUERY (`oracle/VoltDBSubqueryOracle`) checks that a query with an IN, ANY or ALL subquery in its WHERE clause
+returns the rows of the same query with the subquery written with EXISTS. With c the comparison of x and e (`x = e` for
+IN):
+
+| Subquery | Written with EXISTS |
+| --- | --- |
+| `x IN (SELECT e FROM t AS s WHERE q)`, `x op ANY (...)` | `EXISTS (SELECT 1 FROM t AS s WHERE q AND c)` |
+| `x NOT IN (...)` (that is, `x <> ALL`), `x op ALL (...)` | `NOT EXISTS (SELECT 1 FROM t AS s WHERE q AND (c IS NULL OR NOT c))` |
+
+The two hold, are TRUE, for the same rows, whatever is NULL and whether the subquery is empty; where either is FALSE or
+NULL makes no difference to a WHERE clause. The predicate is the whole WHERE clause, or ANDed with a random predicate.
+VoltDB plans an IN subquery by turning it into EXISTS itself, moving x into the subquery, so this checks that rewrite.
+The query reads the FROM clauses and joins of TLP WHERE, and outputs a random subset of their columns.
+
+### The WINDOW oracle
+
+WINDOW (`oracle/VoltDBWindowOracle`) checks one windowed function against the rows of its own query. The query
+outputs the window's PARTITION BY and ORDER BY columns and the function's argument, then the window function:
+
+```sql
+SELECT p..., o..., [arg,] f([arg]) OVER ([PARTITION BY p...] [ORDER BY o [DESC]...]) FROM ... [WHERE q]
+```
+
+The oracle groups the rows by p, orders each group by o, NULLs first (last with DESC), and works out each row's value
+in Java: RANK is 1 plus the rows before it, DENSE_RANK 1 plus the distinct o values before it, and ROW_NUMBER is one
+of its peers' numbers (the rows with its o values), which together must be consecutive. COUNT(*), COUNT, SUM, MIN and
+MAX cover the rows up to the current row and its peers, or the whole group without an ORDER BY. A FLOAT SUM may differ
+in its last digits, as it adds in another order. The query must also return the rows of the same query without the
+window function.
+
+- f is RANK, DENSE_RANK, ROW_NUMBER, COUNT, SUM, MIN or MAX: VoltDB supports no other window function, and no frame
+  clause.
+- p is up to 2 columns of any type but BOOLEAN; o is up to 3 integer or TIMESTAMP columns, which is all VoltDB orders
+  a window by ("Windowed function call expressions can have only integer or TIMESTAMP value types in the ORDER BY
+  expression of their window"). RANK and DENSE_RANK need an ORDER BY.
+- arg is an expression: numeric for SUM, of any kind but BOOLEAN for MIN and MAX (ENG-30493), of any kind for COUNT.
+- VoltDB allows one window function per SELECT list, and none with GROUP BY or DISTINCT.
+
+Values are compared as SQL orders them: numbers by value, strings by code point (the order of their UTF-8 bytes),
+VARBINARY by unsigned bytes, and TIMESTAMPs in time. A failure reports the first row whose value is wrong, or the rows
+that differ from the query without the window function.
+
 ## How the provider maps SQLancer onto VoltDB
 
 - **One schema, many databases.** A VoltDB cluster has a single schema, so each SQLancer database is the set of tables
@@ -693,6 +770,17 @@ The bugs below were found in milestone 11, as the generator learned functions an
 | ENG-30592 | A parameter inside `TRIM(x)` is counted twice: "Incorrect number of parameters passed: expected 2, passed 1". `TRIM(BOTH ' ' FROM x)`, LTRIM and RTRIM take it once. Found by PARAMS: all eight failed databases of its first 10-minute trials. | `TRIM(x)` is written `LTRIM(RTRIM(x))`. |
 | ENG-30531 (comment) | The milestone 5 bug, in ORDER BY: VoltDB trusts an index's order through a FULL JOIN, whose null-extended rows come last, so `ORDER BY` of partitioned tables comes out unsorted (each partition skips its sort, and the coordinator merges the partitions as if they were sorted). LIMIT and OFFSET then pick the wrong rows. Found by LIMIT in milestone 12's trials. Wrong result. | LIMIT's queries make no FULL JOINs. |
 | ENG-30494 (comment) | The milestone 2 bug, in CASE: `CASE WHEN k = 1 THEN 1 WHEN bo = TRUE THEN 2 END` is 0 for k = 1. Wrong result. | The generator writes no BOOLEAN literals (already). |
+
+The bugs below were found in milestone 14, by subqueries and the SUBQUERY oracle.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30594 | A subquery in the output of an IN or `= ANY` subquery, such as `1 IN (SELECT (SELECT MAX(a) FROM t AS s1) FROM t AS s0)`, crashes the planner: NullPointerException, "this.m_subqueryNode" is null. ALL and EXISTS work. | The output of an IN, ANY or ALL subquery holds no subquery. |
+| ENG-30595 | `CHAR_LENGTH((SELECT MAX(s) ...)) IN (SELECT ...)` kills the server (SIGSEGV in `StringRef::getObject`): the string function on the left of an IN or `= ANY` subquery gets an INTEGER instead of the scalar subquery's value. UPPER of it fails with "Type INTEGER can't be cast as VARCHAR". Found by SUBQUERY as a node crash. Critical. | The left operand of an IN, ANY or ALL subquery holds no subquery. |
+| ENG-30596 | A bare scalar subquery on the left of an IN list fails in the EE: "Invalid ExpressionType 'COMPARE_IN' called for VectorComparisonExpression". `(SELECT ...) + 0 IN (...)` works. | A numeric one is written `(s + 0)`; a string one is not generated there. |
+| ENG-30597 | With GROUP BY and an aggregate, an ALL or IN subquery whose output is a column of the outer query fails: `<> ALL` in the EE ("invalid column type 'INVALID'", or a garbage type such as 'UNKNOWN[-47]'), IN in the planner (IndexOutOfBoundsException in `rewriteInSubqueryAsExists`). Found by TLP DISTINCT. | The output of an IN, ANY or ALL subquery reads only the subquery's own columns. |
+| ENG-16927 (comment) | An old bug, open since 2019: any subquery in the string argument of SUBSTRING or TRIM crashes the SQL parser (NullPointerException in `QueryExpression.getColumns`). Other functions of a subquery work. Found by TLP AGGREGATE. | SUBSTRING's string argument has no subquery (and TRIM is already written `LTRIM(RTRIM(x))`). |
+| ENG-30497 (comment) | The milestone 2 bug, through subqueries: NOT IN, `<> ALL` and a correlated NOT EXISTS over an outer join's inner table turn the join into an inner join, though each can be TRUE for the null-extended row. `oa LEFT JOIN ob ... WHERE NOT EXISTS (SELECT 1 FROM ob AS s WHERE s.x = ob.x)` loses the unmatched rows. Found by TLP WHERE. Wrong result. | No subquery predicates with an outer join. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.

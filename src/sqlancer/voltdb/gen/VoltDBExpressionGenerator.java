@@ -188,10 +188,13 @@ public final class VoltDBExpressionGenerator
             List<VoltDBExpression> args = new ArrayList<>();
             // ENG-30591: an IN predicate anywhere in SUBSTRING's string argument, as in a CASE condition, crashes the
             // parser, so unless --avoid-known-bugs is false the argument has none, as in a comparison's operands
+            // ENG-16927 (comment): a subquery anywhere in SUBSTRING's or TRIM's string argument crashes the parser
+            // (NullPointerException in QueryExpression.getColumns), so unless --avoid-known-bugs is false it has none
             int nesting = comparandNesting;
             comparandNesting += avoidKnownBugs ? 1 : 0;
             try {
-                args.add(generateExpression(Kind.STRING, depth + 1));
+                args.add(avoidKnownBugs ? withoutSubqueries(() -> generateExpression(Kind.STRING, depth + 1))
+                        : generateExpression(Kind.STRING, depth + 1));
             } finally {
                 comparandNesting = nesting;
             }
@@ -206,6 +209,8 @@ public final class VoltDBExpressionGenerator
         case TRIM:
             VoltDBFunctionName trim = Randomly.fromOptions(VoltDBFunctionName.TRIM, VoltDBFunctionName.LTRIM,
                     VoltDBFunctionName.RTRIM);
+            // ENG-16927 (see SUBSTRING): TRIM(x) is written LTRIM(RTRIM(x)) while avoiding known bugs, so only a
+            // TRIM generated with --avoid-known-bugs false can hold a subquery
             VoltDBExpression trimmed = generateExpression(Kind.STRING, depth + 1);
             if (trim == VoltDBFunctionName.TRIM && avoidKnownBugs) {
                 // ENG-30592: a parameter inside TRIM(x) is counted twice ("Incorrect number of parameters passed"),
@@ -965,7 +970,10 @@ public final class VoltDBExpressionGenerator
             VoltDBTable alias = aliasOf(table);
             // ENG-30594: a subquery in the output of an IN or = ANY subquery crashes the planner (NullPointerException
             // on "m_subqueryNode"), so unless --avoid-known-bugs is false the output has none
-            boolean correlated = Randomly.getBooleanWithRatherLowProbability();
+            // ENG-30597: with GROUP BY and an aggregate, an ALL or IN subquery whose output is the outer query's column
+            // fails (EE "invalid column type", planner IndexOutOfBoundsException), so unless --avoid-known-bugs is
+            // false the output reads the subquery's own columns only
+            boolean correlated = !avoidKnownBugs && Randomly.getBooleanWithRatherLowProbability();
             VoltDBExpression output = avoidKnownBugs
                     ? withoutSubqueries(() -> inSubquery(alias, correlated, () -> generateExpression(k, depth + 1)))
                     : inSubquery(alias, correlated, () -> generateExpression(k, depth + 1));
