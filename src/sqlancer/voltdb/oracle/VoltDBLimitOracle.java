@@ -48,8 +48,11 @@ public class VoltDBLimitOracle implements TestOracle<VoltDBGlobalState> {
     public void check() throws Exception {
         reproducer = null;
         boolean distinct = Randomly.getBoolean() && Randomly.getBoolean();
-        // ENG-30531: DISTINCT over a FULL JOIN can return the NULL group twice
-        VoltDBExpressionGenerator gen = new VoltDBExpressionGenerator(state).setNoFullJoins(distinct);
+        // ENG-30531: VoltDB trusts an index's order through a FULL JOIN, whose null-extended rows come last, so
+        // DISTINCT
+        // can return the NULL group twice and ORDER BY of partitioned tables comes out unsorted; unless
+        // --avoid-known-bugs is false, there are no FULL JOINs (setNoFullJoins applies only then)
+        VoltDBExpressionGenerator gen = new VoltDBExpressionGenerator(state).setNoFullJoins(true);
         gen.setTablesAndColumns(TestOracleUtils.getRandomTableNonEmptyTables(state.getSchema()));
         VoltDBSelect select = gen.generateSelect();
         select.setFromList(gen.getTableRefs());

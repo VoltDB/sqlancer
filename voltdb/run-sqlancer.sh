@@ -27,6 +27,8 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
   --port-base N      first of the ports the cluster uses, 10 per node (default 52000)
   --results DIR      where the run's directory is created (default ./sqlancer-results)
   --use-reducer      reduce each failure with SQLancer's statement reducer
+  --kill-interval S  every S seconds, kill a node other than node 0 with kill -9 and restart it,
+                     which rejoins it to the cluster (default 0: never). Needs --kfactor 1 or more.
   --keep-cluster     leave the cluster running and its data in place after the run
   -h, --help         this help
 
@@ -56,6 +58,7 @@ port_base=52000
 results_root=$PWD/sqlancer-results
 use_reducer=false
 keep_cluster=false
+kill_interval=0
 provider_args=()
 command_line="$0 $*"
 
@@ -75,6 +78,7 @@ while [ $# -gt 0 ]; do
     --results) results_root=$2; shift 2 ;;
     --use-reducer) use_reducer=true; shift ;;
     --keep-cluster) keep_cluster=true; shift ;;
+    --kill-interval) kill_interval=$2; shift 2 ;;
     -h | --help) usage; exit 0 ;;
     --) shift; provider_args=("$@"); break ;;
     *) usage >&2; die "unknown option: $1" ;;
@@ -88,7 +92,7 @@ if [ -n "$license" ]; then
     [ -r "$license" ] || die "cannot read the license $license"
     license_args=(--license "$license")
 fi
-for n in "$nodes" "$sites" "$duration" "$threads" "$queries" "$port_base"; do
+for n in "$nodes" "$sites" "$duration" "$threads" "$queries" "$port_base" "$kill_interval"; do
     case $n in '' | *[!0-9]*) die "not a number: '$n'" ;; esac
 done
 [ "$nodes" -ge 1 ] || die "--nodes must be at least 1"
@@ -97,6 +101,11 @@ if [ -z "$kfactor" ]; then
 fi
 [ "$kfactor" -lt "$nodes" ] || die "--kfactor must be less than --nodes"
 [ -n "$seed" ] || seed=$(date +%s)
+if [ "$kill_interval" -gt 0 ]; then
+    [ "$kfactor" -ge 1 ] || die "--kill-interval needs --kfactor 1 or more"
+    # the provider expects the errors a node failure causes (see VoltDBErrors)
+    provider_args=(--node-failures true ${provider_args[@]+"${provider_args[@]}"})
+fi
 
 java=java
 [ -n "${JAVA_HOME:-}" ] && java=$JAVA_HOME/bin/java
@@ -189,6 +198,7 @@ sqlancer_dirty=$(git -C "$repo_dir" status --porcelain 2>/dev/null | grep -v '^?
     echo "threads:          $threads"
     echo "queries per db:   $queries"
     echo "use reducer:      $use_reducer"
+    echo "kill interval:    $([ "$kill_interval" -gt 0 ] && echo "$kill_interval s" || echo never)"
     echo "provider options: ${provider_args[*]:-}"
 } >"$results/manifest.txt"
 cat "$results/manifest.txt"
@@ -210,13 +220,17 @@ for ((i = 0; i < nodes; i++)); do
         die "voltdb init failed for node $i; see $cluster/init$i.log"
 done
 cluster_started=true
+# start_node I LOG: starts node I, or restarts it after a failure, which rejoins it to the running cluster
+start_node() {
+    # in the foreground under nohup: "voltdb start --background" allows one server per user (a shared PID file).
+    # In a subshell, so that the server is not one of this script's jobs and its kill -9 is not reported.
+    (nohup "$voltdb_home/bin/voltdb" start -D "$cluster/node$1" -c "$nodes" -H "localhost:$(internal_port 0)" \
+        --client="$(client_port $1)" --admin="$(admin_port $1)" --internal="$(internal_port $1)" \
+        --zookeeper="$(port $1 3)" --replication="$(port $1 4)" --metrics="$(port $1 5)" \
+        >"$2" 2>&1 &)
+}
 for ((i = 0; i < nodes; i++)); do
-    node=$cluster/node$i
-    # in the foreground under nohup: "voltdb start --background" allows one server per user (a shared PID file)
-    nohup "$voltdb_home/bin/voltdb" start -D "$node" -c "$nodes" -H "localhost:$(internal_port 0)" \
-        --client="$(client_port $i)" --admin="$(admin_port $i)" --internal="$(internal_port $i)" \
-        --zookeeper="$(port $i 3)" --replication="$(port $i 4)" --metrics="$(port $i 5)" \
-        >"$cluster/start$i.log" 2>&1 &
+    start_node $i "$cluster/start$i.log"
 done
 
 ready=0
@@ -247,6 +261,53 @@ sqlancer_args=(--num-threads "$threads" --num-tries "$threads" --timeout-seconds
     --random-seed "$seed" --host localhost --port "$(client_port 0)" --username "" --password ""
     --database-prefix db)
 $use_reducer && sqlancer_args+=(--use-reducer)
+# --- node failures -----------------------------------------------------------------------------------------------
+
+# Every kill_interval seconds: kill -9 a random node other than node 0, which SQLancer connects to, wait until its
+# client port closes, restart it and wait until it has rejoined. Each event is a line of chaos.log; a rejoin that
+# does not complete within 600 s ends the loop and fails the run. The loop stops when $results/chaos.stop exists,
+# after the node it is handling has rejoined, so the run ends with every node up.
+chaos_loop() {
+    local n=0 i pid t0
+    while true; do
+        for _ in $(seq 1 "$kill_interval"); do
+            [ -e "$results/chaos.stop" ] && return 0
+            sleep 1
+        done
+        i=$((1 + RANDOM % (nodes - 1)))
+        n=$((n + 1))
+        pid=$(pgrep -f -- "voltdbroot $cluster/node$i( |\$)" | head -1)
+        if [ -z "$pid" ]; then
+            echo "$(date '+%H:%M:%S') kill $n: node$i is not running" >>"$results/chaos.log"
+            return 1
+        fi
+        kill -9 "$pid"
+        t0=$(date +%s)
+        echo "$(date '+%H:%M:%S') kill $n: node$i (pid $pid)" >>"$results/chaos.log"
+        while port_in_use "$(client_port $i)"; do sleep 1; done
+        # the server is "java ... voltdbroot <dir>"; the survivors must notice the failure before it comes back
+        sleep 5
+        start_node "$i" "$cluster/restart$i-$n.log"
+        for _ in $(seq 1 600); do
+            grep -q "Server completed initialization" "$cluster/restart$i-$n.log" 2>/dev/null && break
+            sleep 1
+        done
+        if ! grep -q "Server completed initialization" "$cluster/restart$i-$n.log" 2>/dev/null; then
+            echo "$(date '+%H:%M:%S') rejoin $n: node$i did not rejoin within 600 s" >>"$results/chaos.log"
+            return 1
+        fi
+        echo "$(date '+%H:%M:%S') rejoin $n: node$i, $(($(date +%s) - t0)) s after the kill" >>"$results/chaos.log"
+    done
+}
+
+chaos_pid=
+if [ "$kill_interval" -gt 0 ]; then
+    : >"$results/chaos.log"
+    chaos_loop &
+    chaos_pid=$!
+    log "Killing and rejoining a node other than node 0 every $kill_interval s (chaos.log)"
+fi
+
 log "Running SQLancer for $duration s: oracles $oracles, seed $seed, $threads threads"
 # in the background, so that an interrupt runs the trap at once instead of after SQLancer finishes
 (cd "$results/sqlancer" && exec "$java" -jar "$jar" "${sqlancer_args[@]}" voltdb --oracle "$oracles" \
@@ -257,6 +318,17 @@ sqlancer_exit=$?
 sqlancer_pid=
 log "SQLancer exited with $sqlancer_exit"
 
+chaos_failed=false
+kills=0
+rejoins=0
+if [ -n "$chaos_pid" ]; then
+    touch "$results/chaos.stop"
+    wait "$chaos_pid" || chaos_failed=true
+    kills=$(grep -c " kill " "$results/chaos.log")
+    rejoins=$(grep -c " rejoin [0-9]*: node[0-9]*, " "$results/chaos.log")
+    log "Node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", the last one FAILED")"
+fi
+
 # --- collect -----------------------------------------------------------------------------------------------------
 
 down=()
@@ -266,7 +338,7 @@ done
 stop_cluster
 for ((i = 0; i < nodes; i++)); do
     mkdir -p "$results/servers/node$i"
-    cp "$cluster/start$i.log" "$cluster/init$i.log" "$results/servers/node$i/" 2>/dev/null
+    cp "$cluster/start$i.log" "$cluster/init$i.log" "$cluster"/restart$i-*.log "$results/servers/node$i/" 2>/dev/null
     cp -R "$cluster/node$i/voltdbroot/log/." "$results/servers/node$i/" 2>/dev/null
 done
 cp "$cluster/deployment.xml" "$results/"
@@ -288,8 +360,8 @@ fatal=$(cat "$results"/servers/node*/volt.log 2>/dev/null | grep -c " FATAL ")
 # --- summary -----------------------------------------------------------------------------------------------------
 
 result=PASS
-[ "$sqlancer_exit" -eq 0 ] && [ ${#failures[@]} -eq 0 ] && [ ${#down[@]} -eq 0 ] && [ "$fatal" -eq 0 ] ||
-    result=FAIL
+[ "$sqlancer_exit" -eq 0 ] && [ ${#failures[@]} -eq 0 ] && [ ${#down[@]} -eq 0 ] && [ "$fatal" -eq 0 ] &&
+    ! $chaos_failed || result=FAIL
 {
     echo "RESULT: $result"
     echo "run: $run_id"
@@ -298,6 +370,7 @@ result=PASS
     echo "failed databases: ${#failures[@]}"
     echo "nodes down at the end: ${down[*]:-none}"
     echo "FATAL lines in server logs: $fatal"
+    [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
     for f in ${failures[@]+"${failures[@]}"}; do
         echo
         echo "== reproductions/$(basename "$f")"

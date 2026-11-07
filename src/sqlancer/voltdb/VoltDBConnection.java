@@ -10,6 +10,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.concurrent.ThreadLocalRandom;
 
+import sqlancer.IgnoreMeException;
 import sqlancer.SQLConnection;
 
 /**
@@ -24,18 +25,23 @@ import sqlancer.SQLConnection;
  * the other threads (ENG-30489).</li>
  * <li>getString() returns null for a NULL value. The VoltDB driver returns the type's NULL sentinel instead, such as
  * -2147483648 for an INTEGER, or throws for a DECIMAL, BOOLEAN or TIMESTAMP (ENG-4643).</li>
+ * <li>While nodes are killed and rejoined during the run (--node-failures), a statement or metadata call that fails
+ * because of a node failure (see {@link VoltDBErrors#isNodeFailure}) throws IgnoreMeException, which skips the
+ * statement, the check or the database. Such a statement may have committed, so it is not retried.</li>
  * </ul>
  */
 public class VoltDBConnection extends SQLConnection {
 
     private final Connection connection;
     private final long retryMillis;
+    private final boolean nodeFailures;
     private boolean closed;
 
-    public VoltDBConnection(Connection connection, int retrySeconds) {
+    public VoltDBConnection(Connection connection, int retrySeconds, boolean nodeFailures) {
         super(connection);
         this.connection = connection;
         this.retryMillis = retrySeconds * 1000L;
+        this.nodeFailures = nodeFailures;
     }
 
     @Override
@@ -57,7 +63,35 @@ public class VoltDBConnection extends SQLConnection {
     }
 
     public DatabaseMetaData getMetaData() throws SQLException {
-        return connection.getMetaData();
+        DatabaseMetaData md;
+        try {
+            // the driver reads the cluster's system information here
+            md = connection.getMetaData();
+        } catch (SQLException e) {
+            if (skippedIfNodeFailure(e) instanceof IgnoreMeException) {
+                throw new IgnoreMeException();
+            }
+            throw e;
+        }
+        if (!nodeFailures) {
+            return md;
+        }
+        return (DatabaseMetaData) Proxy.newProxyInstance(DatabaseMetaData.class.getClassLoader(),
+                new Class<?>[] { DatabaseMetaData.class }, (proxy, method, args) -> {
+                    try {
+                        return method.invoke(md, args);
+                    } catch (InvocationTargetException e) {
+                        throw skippedIfNodeFailure(e.getCause());
+                    }
+                });
+    }
+
+    // an error a node failure caused, as IgnoreMeException while --node-failures is on, otherwise the error itself
+    private Throwable skippedIfNodeFailure(Throwable t) {
+        if (nodeFailures && t instanceof SQLException && VoltDBErrors.isNodeFailure((SQLException) t)) {
+            return new IgnoreMeException();
+        }
+        return t;
     }
 
     // wraps a statement so that its execute* methods retry while VoltDB rejects them as retryable
@@ -77,7 +111,7 @@ public class VoltDBConnection extends SQLConnection {
                                 Thread.sleep(ThreadLocalRandom.current().nextLong(20, 100));
                                 continue;
                             }
-                            throw cause;
+                            throw skippedIfNodeFailure(cause);
                         }
                     }
                 }));

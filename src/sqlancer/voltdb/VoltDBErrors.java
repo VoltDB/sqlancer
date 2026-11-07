@@ -16,9 +16,35 @@ public final class VoltDBErrors {
      * ad hoc statement that was planned before a catalog update committed. Both are rejected before they run.
      */
     private static final String[] RETRYABLE = { "while another one is in progress",
-            "was planned against a catalog version which does not match" };
+            "was planned against a catalog version which does not match",
+            // the same while a node fails or rejoins (run-sqlancer.sh --kill-interval): VoltDB rejects DDL until the
+            // failed catalog update is cleaned up and the rejoin is done
+            "while catalog update transaction is in progress", "while node rejoin is in progress" };
+
+    /**
+     * Errors a node failure causes while nodes are killed and rejoined during the run (--node-failures). A statement in
+     * flight when a partition's leader moves is dropped, and may or may not have committed; a system request waiting on
+     * the dead node times out. {@link VoltDBConnection} skips the statement, check or database that hit one.
+     */
+    private static final String[] NODE_FAILURE = { "Transaction dropped due to change in mastership",
+            "OPS request hit sixty second timeout", "Transaction being restarted due to fault recovery",
+            // a catalog update (DDL) whose verification step was waiting on the dead node
+            "failed, connection lost" };
 
     private VoltDBErrors() {
+    }
+
+    public static boolean isNodeFailure(SQLException e) {
+        String message = e.getMessage();
+        if (message == null) {
+            return false;
+        }
+        for (String r : NODE_FAILURE) {
+            if (message.contains(r)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static boolean isRetryable(SQLException e) {

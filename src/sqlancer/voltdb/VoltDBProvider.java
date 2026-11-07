@@ -143,8 +143,10 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
         Class.forName("org.voltdb.jdbc.Driver");
         Connection con = DriverManager.getConnection(String.format("jdbc:voltdb://%s:%d", host, port),
                 globalState.getOptions().getUserName(), globalState.getOptions().getPassword());
-        SQLConnection sqlCon = new VoltDBConnection(con, globalState.getDbmsSpecificOptions().retrySeconds);
-        List<String[]> leftover = VoltDBSchema.getTables(con.getMetaData(), prefix(globalState.getDatabaseName()));
+        SQLConnection sqlCon = new VoltDBConnection(con, globalState.getDbmsSpecificOptions().retrySeconds,
+                globalState.getDbmsSpecificOptions().nodeFailures);
+        List<String[]> leftover = VoltDBSchema.getTables(((VoltDBConnection) sqlCon).getMetaData(),
+                prefix(globalState.getDatabaseName()));
         for (String[] t : leftover) {
             String drop = "DROP TABLE " + t[0] + " IF EXISTS CASCADE";
             globalState.getState().logStatement(drop);

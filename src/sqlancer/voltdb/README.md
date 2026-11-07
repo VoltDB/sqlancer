@@ -4,12 +4,13 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 11.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 12.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
 VIEWS oracle checks. Since milestone 11 expressions also use CASE, COALESCE, MOD, FLOOR, CEILING, CHAR_LENGTH,
-SUBSTRING, UPPER, LOWER and TRIM, and the LIMIT oracle checks LIMIT and OFFSET.
+SUBSTRING, UPPER, LOWER and TRIM, and the LIMIT oracle checks LIMIT and OFFSET. Since milestone 12 the run script
+can kill and rejoin nodes while SQLancer runs (`--kill-interval`), which the nightly job's 3-node run does.
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -66,6 +67,7 @@ voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 -
 | `--port-base N` | 52000 | The cluster's first port. Node *i* uses the 6 ports from N + 10*i (client, admin, internal, zookeeper, replication, metrics). The script refuses to start if any is in use, and it never touches other servers. |
 | `--results DIR` | `./sqlancer-results` | Where the run's directory is created. |
 | `--use-reducer` | off | Reduce each failure before saving it (see [Reducing a failure](#reducing-a-failure)). |
+| `--kill-interval SECS` | 0 (never) | Every SECS seconds, kill a node other than node 0 with `kill -9`, restart it and wait until it has rejoined (see [Node failures](#node-failures)). Needs k-safety 1 or more. |
 | `--keep-cluster` | off | Leave the cluster running, with its data, after the run. |
 | `-- ...` | | Everything after `--` goes to the provider, for example `-- --avoid-known-bugs false`. |
 
@@ -80,15 +82,47 @@ that did not start). Each run writes `<results>/sqlancer-<UTC time>-seed<N>/`:
 | `deployment.xml` | The cluster's configuration. |
 | `servers/node<i>/` | Each node's `volt.log` and its `voltdb init` and `voltdb start` output. |
 | `sqlancer/` | SQLancer's output (`out.log`) and its `logs/voltdb/` directory (see [Reading the results](#reading-the-results)). |
+| `chaos.log` | With `--kill-interval`: each kill and rejoin, with its time. |
 | `reproductions/` | The log of each database whose thread failed: the statements that set it up, then the failing queries. With `--use-reducer`, these are reduced, and `<db>-reduce.log` shows the steps. |
 
 A run FAILs if any of these happens:
 - SQLancer exits non-zero, or any thread fails.
 - A node is down at the end.
 - A server log has a FATAL line.
+- With `--kill-interval`, a killed node does not rejoin within 600 seconds.
 
 The cluster's data is deleted after the logs are copied, unless `--keep-cluster` is given. Several runs can share a
 machine if each has its own `--port-base`.
+
+## Node failures
+
+With `--kill-interval SECS`, the script kills a node every SECS seconds while SQLancer runs, and the oracles keep
+checking query results through the failures:
+
+1. It picks a node other than node 0 at random. SQLancer connects to node 0 only, so its connections survive.
+2. It kills the node's server with `kill -9`, waits until its client port closes, and waits 5 seconds more for the
+   survivors to notice.
+3. It restarts the node with the same `voltdb start` command, which rejoins it to the running cluster: it gets its
+   partitions' data back from the replicas, while the cluster keeps working.
+4. It waits until the rejoin completes ("Server completed initialization" in the restart's output), up to 600 seconds,
+   and logs both events to `chaos.log`. A rejoin that does not complete fails the run.
+
+When SQLancer stops, the script lets the current rejoin finish, so the run ends with every node up, and the summary
+counts the kills and rejoins. A local rejoin takes about 10 seconds.
+
+With `--kill-interval`, the script passes `--node-failures true` to the provider, which makes `VoltDBConnection`
+handle the errors a node failure causes:
+
+| Error | What it means | What the provider does |
+| --- | --- | --- |
+| `Transaction dropped due to change in mastership. It is possible the transaction was committed` | The statement was in flight when a partition's leader moved; it may have committed. | Skips the statement, check or database (IgnoreMeException), since it cannot know. |
+| `Transaction being restarted due to fault recovery or shutdown` | The same for a read, aborted by the failure. | The same. |
+| `OPS request hit sixty second timeout before all responses were received` | A system request, such as the JDBC metadata calls that read the schema, waited on the dead node. | The same. |
+| `The errors for @VerifyCatalogAndWriteJar from host N: Host N failed, connection lost` | A DDL statement's catalog update was waiting on the dead node. | The same. |
+| `Can't do catalog update(@AdHoc) while node rejoin is in progress`, `... while catalog update transaction is in progress` | VoltDB rejects DDL until the rejoin is done, or until a catalog update the failure interrupted is cleaned up. | Retries the statement, like a concurrent schema change, for up to `--retry-seconds`. VoltDB rejects it before running it. |
+
+Without `--node-failures`, these errors fail the run as before. The OPS timeout makes each failure cost up to a minute
+of the threads that read the schema at the time, so a run with failures checks fewer queries.
 
 ## The nightly lab job
 
@@ -104,7 +138,7 @@ the kit's runtime JDK and makes two runs, one after the other, every node on the
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1` | 3 nodes, k=1, 8 sites per host | all seven (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all nine (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT) | 45 minutes |
 | `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
 
 Both runs use `--use-reducer`. The first run's seed is the UTC time as `yyyymmddHHMM`, and the second's is one more.
@@ -119,7 +153,8 @@ To repeat a failure on your machine, take the seed and oracles from the bundle's
 them against the same build. The reproduction in `reproductions/` is usually quicker: run its statements on an empty
 server.
 
-The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor`, default `3:1 1:0`), `DURATION` (seconds
+The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor[:kill]`, where kill is the seconds
+between node failures, default `3:1:300 1:0`), `DURATION` (seconds
 per run, default 2700), `ORACLES`, `SEED`, `EXTRA_ARGS` (provider options) and `SQLANCER_REF`. A run of the job alone
 needs a kit: give `releasedir`, for example `releases/one-offs/16.1.0-SNAPSHOT-master/<kit build>`.
 
@@ -438,7 +473,7 @@ order, up to rows that are the same in every column, so `LIMIT n OFFSET m` must 
 the query without them, in the same order.
 
 - The query reads the FROM clauses and joins of TLP WHERE, has a WHERE clause half the time, and is DISTINCT about one
-  time in four (without FULL joins then, for ENG-30531).
+  time in four. While `--avoid-known-bugs` is true it makes no FULL JOINs (ENG-30531 below).
 - It outputs columns, or one to three expressions that read a column, of any kind but BOOLEAN, which VoltDB orders
   wrongly (ENG-30493). VoltDB rejects ORDER BY of a constant.
 - ORDER BY names every output by position, each ascending or descending. LIMIT is 0 to 12, and OFFSET 0 to 12.
@@ -643,6 +678,7 @@ The bugs below were found in milestone 11, as the generator learned functions an
 | ENG-30497 (comment) | The milestone 2 bug, through CASE: a CASE over an outer join's inner table in WHERE turns the join into an inner join, though the CASE can be non-NULL for the null-extended row. `WHERE (CASE WHEN jb.n > 0 THEN 'a' ELSE 'b' END) = 'b'` drops the row a LEFT JOIN null-extends. COALESCE is handled correctly. Found by TLP WHERE. Wrong result. | With an outer join, the generator writes COALESCE instead of CASE. |
 | ENG-30591 | SUBSTRING of a CASE whose condition has an IN list crashes the SQL parser (NullPointerException in `TableUtil.addAutoColumns`). Other functions of the same CASE work. Found by PARAMS. | SUBSTRING's string argument has no IN predicate. |
 | ENG-30592 | A parameter inside `TRIM(x)` is counted twice: "Incorrect number of parameters passed: expected 2, passed 1". `TRIM(BOTH ' ' FROM x)`, LTRIM and RTRIM take it once. Found by PARAMS: all eight failed databases of its first 10-minute trials. | `TRIM(x)` is written `LTRIM(RTRIM(x))`. |
+| ENG-30531 (comment) | The milestone 5 bug, in ORDER BY: VoltDB trusts an index's order through a FULL JOIN, whose null-extended rows come last, so `ORDER BY` of partitioned tables comes out unsorted (each partition skips its sort, and the coordinator merges the partitions as if they were sorted). LIMIT and OFFSET then pick the wrong rows. Found by LIMIT in milestone 12's trials. Wrong result. | LIMIT's queries make no FULL JOINs. |
 | ENG-30494 (comment) | The milestone 2 bug, in CASE: `CASE WHEN k = 1 THEN 1 WHEN bo = TRUE THEN 2 END` is 0 for k = 1. Wrong result. | The generator writes no BOOLEAN literals (already). |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads

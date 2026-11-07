@@ -38,6 +38,9 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--avoid-known-bugs", description = "Do not generate SQL that hits a known, unfixed VoltDB bug (see the README)", arity = 1)
     public boolean avoidKnownBugs = true;
 
+    @Parameter(names = "--node-failures", description = "Nodes are killed and rejoined during the run (run-sqlancer.sh --kill-interval): expect and retry the errors that causes", arity = 1)
+    public boolean nodeFailures;
+
     @Override
     public List<VoltDBOracleFactory> getTestOracleFactory() {
         return oracles;
