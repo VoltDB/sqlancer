@@ -29,7 +29,10 @@ public final class VoltDBErrors {
     private static final String[] NODE_FAILURE = { "Transaction dropped due to change in mastership",
             "OPS request hit sixty second timeout", "Transaction being restarted due to fault recovery",
             // a catalog update (DDL) whose verification step was waiting on the dead node
-            "failed, connection lost" };
+            "failed, connection lost",
+            // a DDL statement that one of the errors above interrupted can still commit after its client was told it
+            // failed, so a later CREATE of the same name collides with an object the provider never saw
+            "object name already exists" };
 
     private VoltDBErrors() {
     }
