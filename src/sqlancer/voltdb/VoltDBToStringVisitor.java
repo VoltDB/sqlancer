@@ -8,6 +8,8 @@ import sqlancer.voltdb.ast.VoltDBConstant;
 import sqlancer.voltdb.ast.VoltDBExpression;
 import sqlancer.voltdb.ast.VoltDBJoin;
 import sqlancer.voltdb.ast.VoltDBSelect;
+import sqlancer.voltdb.ast.VoltDBSubquery;
+import sqlancer.voltdb.ast.VoltDBWindowFunction;
 
 public class VoltDBToStringVisitor extends NewToStringVisitor<VoltDBExpression> {
 
@@ -21,6 +23,10 @@ public class VoltDBToStringVisitor extends NewToStringVisitor<VoltDBExpression> 
             visit((VoltDBJoin) expr);
         } else if (expr instanceof VoltDBCase) {
             visit((VoltDBCase) expr);
+        } else if (expr instanceof VoltDBSubquery) {
+            visit((VoltDBSubquery) expr);
+        } else if (expr instanceof VoltDBWindowFunction) {
+            visit((VoltDBWindowFunction) expr);
         } else {
             throw new AssertionError(expr.getClass());
         }
@@ -53,6 +59,83 @@ public class VoltDBToStringVisitor extends NewToStringVisitor<VoltDBExpression> 
             visit(c.getElseResult());
         }
         sb.append(" END)");
+    }
+
+    private void visit(VoltDBSubquery s) {
+        switch (s.getForm()) {
+        case EXISTS:
+            sb.append("(EXISTS ");
+            appendSubquery(s, null);
+            sb.append(")");
+            break;
+        case IN:
+            sb.append("(");
+            visit(s.getLeft());
+            sb.append(s.isNegated() ? " NOT IN " : " IN ");
+            appendSubquery(s, s.getOutput());
+            sb.append(")");
+            break;
+        case QUANTIFIED:
+            sb.append("(");
+            visit(s.getLeft());
+            sb.append(s.getOperator().getTextRepresentation()).append(s.isAll() ? "ALL " : "ANY ");
+            appendSubquery(s, s.getOutput());
+            sb.append(")");
+            break;
+        case SCALAR:
+            appendSubquery(s, s.getOutput());
+            break;
+        default:
+            throw new AssertionError(s.getForm());
+        }
+    }
+
+    // (SELECT output FROM t AS s [WHERE q]); output null is 1
+    private void appendSubquery(VoltDBSubquery s, VoltDBExpression output) {
+        sb.append("(SELECT ");
+        if (output == null) {
+            sb.append('1');
+        } else {
+            visit(output);
+        }
+        sb.append(" FROM ").append(s.getTableName()).append(" AS ").append(s.getAlias().getName());
+        if (s.getWhere() != null) {
+            sb.append(" WHERE ");
+            visit(s.getWhere());
+        }
+        sb.append(')');
+    }
+
+    private void visit(VoltDBWindowFunction w) {
+        sb.append(w.getFunction()).append('(');
+        if (w.getFunction().isAggregate()) {
+            if (w.getArgument() == null) {
+                sb.append('*');
+            } else {
+                visit(w.getArgument());
+            }
+        }
+        sb.append(") OVER (");
+        if (!w.getPartitionBy().isEmpty()) {
+            sb.append("PARTITION BY ");
+            visit(w.getPartitionBy());
+        }
+        if (!w.getOrderBy().isEmpty()) {
+            if (!w.getPartitionBy().isEmpty()) {
+                sb.append(' ');
+            }
+            sb.append("ORDER BY ");
+            for (int i = 0; i < w.getOrderBy().size(); i++) {
+                if (i != 0) {
+                    sb.append(", ");
+                }
+                visit(w.getOrderBy().get(i));
+                if (w.getDescending().get(i)) {
+                    sb.append(" DESC");
+                }
+            }
+        }
+        sb.append(')');
     }
 
     private void visit(VoltDBJoin join) {

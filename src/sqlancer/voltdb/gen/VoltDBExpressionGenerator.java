@@ -33,6 +33,7 @@ import sqlancer.voltdb.ast.VoltDBFunction.VoltDBFunctionName;
 import sqlancer.voltdb.ast.VoltDBInOperation;
 import sqlancer.voltdb.ast.VoltDBJoin;
 import sqlancer.voltdb.ast.VoltDBSelect;
+import sqlancer.voltdb.ast.VoltDBSubquery;
 import sqlancer.voltdb.ast.VoltDBTableReference;
 import sqlancer.voltdb.ast.VoltDBUnaryPostfixOperation;
 import sqlancer.voltdb.ast.VoltDBUnaryPostfixOperation.VoltDBUnaryPostfixOperator;
@@ -132,6 +133,16 @@ public final class VoltDBExpressionGenerator
     // how many functions that type their result from their arguments (ABS, FLOOR, CEILING, MOD, CASE, COALESCE)
     // enclose the expression being generated (ENG-30550)
     private int typedFunctionNesting;
+    // whether expressions may hold subqueries (see setSubqueries); the replicated tables they may read; how many
+    // subqueries enclose the expression being generated; and the number of the next subquery's alias
+    private boolean subqueries;
+    private List<VoltDBTable> subqueryTables = List.of();
+    private int subqueryNesting;
+    private int subqueryAliases;
+    // while greater than 0, no subquery (see withoutSubqueries)
+    private int subqueriesBlocked;
+
+    private static final int MAX_SUBQUERY_NESTING = 2;
 
     public VoltDBExpressionGenerator(VoltDBGlobalState state) {
         this.state = state;
@@ -142,6 +153,9 @@ public final class VoltDBExpressionGenerator
     protected VoltDBExpression generateExpression(Kind kind, int depth) {
         if (depth >= state.getOptions().getMaxExpressionDepth() || Randomly.getBooleanWithSmallProbability()) {
             return generateLeafNode(kind);
+        }
+        if (kind != Kind.BOOLEAN && canGenerateScalarSubquery(kind) && Randomly.getBooleanWithSmallProbability()) {
+            return generateScalarSubquery(kind, depth);
         }
         switch (kind) {
         case BOOLEAN:
@@ -257,6 +271,9 @@ public final class VoltDBExpressionGenerator
     }
 
     private VoltDBExpression generateBooleanExpression(int depth) {
+        if (canGenerateSubqueryPredicate() && Randomly.getBooleanWithRatherLowProbability()) {
+            return generateSubqueryPredicate(depth);
+        }
         switch (Randomly.fromOptions(BooleanExpression.values())) {
         case COMPARISON:
             Kind kind = getRandomType();
@@ -339,7 +356,17 @@ public final class VoltDBExpressionGenerator
                 for (int i = 0; i < n; i++) {
                     list.add(generateInListElement(inKind, depth));
                 }
-                return new VoltDBInOperation(generateComparand(inKind, depth), list, Randomly.getBoolean());
+                VoltDBExpression left = generateComparand(inKind, depth);
+                if (avoidKnownBugs && left instanceof VoltDBSubquery) {
+                    // ENG-30596: a bare scalar subquery on the left of an IN list fails in the EE ("Invalid
+                    // ExpressionType 'COMPARE_IN' called for VectorComparisonExpression"), so unless --avoid-known-bugs
+                    // is false a numeric one is written (s + 0), and a string one is not generated: s || '' would be
+                    // NULL for '' (ENG-30546)
+                    left = inKind == Kind.NUMERIC
+                            ? new VoltDBBinaryOperation(left, new VoltDBConstant("0"), VoltDBBinaryOperator.ADD)
+                            : withoutSubqueries(() -> generateComparand(inKind, depth));
+                }
+                return new VoltDBInOperation(left, list, Randomly.getBoolean());
             });
         case LIKE:
             return generateLike(depth);
@@ -821,7 +848,206 @@ public final class VoltDBExpressionGenerator
         }
         this.columns = all;
         hasOuterJoin = joins.stream().anyMatch(j -> j.getJoinType() != VoltDBJoin.JoinType.INNER);
+        subqueryAliases = 0;
+        if (subqueries) {
+            // ENG-30582 (above) applies to the aggregates of scalar subqueries too
+            Set<String> viewed = avoidKnownBugs
+                    ? state.getViews().values().stream().map(v -> v[0]).collect(Collectors.toSet()) : Set.of();
+            subqueryTables = state.getSchema().getDatabaseTables().stream()
+                    .filter(t -> !t.isPartitioned() && !viewed.contains(t.getName())).collect(Collectors.toList());
+        }
         return this;
+    }
+
+    // Subqueries in the expressions this generator makes: EXISTS, IN, ANY and ALL predicates, and scalar subqueries
+    // that aggregate, correlated with the outer query or not. VoltDB runs subqueries over replicated tables only, and
+    // rejects them in a HAVING clause, in an aggregate's argument and in a window's ORDER BY, so there are none there.
+    // Generators with subqueries off make the same choices as before subqueries existed.
+    public VoltDBExpressionGenerator setSubqueries(boolean subqueries) {
+        this.subqueries = subqueries;
+        return this;
+    }
+
+    private boolean canGenerateSubquery() {
+        return subqueries && !subqueryTables.isEmpty() && subqueryNesting < MAX_SUBQUERY_NESTING
+                && aggregateColumns == null && !inAggregate && subqueriesBlocked == 0;
+    }
+
+    // ENG-30497 (comment): VoltDB takes NOT IN, <> ALL and NOT EXISTS over an outer join's inner table to reject NULLs
+    // and turns the join into an inner join, though they can be TRUE for the null-extended row; so unless
+    // --avoid-known-bugs is false, there are no subquery predicates with an outer join
+    private boolean canGenerateSubqueryPredicate() {
+        return canGenerateSubquery() && !(hasOuterJoin && avoidKnownBugs);
+    }
+
+    private <T> T withoutSubqueries(Supplier<T> body) {
+        subqueriesBlocked++;
+        try {
+            return body.get();
+        } finally {
+            subqueriesBlocked--;
+        }
+    }
+
+    // An expression of the given kind in one domain (see generateExpressionInDomain) without subqueries, for a window
+    // function's argument: "Window function calls with subquery expression arguments are not allowed"
+    public VoltDBExpression generateWindowArgument(Kind kind) {
+        return withoutSubqueries(() -> generateExpressionInDomain(kind));
+    }
+
+    // ENG-30533 (see setUngroupedAggregates): a subquery's MIN or MAX has no GROUP BY, so unless --avoid-known-bugs is
+    // false its argument is a NUMERIC or STRING expression, which (c + 0) and (c || '') keep from being a bare column
+    private boolean canGenerateScalarSubquery(Kind kind) {
+        return canGenerateSubquery() && (!avoidKnownBugs || kind == Kind.NUMERIC || kind == Kind.STRING);
+    }
+
+    // A copy of the table under the next alias, S0, S1, ..., whose columns a subquery's expressions reference
+    private VoltDBTable aliasOf(VoltDBTable t) {
+        List<VoltDBColumn> copies = t.getColumns().stream()
+                .map(c -> new VoltDBColumn(c.getName(), c.getType(), c.isNullable())).collect(Collectors.toList());
+        VoltDBTable alias = new VoltDBTable("S" + subqueryAliases++, copies, null, List.of());
+        copies.forEach(c -> c.setTable(alias));
+        return alias;
+    }
+
+    // Generates inside a subquery over alias: with only its columns in scope, or with the outer query's too
+    private <T> T inSubquery(VoltDBTable alias, boolean correlated, Supplier<T> body) {
+        List<VoltDBColumn> outer = columns;
+        List<VoltDBColumn> scope = new ArrayList<>(alias.getColumns());
+        if (correlated) {
+            scope.addAll(outer);
+        }
+        columns = scope;
+        subqueryNesting++;
+        try {
+            return body.get();
+        } finally {
+            columns = outer;
+            subqueryNesting--;
+        }
+    }
+
+    // a subquery's WHERE condition, which may reference the outer query's columns, or null
+    private VoltDBExpression generateSubqueryWhere(VoltDBTable alias, int depth) {
+        if (Randomly.getBooleanWithRatherLowProbability()) {
+            return null;
+        }
+        return inSubquery(alias, true, () -> generateExpression(Kind.BOOLEAN, depth + 1));
+    }
+
+    // EXISTS, IN, or a comparison with ANY or ALL. VoltDB's parser rejects IN inside an operand of a comparison or IN,
+    // as for IN lists, and ANY and ALL with it, so there it is EXISTS.
+    private VoltDBExpression generateSubqueryPredicate(int depth) {
+        if (comparandNesting > 0 || Randomly.getBoolean()) {
+            VoltDBTable table = Randomly.fromList(subqueryTables);
+            VoltDBTable alias = aliasOf(table);
+            return VoltDBSubquery.exists(table.getName(), alias, generateSubqueryWhere(alias, depth));
+        }
+        return generateSubqueryComparison(depth);
+    }
+
+    // x [NOT] IN (SELECT e ...) or x op ANY|ALL (SELECT e ...), x and e of one kind and domain. ENG-12656: an index
+    // lookup on a VARBINARY(n) column with a longer value fails, and either side can be the indexed column, so unless
+    // --avoid-known-bugs is false they are not VARBINARY.
+    private VoltDBSubquery generateSubqueryComparison(int depth) {
+        Kind kind;
+        do {
+            kind = getRandomType();
+        } while (kind == Kind.VARBINARY && avoidKnownBugs);
+        Kind k = kind;
+        VoltDBTable table = Randomly.fromList(subqueryTables);
+        return (VoltDBSubquery) inDomain(kind, () -> {
+            // ENG-30595: a string function of a scalar subquery on the left of IN or = ANY gets a value of the wrong
+            // type, and CHAR_LENGTH of it crashes the server, so unless --avoid-known-bugs is false the left operand
+            // has no subquery
+            VoltDBExpression left = avoidKnownBugs ? withoutSubqueries(() -> generateComparand(k, depth))
+                    : generateComparand(k, depth);
+            VoltDBTable alias = aliasOf(table);
+            // ENG-30594: a subquery in the output of an IN or = ANY subquery crashes the planner (NullPointerException
+            // on "m_subqueryNode"), so unless --avoid-known-bugs is false the output has none
+            boolean correlated = Randomly.getBooleanWithRatherLowProbability();
+            VoltDBExpression output = avoidKnownBugs
+                    ? withoutSubqueries(() -> inSubquery(alias, correlated, () -> generateExpression(k, depth + 1)))
+                    : inSubquery(alias, correlated, () -> generateExpression(k, depth + 1));
+            VoltDBExpression where = generateSubqueryWhere(alias, depth);
+            if (Randomly.getBoolean()) {
+                return VoltDBSubquery.inSet(left, Randomly.getBoolean(), table.getName(), alias, output, where);
+            }
+            VoltDBBinaryOperator op = Randomly.fromOptions(VoltDBBinaryOperator.EQUALS, VoltDBBinaryOperator.NOT_EQUALS,
+                    VoltDBBinaryOperator.SMALLER, VoltDBBinaryOperator.SMALLER_EQUALS, VoltDBBinaryOperator.GREATER,
+                    VoltDBBinaryOperator.GREATER_EQUALS);
+            if (op.isOrdering() && !canCompareOrdered(k)) {
+                op = Randomly.fromOptions(VoltDBBinaryOperator.EQUALS, VoltDBBinaryOperator.NOT_EQUALS);
+            }
+            return VoltDBSubquery.quantified(left, op, Randomly.getBoolean(), table.getName(), alias, output, where);
+        });
+    }
+
+    // An IN, ANY or ALL subquery predicate, at the top of a WHERE clause (see VoltDBSubqueryOracle)
+    public VoltDBSubquery generateSubqueryComparison() {
+        if (!canGenerateSubqueryPredicate()) {
+            throw new IgnoreMeException();
+        }
+        return generateSubqueryComparison(0);
+    }
+
+    // The same predicate with EXISTS, where it holds (is TRUE) for the same rows. With c the comparison of x and e
+    // (x = e for IN):
+    // x IN S and x op ANY S hold when some row of S makes c TRUE: EXISTS (SELECT 1 ... WHERE q AND c);
+    // x NOT IN S (x <> ALL S) and x op ALL S hold when no row of S makes c FALSE or NULL:
+    // NOT EXISTS (SELECT 1 ... WHERE q AND (c IS NULL OR NOT c)).
+    public VoltDBExpression existsRewrite(VoltDBSubquery s) {
+        VoltDBBinaryOperator op;
+        boolean all;
+        if (s.getForm() == VoltDBSubquery.Form.IN) {
+            op = s.isNegated() ? VoltDBBinaryOperator.NOT_EQUALS : VoltDBBinaryOperator.EQUALS;
+            all = s.isNegated();
+        } else if (s.getForm() == VoltDBSubquery.Form.QUANTIFIED) {
+            op = s.getOperator();
+            all = s.isAll();
+        } else {
+            throw new AssertionError(s.getForm());
+        }
+        VoltDBExpression c = new VoltDBBinaryOperation(s.getLeft(), s.getOutput(), op);
+        VoltDBExpression condition = all ? new VoltDBBinaryOperation(isNull(c),
+                new VoltDBUnaryPrefixOperation(c, VoltDBUnaryPrefixOperator.NOT), VoltDBBinaryOperator.OR) : c;
+        VoltDBExpression where = s.getWhere() == null ? condition
+                : new VoltDBBinaryOperation(s.getWhere(), condition, VoltDBBinaryOperator.AND);
+        VoltDBExpression exists = VoltDBSubquery.exists(s.getTableName(), s.getAlias(), where);
+        return all ? new VoltDBUnaryPrefixOperation(exists, VoltDBUnaryPrefixOperator.NOT) : exists;
+    }
+
+    // (SELECT agg FROM t AS s [WHERE q]): MIN or MAX of an expression over s's columns, or a COUNT(*)
+    private VoltDBExpression generateScalarSubquery(Kind kind, int depth) {
+        VoltDBTable table = Randomly.fromList(subqueryTables);
+        VoltDBTable alias = aliasOf(table);
+        List<VoltDBAggregateFunction> functions = new ArrayList<>(
+                List.of(VoltDBAggregateFunction.MIN, VoltDBAggregateFunction.MAX));
+        if (kind == Kind.NUMERIC && numericDomain != NumericDomain.FLOAT) {
+            functions.add(VoltDBAggregateFunction.COUNT);
+        }
+        VoltDBAggregateFunction function = Randomly.fromList(functions);
+        VoltDBExpression where = generateSubqueryWhere(alias, depth);
+        List<VoltDBExpression> args = List.of();
+        if (function != VoltDBAggregateFunction.COUNT) {
+            inAggregate = true;
+            try {
+                VoltDBExpression arg = inSubquery(alias, false, () -> generateExpression(kind, depth + 1));
+                if (avoidKnownBugs && arg instanceof VoltDBColumnReference) {
+                    arg = kind == Kind.STRING
+                            ? new VoltDBBinaryOperation(arg, new VoltDBConstant("''"), VoltDBBinaryOperator.CONCAT)
+                            : new VoltDBBinaryOperation(arg, new VoltDBConstant("0"), VoltDBBinaryOperator.ADD);
+                }
+                args = List.of(arg);
+            } finally {
+                inAggregate = false;
+            }
+        }
+        return VoltDBSubquery.scalar(table.getName(), alias, new VoltDBAggregate(args, function), where);
+    }
+
+    public List<VoltDBColumn> getColumns() {
+        return columns;
     }
 
     // ENG-30510: VoltDB turns a RIGHT JOIN into a LEFT JOIN and can then use an ON condition on the preserved table
@@ -1112,10 +1338,15 @@ public final class VoltDBExpressionGenerator
     public String generateUnoptimizedQueryString(VoltDBSelect select, VoltDBExpression whereCondition) {
         // The predicate moves from WHERE into the projection, where the planner cannot use it to filter. CASE counts
         // a row only when the predicate is TRUE, as WHERE does. COALESCE turns the SUM of no rows (NULL) into 0.
-        select.setFetchColumns(List.of(new VoltDBConstant(
-                "CASE WHEN " + VoltDBToStringVisitor.asString(whereCondition) + " THEN 1 ELSE 0 END AS c")));
+        String predicate = VoltDBToStringVisitor.asString(whereCondition);
+        select.setFetchColumns(List.of(new VoltDBConstant("CASE WHEN " + predicate + " THEN 1 ELSE 0 END AS c")));
         select.setWhereClause(null);
         select.setOrderByClauses(List.of());
+        if (predicate.contains("(SELECT ")) {
+            // VoltDB rejects the SUM of an expression with a subquery, even through the derived table ("SQL Aggregate
+            // function calls with subquery expression arguments are not allowed"); NoREC adds up the rows' values
+            return select.asString();
+        }
         return "SELECT COALESCE(SUM(c), 0) FROM (" + select.asString() + ") AS res";
     }
 
