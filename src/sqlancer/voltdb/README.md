@@ -526,7 +526,7 @@ and WINDOW (its WHERE clause) may hold subqueries:
 
 The WHERE condition q references the outer query's columns (a correlated subquery), and so does the output e while
 `--avoid-known-bugs` is false (ENG-30597 below). A
-subquery can hold another, two deep. Each reads one table under its own alias (`S0`, `S1`, ...), which may be the outer
+subquery can hold another, two deep (EXISTS only while `--avoid-known-bugs` is true: ENG-30600). Each reads one table under its own alias (`S0`, `S1`, ...), which may be the outer
 query's table too. PQS, PARAMS, VIEWS and LIMIT generate no subqueries, and a generator with subqueries off makes the
 same random choices as before milestone 14.
 
@@ -790,6 +790,13 @@ The bugs below were found in milestone 14, by subqueries and the SUBQUERY oracle
 | ENG-30597 | With GROUP BY and an aggregate, an ALL or IN subquery whose output is a column of the outer query fails: `<> ALL` in the EE ("invalid column type 'INVALID'", or a garbage type such as 'UNKNOWN[-47]'), IN in the planner (IndexOutOfBoundsException in `rewriteInSubqueryAsExists`). Found by TLP DISTINCT. | The output of an IN, ANY or ALL subquery reads only the subquery's own columns. |
 | ENG-16927 (comment) | An old bug, open since 2019: any subquery in the string argument of SUBSTRING or TRIM crashes the SQL parser (NullPointerException in `QueryExpression.getColumns`). Other functions of a subquery work. Found by TLP AGGREGATE. | SUBSTRING's string argument has no subquery (and TRIM is already written `LTRIM(RTRIM(x))`). |
 | ENG-30497 (comment) | The milestone 2 bug, through subqueries: NOT IN, `<> ALL` and a correlated NOT EXISTS over an outer join's inner table turn the join into an inner join, though each can be TRUE for the null-extended row. `oa LEFT JOIN ob ... WHERE NOT EXISTS (SELECT 1 FROM ob AS s WHERE s.x = ob.x)` loses the unmatched rows. Found by TLP WHERE. Wrong result. | No subquery predicates with an outer join. |
+
+The bugs below were found by milestone 14's oracles in milestone 15's lab runs.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30599 | A window's `ORDER BY ... DESC` is applied ascending when an equality on its PARTITION BY column makes the planner use an index on (partition column, order column): `RANK() OVER (PARTITION BY a ORDER BY b DESC) ... WHERE a = 1` ranks the smallest b first. The plan is a forward range scan with no sort; `a >= 1` gets a reverse scan and is right. Found by WINDOW. Wrong result. | A window with a PARTITION BY orders ascending. |
+| ENG-30600 | An IN or `= ANY` subquery inside another subquery, whose left operand is a column of the outermost query, holds for every row: `A WHERE EXISTS (SELECT 1 FROM B AS S1 WHERE A.k IN (SELECT S2.k FROM B AS S2))` returns all of A, NULLs included. NOT IN and the same written with EXISTS are right. Found by SUBQUERY. Wrong result. | A subquery inside a subquery is EXISTS. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.

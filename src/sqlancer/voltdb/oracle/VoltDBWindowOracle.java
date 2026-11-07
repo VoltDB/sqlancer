@@ -77,8 +77,12 @@ public class VoltDBWindowOracle implements TestOracle<VoltDBGlobalState> {
         List<VoltDBExpression> partitionBy = refs(atMost(Randomly.subset(partitionable), 2));
         List<VoltDBExpression> orderBy = refs(!orderable.isEmpty() && (function.needsOrderBy() || Randomly.getBoolean())
                 ? atMost(Randomly.nonEmptySubset(orderable), 3) : List.of());
+        // ENG-30599: with a PARTITION BY, an equality on the partitioning column can make VoltDB take an index's
+        // ascending order for the window's ORDER BY ... DESC; unless --avoid-known-bugs is false, such a window
+        // orders ascending
+        boolean ascendingOnly = !partitionBy.isEmpty() && state.getDbmsSpecificOptions().avoidKnownBugs;
         List<Boolean> descending = new ArrayList<>();
-        orderBy.forEach(o -> descending.add(Randomly.getBoolean()));
+        orderBy.forEach(o -> descending.add(!ascendingOnly && Randomly.getBoolean()));
         VoltDBExpression argument = null;
         switch (function) {
         case COUNT:

@@ -942,8 +942,10 @@ public final class VoltDBExpressionGenerator
 
     // EXISTS, IN, or a comparison with ANY or ALL. VoltDB's parser rejects IN inside an operand of a comparison or IN,
     // as for IN lists, and ANY and ALL with it, so there it is EXISTS.
+    // ENG-30600: an IN or = ANY subquery inside another subquery, whose left operand is a column of the outermost
+    // query, holds for every row; unless --avoid-known-bugs is false, a subquery inside a subquery is EXISTS.
     private VoltDBExpression generateSubqueryPredicate(int depth) {
-        if (comparandNesting > 0 || Randomly.getBoolean()) {
+        if (comparandNesting > 0 || subqueryNesting > 0 && avoidKnownBugs || Randomly.getBoolean()) {
             VoltDBTable table = Randomly.fromList(subqueryTables);
             VoltDBTable alias = aliasOf(table);
             return VoltDBSubquery.exists(table.getName(), alias, generateSubqueryWhere(alias, depth));
