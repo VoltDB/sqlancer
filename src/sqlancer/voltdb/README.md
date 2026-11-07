@@ -4,13 +4,14 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 12.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 13.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
 VIEWS oracle checks. Since milestone 11 expressions also use CASE, COALESCE, MOD, FLOOR, CEILING, CHAR_LENGTH,
 SUBSTRING, UPPER, LOWER and TRIM, and the LIMIT oracle checks LIMIT and OFFSET. Since milestone 12 the run script
-can kill and rejoin nodes while SQLancer runs (`--kill-interval`), which the nightly job's 3-node run does.
+can kill and rejoin nodes while SQLancer runs (`--kill-interval`), which the nightly job's 3-node run does. Since
+milestone 13 the nightly job also runs a third cluster shape: 3 nodes with k=2 and 2 sites per host.
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -137,14 +138,21 @@ system test (`matrix-systemtest/master`, on the nights the rotation in `internal
 
 The job fetches this repository at the commit in its `SQLANCER_REF` parameter. That commit is pinned in the Jenkinsfile,
 so a change here reaches the nightly run only when the Jenkinsfile is changed to name it. It then builds SQLancer with
-the kit's runtime JDK and makes two runs, one after the other, every node on the agent:
+the kit's runtime JDK and makes three runs, one after the other, every node on the agent:
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
 | `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all nine (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT) | 45 minutes |
 | `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
+| `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
 
-Both runs use `--use-reducer`. The first run's seed is the UTC time as `yyyymmddHHMM`, and the second's is one more.
+The shapes differ in what the planner and the execution engine do. With one node and 8 sites, a multi-partition query
+gathers 8 partitions' results in one process. With 3 nodes, k=1, the partitions' leaders are spread over the nodes and
+each has one replica, and node failures move them. With k=2 and 2 sites per host, every node holds every partition, so
+there are only 2 partitions and every write is replicated twice. The whole job takes about 2 hours 20 minutes.
+
+Every run uses `--use-reducer`. The first run's seed is the UTC time as `yyyymmddHHMM`, and each next run's is one
+more.
 `--avoid-known-bugs` stays on, so a failure is a new bug, or a known one in a new form.
 
 Each run is one row in the triagedb, with the seed in its run arguments. A failing row's reason is the oracle's account
@@ -156,8 +164,8 @@ To repeat a failure on your machine, take the seed and oracles from the bundle's
 them against the same build. The reproduction in `reproductions/` is usually quicker: run its statements on an empty
 server.
 
-The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor[:kill]`, where kill is the seconds
-between node failures, default `3:1:300 1:0`), `DURATION` (seconds
+The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor[:kill[:sites]]`, where kill is the
+seconds between node failures and sites the sites per host, default `3:1:300 1:0 3:2:0:2`), `DURATION` (seconds
 per run, default 2700), `ORACLES`, `SEED`, `EXTRA_ARGS` (provider options) and `SQLANCER_REF`. A run of the job alone
 needs a kit: give `releasedir`, for example `releases/one-offs/16.1.0-SNAPSHOT-master/<kit build>`.
 
