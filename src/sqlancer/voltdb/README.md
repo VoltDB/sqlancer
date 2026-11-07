@@ -64,7 +64,7 @@ voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 -
 | `--seed N` | the current time | The random seed. It is in the manifest either way, so any run can be repeated. |
 | `--threads N` | 4 | SQLancer threads. |
 | `--queries N` | 100 | Oracle checks per generated database. |
-| `--port-base N` | 52000 | The cluster's first port. Node *i* uses the 6 ports from N + 10*i (client, admin, internal, zookeeper, replication, metrics). The script refuses to start if any is in use, and it never touches other servers. |
+| `--port-base N` | 30000 | The cluster's first port. Node *i* uses the 6 ports from N + 10*i (client, admin, internal, zookeeper, replication, metrics). The script refuses to start if any is in use, and it never touches other servers. The default is below the ephemeral ports Linux and macOS give outgoing connections, one of which can take a killed node's port before it restarts. |
 | `--results DIR` | `./sqlancer-results` | Where the run's directory is created. |
 | `--use-reducer` | off | Reduce each failure before saving it (see [Reducing a failure](#reducing-a-failure)). |
 | `--kill-interval SECS` | 0 (never) | Every SECS seconds, kill a node other than node 0 with `kill -9`, restart it and wait until it has rejoined (see [Node failures](#node-failures)). Needs k-safety 1 or more. |
@@ -105,7 +105,10 @@ checking query results through the failures:
 3. It restarts the node with the same `voltdb start` command, which rejoins it to the running cluster: it gets its
    partitions' data back from the replicas, while the cluster keeps working.
 4. It waits until the rejoin completes ("Server completed initialization" in the restart's output), up to 600 seconds,
-   and logs both events to `chaos.log`. A rejoin that does not complete fails the run.
+   and logs both events to `chaos.log`. A rejoin that does not complete fails the run. A restart that exits because a
+   port is taken ("Address already in use") is tried again, up to 5 times: an outgoing connection elsewhere on the
+   machine can take a port in the ephemeral range while the node is down, which is why `--port-base` defaults below
+   it.
 
 When SQLancer stops, the script lets the current rejoin finish, so the run ends with every node up, and the summary
 counts the kills and rejoins. A local rejoin takes about 10 seconds.
