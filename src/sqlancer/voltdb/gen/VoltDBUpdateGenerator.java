@@ -14,6 +14,10 @@ import sqlancer.voltdb.VoltDBSchema.VoltDBColumn;
 import sqlancer.voltdb.VoltDBSchema.VoltDBDataType;
 import sqlancer.voltdb.VoltDBSchema.VoltDBTable;
 import sqlancer.voltdb.VoltDBToStringVisitor;
+import sqlancer.voltdb.ast.VoltDBCase;
+import sqlancer.voltdb.ast.VoltDBExpression;
+import sqlancer.voltdb.ast.VoltDBFunction;
+import sqlancer.voltdb.ast.VoltDBFunction.VoltDBFunctionName;
 import sqlancer.voltdb.gen.VoltDBExpressionGenerator.Kind;
 
 /**
@@ -54,7 +58,15 @@ public final class VoltDBUpdateGenerator {
                 // column is set to a date string
                 value = VoltDBConstantGenerator.generate(r, c.getType(), c.isNullable());
             } else {
-                value = VoltDBToStringVisitor.asString(gen.generateExpression(kind));
+                VoltDBExpression expr = gen.generateExpression(kind);
+                // ENG-30589: setting a VARCHAR column to a CASE or COALESCE fails to compile ("Asking for fixed size
+                // for non-fixed or unknown type:varchar"); inside another function it works
+                while (kind == Kind.STRING && globalState.getDbmsSpecificOptions().avoidKnownBugs
+                        && (expr instanceof VoltDBCase || expr instanceof VoltDBFunction
+                                && ((VoltDBFunction) expr).getFunc() == VoltDBFunctionName.COALESCE)) {
+                    expr = gen.generateExpression(kind);
+                }
+                value = VoltDBToStringVisitor.asString(expr);
             }
             assignments.add(c.getName() + " = " + value);
         }

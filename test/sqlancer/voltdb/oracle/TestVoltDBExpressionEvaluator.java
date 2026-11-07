@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import sqlancer.voltdb.ast.VoltDBBetweenOperation;
 import sqlancer.voltdb.ast.VoltDBBinaryOperation;
 import sqlancer.voltdb.ast.VoltDBBinaryOperation.VoltDBBinaryOperator;
+import sqlancer.voltdb.ast.VoltDBCase;
 import sqlancer.voltdb.ast.VoltDBConstant;
 import sqlancer.voltdb.ast.VoltDBExpression;
 import sqlancer.voltdb.ast.VoltDBFunction;
@@ -238,4 +239,61 @@ public class TestVoltDBExpressionEvaluator {
                 new Binary(new byte[] { 1 })));
     }
 
+    private static VoltDBExpression f(VoltDBFunctionName name, VoltDBExpression... args) {
+        return new VoltDBFunction(List.of(args), name);
+    }
+
+    @Test
+    public void testNumericFunctions() {
+        assertEquals(-7L, eval(f(VoltDBFunctionName.FLOOR, c("(-7)"))));
+        assertEquals(dec("-8"), eval(f(VoltDBFunctionName.FLOOR, c("(-7.5)"))));
+        assertEquals(dec("-7"), eval(f(VoltDBFunctionName.CEILING, c("(-7.5)"))));
+        assertEquals(-1.0, eval(f(VoltDBFunctionName.FLOOR, c("(-0.5E0)"))));
+        assertEquals(-0.0, eval(f(VoltDBFunctionName.CEILING, c("(-0.5E0)"))));
+        // MOD takes the dividend's sign
+        assertEquals(-1L, eval(f(VoltDBFunctionName.MOD, c("(-7)"), c("3"))));
+        assertEquals(1L, eval(f(VoltDBFunctionName.MOD, c("7"), c("(-3)"))));
+        assertNull(eval(f(VoltDBFunctionName.MOD, NULL_INT, c("3"))));
+        assertThrows(Unpredictable.class, () -> eval(f(VoltDBFunctionName.MOD, c("7"), c("0"))));
+        assertEquals(5L, eval(f(VoltDBFunctionName.CHAR_LENGTH, c("'héllo'"))));
+    }
+
+    @Test
+    public void testStringFunctions() {
+        VoltDBExpression hello = c("'héllo'");
+        assertEquals("éllo", eval(f(VoltDBFunctionName.SUBSTRING, hello, c("2"))));
+        assertEquals("él", eval(f(VoltDBFunctionName.SUBSTRING, hello, c("2"), c("2"))));
+        assertEquals("h", eval(f(VoltDBFunctionName.SUBSTRING, hello, c("0"), c("2"))));
+        assertEquals("h", eval(f(VoltDBFunctionName.SUBSTRING, hello, c("(-1)"), c("3"))));
+        assertEquals("", eval(f(VoltDBFunctionName.SUBSTRING, hello, c("(-5)"), c("6"))));
+        assertEquals("", eval(f(VoltDBFunctionName.SUBSTRING, hello, c("6"))));
+        assertEquals("héllo", eval(f(VoltDBFunctionName.SUBSTRING, hello, c("0"))));
+        assertEquals("ABC", eval(f(VoltDBFunctionName.UPPER, c("'aBc'"))));
+        assertThrows(Unpredictable.class, () -> eval(f(VoltDBFunctionName.UPPER, hello)));
+        assertEquals("aBc", eval(f(VoltDBFunctionName.TRIM, c("' aBc '"))));
+        assertEquals("aBc ", eval(f(VoltDBFunctionName.LTRIM, c("' aBc '"))));
+        assertEquals(" aBc", eval(f(VoltDBFunctionName.RTRIM, c("' aBc '"))));
+        assertEquals("", eval(f(VoltDBFunctionName.TRIM, c("'   '"))));
+        // spaces only
+        assertEquals("\ta\t", eval(f(VoltDBFunctionName.TRIM, c("'\ta\t'"))));
+    }
+
+    @Test
+    public void testCaseAndCoalesce() {
+        VoltDBExpression yes = c("(1 = 1)");
+        VoltDBExpression no = c("(1 = 0)");
+        // an INTEGER result of a CASE with a DECIMAL branch is a DECIMAL; with a FLOAT branch, a FLOAT
+        assertEquals(dec("1"), eval(new VoltDBCase(List.of(yes), List.of(c("1")), c("2.5"))));
+        assertEquals(1.0, eval(new VoltDBCase(List.of(yes), List.of(c("1")), c("2.5E0"))));
+        assertEquals(2L, eval(new VoltDBCase(List.of(no, NULL_BOOL), List.of(c("1"), c("3")), c("2"))));
+        assertNull(eval(new VoltDBCase(List.of(no), List.of(c("1")), null)));
+        assertEquals(dec("7"), eval(f(VoltDBFunctionName.COALESCE, NULL_INT, c("7"), c("1.5"))));
+        assertEquals("z", eval(f(VoltDBFunctionName.COALESCE, c("CAST(NULL AS VARCHAR)"), c("'z'"))));
+        // an error in a branch not taken: VoltDB skips it at run time but not when it folds the CASE
+        assertThrows(Unpredictable.class, () -> eval(
+                new VoltDBCase(List.of(yes), List.of(c("1")), op(c("1"), VoltDBBinaryOperator.DIVIDE, c("0")))));
+        // integer division of a DECIMAL CASE keeps a fraction
+        assertEquals(dec("3.5"),
+                eval(op(new VoltDBCase(List.of(yes), List.of(c("7")), c("1.0")), VoltDBBinaryOperator.DIVIDE, c("2"))));
+    }
 }

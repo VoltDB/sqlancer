@@ -9,12 +9,16 @@ import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Pattern;
 
+import sqlancer.voltdb.VoltDBSchema.VoltDBDataType;
 import sqlancer.voltdb.ast.VoltDBBetweenOperation;
 import sqlancer.voltdb.ast.VoltDBBinaryOperation;
 import sqlancer.voltdb.ast.VoltDBBinaryOperation.VoltDBBinaryOperator;
+import sqlancer.voltdb.ast.VoltDBCase;
 import sqlancer.voltdb.ast.VoltDBColumnReference;
 import sqlancer.voltdb.ast.VoltDBConstant;
 import sqlancer.voltdb.ast.VoltDBExpression;
@@ -44,6 +48,11 @@ import sqlancer.voltdb.ast.VoltDBUnaryPrefixOperation.VoltDBUnaryPrefixOperator;
  * <li>Comparisons, AND, OR, NOT, BETWEEN, IN and LIKE follow SQL's three-valued logic. LIKE is case-sensitive, '%'
  * matches any characters and '_' one character, and nothing escapes them.</li>
  * <li>A DATE compares with a TIMESTAMP as midnight of that day (ENG-30545 is VoltDB doing otherwise).</li>
+ * <li>CASE and COALESCE take the widest type of their results: integers and DECIMAL give DECIMAL, and any FLOAT gives
+ * FLOAT. FLOOR, CEILING and ABS keep their argument's type; MOD (of integers only) and CHAR_LENGTH are integers.</li>
+ * <li>Strings are counted in characters (code points). SUBSTRING(s, start, length) is the characters from position
+ * start to start + length - 1, counting from 1, and SUBSTRING(s, start) runs to the end; either can be empty, never
+ * NULL. TRIM, LTRIM and RTRIM remove spaces only.</li>
  * </ul>
  *
  * <p>
@@ -55,6 +64,9 @@ import sqlancer.voltdb.ast.VoltDBUnaryPrefixOperation.VoltDBUnaryPrefixOperator;
  * <li>A DECIMAL combined or compared with a FLOAT, which converts the DECIMAL to a double the way VoltDB's EE does, and
  * an integer of magnitude 2^53 or more compared with a FLOAT.</li>
  * <li>Ordered comparisons of BOOLEAN values, which VoltDB gets wrong (ENG-30493).</li>
+ * <li>An error in a CASE or COALESCE branch that is not taken: VoltDB skips such a branch at run time, but fails on it
+ * when the planner folds it.</li>
+ * <li>UPPER and LOWER of a string with characters beyond ASCII, which VoltDB leaves as they are.</li>
  * </ul>
  */
 public final class VoltDBExpressionEvaluator {
@@ -260,15 +272,216 @@ public final class VoltDBExpressionEvaluator {
             return op.isNegated() ? not(in) : in;
         }
         if (expr instanceof VoltDBFunction) {
+            return function((VoltDBFunction) expr);
+        }
+        if (expr instanceof VoltDBCase) {
+            VoltDBCase c = (VoltDBCase) expr;
+            // every condition and result is evaluated, for its errors (see the class comment)
+            Object[] conditions = c.getConditions().stream().map(this::evaluate).toArray();
+            Object[] results = c.getResults().stream().map(this::evaluate).toArray();
+            Object elseResult = c.getElseResult() == null ? null : evaluate(c.getElseResult());
+            Class<?> type = numericType(expr);
+            for (int i = 0; i < conditions.length; i++) {
+                if (Boolean.TRUE.equals(conditions[i])) {
+                    return toNumericType(results[i], type);
+                }
+            }
+            return toNumericType(elseResult, type);
+        }
+        throw new AssertionError(expr.getClass());
+    }
+
+    private Object function(VoltDBFunction f) {
+        List<VoltDBExpression> argExprs = f.getArgs();
+        Object[] args = argExprs.stream().map(this::evaluate).toArray();
+        switch (f.getFunc()) {
+        case ABS:
+            return abs(args[0]);
+        case FLOOR:
+            return round(args[0], RoundingMode.FLOOR);
+        case CEILING:
+            return round(args[0], RoundingMode.CEILING);
+        case MOD:
+            if (isZero(args[1])) {
+                throw new Unpredictable("division by zero");
+            }
+            return args[0] == null || args[1] == null ? null : (Long) args[0] % (Long) args[1];
+        case CHAR_LENGTH:
+            return args[0] == null ? null : (long) ((String) args[0]).codePointCount(0, ((String) args[0]).length());
+        case COALESCE:
+            Class<?> type = numericType(f);
+            for (Object arg : args) {
+                if (arg != null) {
+                    return toNumericType(arg, type);
+                }
+            }
+            return null;
+        case SUBSTRING:
+            if (args[0] == null || args[1] == null || args.length == 3 && args[2] == null) {
+                return null;
+            }
+            return substring((String) args[0], (Long) args[1], args.length == 3 ? (Long) args[2] : null);
+        case UPPER:
+        case LOWER:
+            return args[0] == null ? null
+                    : asciiCase((String) args[0], f.getFunc() == VoltDBFunction.VoltDBFunctionName.UPPER);
+        case TRIM:
+            return args[0] == null ? null : trimSpaces((String) args[0], true, true);
+        case LTRIM:
+            return args[0] == null ? null : trimSpaces((String) args[0], true, false);
+        case RTRIM:
+            return args[0] == null ? null : trimSpaces((String) args[0], false, true);
+        default:
+            throw new AssertionError(f.getFunc());
+        }
+    }
+
+    private static Object round(Object v, RoundingMode mode) {
+        if (v == null || v instanceof Long) {
+            return v;
+        }
+        if (v instanceof Double) {
+            return mode == RoundingMode.FLOOR ? Math.floor((Double) v) : Math.ceil((Double) v);
+        }
+        return ((BigDecimal) v).setScale(0, mode).setScale(DECIMAL_SCALE);
+    }
+
+    // SQL's SUBSTRING on characters: positions start to start + length - 1, counting from 1, within the string
+    static String substring(String s, long start, Long length) {
+        if (length != null && length < 0) {
+            throw new Unpredictable("negative SUBSTRING length");
+        }
+        int n = s.codePointCount(0, s.length());
+        long from = Math.max(start, 1);
+        long to = length == null ? n + 1L : Math.min(start + length, n + 1L); // exclusive
+        if (from >= to || from > n) {
+            return "";
+        }
+        int begin = s.offsetByCodePoints(0, (int) from - 1);
+        int end = s.offsetByCodePoints(0, (int) to - 1);
+        return s.substring(begin, end);
+    }
+
+    private static String asciiCase(String s, boolean upper) {
+        if (s.chars().anyMatch(c -> c > 127)) {
+            throw new Unpredictable("UPPER or LOWER beyond ASCII");
+        }
+        return upper ? s.toUpperCase(Locale.ROOT) : s.toLowerCase(Locale.ROOT);
+    }
+
+    private static String trimSpaces(String s, boolean leading, boolean trailing) {
+        int begin = 0;
+        int end = s.length();
+        while (leading && begin < end && s.charAt(begin) == ' ') {
+            begin++;
+        }
+        while (trailing && end > begin && s.charAt(end - 1) == ' ') {
+            end--;
+        }
+        return s.substring(begin, end);
+    }
+
+    // The numeric type VoltDB gives an expression: Long (any integer type), BigDecimal or Double, or null when it is
+    // not numeric. CASE and COALESCE take the widest of their results.
+    static Class<?> numericType(VoltDBExpression expr) {
+        if (expr instanceof VoltDBConstant) {
+            String text = expr.toString();
+            if (text.startsWith("CAST(NULL AS ")) {
+                return typeClass(VoltDBDataType.valueOf(text.substring("CAST(NULL AS ".length(), text.length() - 1)));
+            }
+            Object value = parseConstant(text);
+            return value instanceof Long || value instanceof BigDecimal || value instanceof Double ? value.getClass()
+                    : null;
+        }
+        if (expr instanceof VoltDBColumnReference) {
+            return typeClass(((VoltDBColumnReference) expr).getColumn().getType().getType());
+        }
+        if (expr instanceof VoltDBBinaryOperation) {
+            VoltDBBinaryOperation op = (VoltDBBinaryOperation) expr;
+            switch (binaryOperator(op.getOperatorRepresentation())) {
+            case ADD:
+            case SUBTRACT:
+            case MULTIPLY:
+            case DIVIDE:
+                return wider(numericType(op.getLeft()), numericType(op.getRight()));
+            default:
+                return null;
+            }
+        }
+        if (expr instanceof VoltDBUnaryPrefixOperation) {
+            VoltDBUnaryPrefixOperation op = (VoltDBUnaryPrefixOperation) expr;
+            return op.getOperatorRepresentation().equals(VoltDBUnaryPrefixOperator.NOT.getTextRepresentation()) ? null
+                    : numericType(op.getExpr());
+        }
+        if (expr instanceof VoltDBFunction) {
             VoltDBFunction f = (VoltDBFunction) expr;
             switch (f.getFunc()) {
             case ABS:
-                return abs(evaluate(f.getArgs().get(0)));
+            case FLOOR:
+            case CEILING:
+                return numericType(f.getArgs().get(0));
+            case MOD:
+            case CHAR_LENGTH:
+                return Long.class;
+            case COALESCE:
+                Class<?> type = null;
+                for (VoltDBExpression arg : f.getArgs()) {
+                    type = wider(type, numericType(arg));
+                }
+                return type;
             default:
-                throw new AssertionError(f.getFunc());
+                return null;
             }
         }
-        throw new AssertionError(expr.getClass());
+        if (expr instanceof VoltDBCase) {
+            VoltDBCase c = (VoltDBCase) expr;
+            Class<?> type = c.getElseResult() == null ? null : numericType(c.getElseResult());
+            for (VoltDBExpression result : c.getResults()) {
+                type = wider(type, numericType(result));
+            }
+            return type;
+        }
+        return null;
+    }
+
+    private static Class<?> typeClass(VoltDBDataType type) {
+        switch (type) {
+        case TINYINT:
+        case SMALLINT:
+        case INTEGER:
+        case BIGINT:
+            return Long.class;
+        case DECIMAL:
+            return BigDecimal.class;
+        case FLOAT:
+            return Double.class;
+        default:
+            return null;
+        }
+    }
+
+    private static Class<?> wider(Class<?> a, Class<?> b) {
+        if (a == null || b == null) {
+            return a == null ? b : a;
+        }
+        if (a == Double.class || b == Double.class) {
+            return Double.class;
+        }
+        return a == BigDecimal.class || b == BigDecimal.class ? BigDecimal.class : Long.class;
+    }
+
+    // a CASE or COALESCE result as the expression's type
+    private static Object toNumericType(Object v, Class<?> type) {
+        if (v == null || type == null || v.getClass() == type) {
+            return v;
+        }
+        if (type == BigDecimal.class && v instanceof Long) {
+            return decimal(v).setScale(DECIMAL_SCALE);
+        }
+        if (type == Double.class && v instanceof Number) {
+            return toDouble(v);
+        }
+        throw new AssertionError(v.getClass() + " as " + type);
     }
 
     // ENG-30549: the planner folds a comparison of two string constants ignoring trailing spaces (PAD SPACE), while the
@@ -309,6 +522,12 @@ public final class VoltDBExpressionEvaluator {
         }
         if (expr instanceof VoltDBFunction) {
             return ((VoltDBFunction) expr).getArgs().stream().allMatch(VoltDBExpressionEvaluator::isConstant);
+        }
+        if (expr instanceof VoltDBCase) {
+            VoltDBCase c = (VoltDBCase) expr;
+            return c.getConditions().stream().allMatch(VoltDBExpressionEvaluator::isConstant)
+                    && c.getResults().stream().allMatch(VoltDBExpressionEvaluator::isConstant)
+                    && (c.getElseResult() == null || isConstant(c.getElseResult()));
         }
         return false;
     }

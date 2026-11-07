@@ -6,6 +6,7 @@ import sqlancer.common.oracle.TestOracle;
 import sqlancer.common.query.ExpectedErrors;
 import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 import sqlancer.voltdb.gen.VoltDBExpressionGenerator;
+import sqlancer.voltdb.oracle.VoltDBLimitOracle;
 import sqlancer.voltdb.oracle.VoltDBParameterOracle;
 import sqlancer.voltdb.oracle.VoltDBPivotedQuerySynthesisOracle;
 import sqlancer.voltdb.oracle.VoltDBSmokeOracle;
@@ -114,6 +115,19 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
             // a view whose CREATE VIEW failed with an expected error
             errors.add("object not found");
             return new VoltDBViewOracle(globalState, errors);
+        }
+    },
+
+    /**
+     * Checks that LIMIT and OFFSET select the right rows of a query ordered by all its outputs.
+     */
+    LIMIT {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            ExpectedErrors errors = expressionErrors();
+            // an output that is constant in a way the oracle does not see, such as (CASE WHEN ('a') IS NULL ...)
+            errors.add("ORDER BY cannot contain constant values");
+            return new VoltDBLimitOracle(globalState, errors);
         }
     };
 

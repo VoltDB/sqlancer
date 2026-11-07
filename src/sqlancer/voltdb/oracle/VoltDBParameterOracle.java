@@ -28,6 +28,7 @@ import sqlancer.voltdb.ast.VoltDBAggregate;
 import sqlancer.voltdb.ast.VoltDBAlias;
 import sqlancer.voltdb.ast.VoltDBBetweenOperation;
 import sqlancer.voltdb.ast.VoltDBBinaryOperation;
+import sqlancer.voltdb.ast.VoltDBCase;
 import sqlancer.voltdb.ast.VoltDBColumnReference;
 import sqlancer.voltdb.ast.VoltDBConstant;
 import sqlancer.voltdb.ast.VoltDBExpression;
@@ -222,8 +223,15 @@ public class VoltDBParameterOracle implements TestOracle<VoltDBGlobalState> {
             } else if (expr instanceof VoltDBAlias) {
                 visit(((VoltDBAlias) expr).getExpr(), parent, sibling);
             } else if (expr instanceof VoltDBFunction) {
-                // ABS: a bare parameter in it is typed FLOAT, so it is cast
+                // a bare parameter in a function is typed FLOAT (ABS) or not at all, so it is cast
                 ((VoltDBFunction) expr).getArgs().forEach(arg -> visit(arg, expr, null));
+            } else if (expr instanceof VoltDBCase) {
+                VoltDBCase c = (VoltDBCase) expr;
+                c.getConditions().forEach(e -> visit(e, expr, null));
+                c.getResults().forEach(e -> visit(e, expr, null));
+                if (c.getElseResult() != null) {
+                    visit(c.getElseResult(), expr, null);
+                }
             } else if (expr instanceof VoltDBAggregate) {
                 // ENG-30572: in HAVING, two aggregates that differ only in their parameters take the first one's
                 // value, so unless --avoid-known-bugs is false, constants in HAVING's aggregates stay literals

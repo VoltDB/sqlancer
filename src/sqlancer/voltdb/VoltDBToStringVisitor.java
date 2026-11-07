@@ -3,6 +3,7 @@ package sqlancer.voltdb;
 import sqlancer.common.ast.newast.NewFunctionNode;
 import sqlancer.common.ast.newast.NewToStringVisitor;
 import sqlancer.voltdb.ast.VoltDBAggregate;
+import sqlancer.voltdb.ast.VoltDBCase;
 import sqlancer.voltdb.ast.VoltDBConstant;
 import sqlancer.voltdb.ast.VoltDBExpression;
 import sqlancer.voltdb.ast.VoltDBJoin;
@@ -18,6 +19,8 @@ public class VoltDBToStringVisitor extends NewToStringVisitor<VoltDBExpression> 
             visit((VoltDBSelect) expr);
         } else if (expr instanceof VoltDBJoin) {
             visit((VoltDBJoin) expr);
+        } else if (expr instanceof VoltDBCase) {
+            visit((VoltDBCase) expr);
         } else {
             throw new AssertionError(expr.getClass());
         }
@@ -35,6 +38,21 @@ public class VoltDBToStringVisitor extends NewToStringVisitor<VoltDBExpression> 
             super.visit(funcCall);
         }
         sb.append(")");
+    }
+
+    private void visit(VoltDBCase c) {
+        sb.append("(CASE");
+        for (int i = 0; i < c.getConditions().size(); i++) {
+            sb.append(" WHEN ");
+            visit(c.getConditions().get(i));
+            sb.append(" THEN ");
+            visit(c.getResults().get(i));
+        }
+        if (c.getElseResult() != null) {
+            sb.append(" ELSE ");
+            visit(c.getElseResult());
+        }
+        sb.append(" END)");
     }
 
     private void visit(VoltDBJoin join) {
@@ -71,6 +89,14 @@ public class VoltDBToStringVisitor extends NewToStringVisitor<VoltDBExpression> 
         if (!select.getOrderByClauses().isEmpty()) {
             sb.append(" ORDER BY ");
             visit(select.getOrderByClauses());
+        }
+        if (select.getLimitClause() != null) {
+            sb.append(" LIMIT ");
+            visit(select.getLimitClause());
+        }
+        if (select.getOffsetClause() != null) {
+            sb.append(" OFFSET ");
+            visit(select.getOffsetClause());
         }
     }
 
