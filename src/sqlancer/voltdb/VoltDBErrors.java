@@ -39,7 +39,10 @@ public final class VoltDBErrors {
             "failed, connection lost",
             // a DDL statement that one of the errors above interrupted can still commit after its client was told it
             // failed, so a later CREATE of the same name collides with an object the provider never saw
-            "object name already exists" };
+            "object name already exists",
+            // a call in flight on the connection to a node that was killed (with --servers, the other connections
+            // carry the next calls)
+            "was lost before a response was received" };
 
     private VoltDBErrors() {
     }

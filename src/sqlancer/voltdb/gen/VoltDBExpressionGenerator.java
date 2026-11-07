@@ -967,6 +967,15 @@ public final class VoltDBExpressionGenerator
             // has no subquery
             VoltDBExpression left = avoidKnownBugs ? withoutSubqueries(() -> generateComparand(k, depth))
                     : generateComparand(k, depth);
+            if (k == Kind.STRING && avoidKnownBugs && !referencesColumn(left)) {
+                // ENG-30549: the planner folds a comparison of two string constants ignoring trailing spaces, while
+                // the EE compares exactly; with a constant on both sides, the EXISTS form of the predicate (see
+                // existsRewrite) is folded and the subquery form is not, so the left operand reads a column
+                if (!canGenerateColumnOfType(Kind.STRING)) {
+                    throw new IgnoreMeException();
+                }
+                left = generateColumn(Kind.STRING);
+            }
             VoltDBTable alias = aliasOf(table);
             // ENG-30594: a subquery in the output of an IN or = ANY subquery crashes the planner (NullPointerException
             // on "m_subqueryNode"), so unless --avoid-known-bugs is false the output has none
@@ -1291,11 +1300,16 @@ public final class VoltDBExpressionGenerator
         return generatePredicateWithColumn();
     }
 
+    // whether the expression references a column in scope
+    private boolean referencesColumn(VoltDBExpression expr) {
+        String text = VoltDBToStringVisitor.asString(expr);
+        return columns.stream().anyMatch(c -> text.contains(c.getFullQualifiedName()));
+    }
+
     private VoltDBExpression generatePredicateWithColumn() {
         for (int i = 0; i < 100; i++) {
             VoltDBExpression predicate = generateExpression(Kind.BOOLEAN);
-            String text = VoltDBToStringVisitor.asString(predicate);
-            if (columns.stream().anyMatch(c -> text.contains(c.getFullQualifiedName()))) {
+            if (referencesColumn(predicate)) {
                 return predicate;
             }
         }
