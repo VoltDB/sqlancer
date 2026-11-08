@@ -143,10 +143,14 @@ public class VoltDBSetOperationOracle implements TestOracle<VoltDBGlobalState> {
         String setOperation = nrOperands == 2 ? operands.get(0) + " " + first.sql() + " " + operands.get(1)
                 : "(" + operands.get(0) + " " + first.sql() + " " + operands.get(1) + ") " + second.sql() + " "
                         + operands.get(2);
-        // ENG-30604: inside a derived table, a set operation with an operand pinned to one partition returns the
-        // replicated operands' rows once per partition, so unless --avoid-known-bugs is false one that reads a
-        // partitioned table is not wrapped
-        boolean wrap = Randomly.getBoolean() && !(partitioned && state.getDbmsSpecificOptions().avoidKnownBugs);
+        // Unless --avoid-known-bugs is false, these set operations are not wrapped in a derived table:
+        // - ENG-30604: one with an operand pinned to one partition returns the replicated operands' rows once per
+        // partition, so one that reads a partitioned table;
+        // - ENG-30607: the derived table's VARCHAR column takes the first operand's size when that is 16 characters or
+        // more, and a longer value from another operand fails, so one with a VARCHAR or VARBINARY output.
+        boolean avoid = state.getDbmsSpecificOptions().avoidKnownBugs;
+        boolean strings = classes.stream().anyMatch(c -> c == VoltDBDataType.VARCHAR || c == VoltDBDataType.VARBINARY);
+        boolean wrap = Randomly.getBoolean() && !(avoid && (partitioned || strings));
         String query = wrap ? "SELECT * FROM (" + setOperation + ") AS u" : setOperation;
         lastQuery = query;
         int columns = classes.size();
