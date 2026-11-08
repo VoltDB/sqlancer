@@ -98,6 +98,10 @@ A run FAILs if any of these happens:
 - A server log has a FATAL line.
 - With `--kill-interval`, a killed node does not rejoin within 600 seconds.
 
+The script passes SQLancer `--num-statement-kind-retries 20`: a failed INSERT is retried with new values, up to
+SQLancer's default of 1,000 times, so once a table's key had run out of values (a BOOLEAN or TINYINT primary key, say)
+each of a database's inserts spent 1,000 constraint violations, and SQLancer's "successful statements" fell below 70%.
+
 The cluster's data is deleted after the logs are copied, unless `--keep-cluster` is given. Several runs can share a
 machine if each has its own `--port-base`.
 
