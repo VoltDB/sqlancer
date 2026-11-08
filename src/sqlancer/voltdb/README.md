@@ -523,6 +523,9 @@ refuses a change, the check is skipped: this oracle checks query results, not wh
 A failure has no reproducer: reducing the database's statements would lose the order of the queries and the change.
 The failure message holds the change, the undo and the query.
 
+While nodes fail (`--node-failures`), SCHEMA does nothing unless `--avoid-known-bugs` is false: ENG-30612, an MPI
+deadlock when a node dies during an @UpdateCore, which its slow ALTER TABLE makes likely.
+
 ## The VIEWS oracle
 
 VIEWS (`oracle/VoltDBViewOracle`) checks VoltDB's materialized views, which it keeps up to date as their tables
@@ -919,6 +922,12 @@ The bugs below were found in milestone 17.
 | ENG-30610 | A join with a constant ON condition (`ON 1 = 1`) is not auto-parameterized, and with `WHERE p.c = x'..'` on a VARBINARY partitioning column it runs single-partition on the wrong partition: `SELECT VB.c0 FROM VB JOIN R ON 1 = 1 WHERE VB.c0 = x'03'` returns no row (with `ON TRUE`, or a parameter, it is right). Found by PROCEDURE's PARAMS check on 3 nodes. Wrong result. | No table is partitioned on a VARBINARY column. |
 | ENG-30608 | Intermittent node crash (SIGILL): a site thread recursed without end through `SeqScanExecutor::p_execute`, `ExecutorContext::getCommonTable` and `executeExecutors` while the DERIVED oracle's `WITH RECURSIVE` query ran, beside other threads' catalog updates: twice in three 20-minute 1-node trials with PROCEDURE, never in the lab without it, and not reproducible on demand. | DERIVED's RECURSIVE mode is off. |
 | ENG-30609 | `SELECT COUNT(*) FROM rc`, rc a recursive common table, fails to plan: "TableCountPlanNode cannot be cast to SeqScanPlanNode". Found reducing ENG-30608. | DERIVED selects the common table's column, not `COUNT(*)`. |
+
+The bug below was found in milestone 18.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30612 | A node killed while an ad hoc DDL's @UpdateCore is in flight: a surviving host reclaims the dead host's catalog-update blocker before the interrupted @UpdateCore is resolved on the leaders, the next @UpdateCore queues behind it on five leaders, and the MPI deadlocks; every later DDL is "in progress on host 2" and the node's rejoin times out after 600 s. Found by the nightly run with node failures (lab build #32). Critical. | SCHEMA does nothing while nodes fail. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.

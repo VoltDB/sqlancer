@@ -67,7 +67,10 @@ public class VoltDBSchemaChangeOracle implements TestOracle<VoltDBGlobalState> {
     @Override
     public void check() throws Exception {
         reproducer = null;
-        if (done) {
+        // ENG-30612: a node killed while an @UpdateCore is in flight can wedge the MPI for good (the blocker it held is
+        // reclaimed before its update is resolved), and this oracle's ALTER TABLE rewrites every row, which makes the
+        // update slow and such a kill likely; unless --avoid-known-bugs is false it does nothing while nodes fail
+        if (done || state.getDbmsSpecificOptions().nodeFailures && state.getDbmsSpecificOptions().avoidKnownBugs) {
             throw new IgnoreMeException();
         }
         done = true;
