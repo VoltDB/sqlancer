@@ -287,7 +287,10 @@ log "Cluster ready: $(grep -h -m1 "^Build:" "$cluster/init0.log" 2>/dev/null)"
 
 sqlancer_args=(--num-threads "$threads" --num-tries "$threads" --timeout-seconds "$duration" --num-queries "$queries"
     --random-seed "$seed" --host localhost --port "$(client_port 0)" --username "" --password ""
-    --database-prefix db)
+    --database-prefix db --num-statement-kind-retries 20)
+# A failed INSERT is retried with new values, up to SQLancer's default of 1000 times; once a table's key has run out of
+# values (a BOOLEAN or TINYINT primary key, say), each of a database's inserts spent 1000 constraint violations, and
+# with --num-statement-kind-retries 20 they spend 20
 $use_reducer && sqlancer_args+=(--use-reducer)
 # --- node failures -----------------------------------------------------------------------------------------------
 

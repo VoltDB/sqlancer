@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 15.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 16.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -15,7 +15,9 @@ milestone 13 the nightly job also runs a third cluster shape: 3 nodes with k=2 a
 milestone 14 expressions also hold subqueries (EXISTS, IN, ANY, ALL and scalar subqueries), the SUBQUERY oracle checks
 IN, ANY and ALL against EXISTS, and the WINDOW oracle checks window functions; see
 [Subqueries and window functions](#subqueries-and-window-functions). Since milestone 15 node failures include node 0:
-SQLancer connects to every node.
+SQLancer connects to every node. Since milestone 16 the SETOPS oracle checks UNION, INTERSECT and EXCEPT, and the
+DERIVED oracle checks derived tables and WITH, recursive WITH included; see
+[Set operations, derived tables and WITH](#set-operations-derived-tables-and-with).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -96,6 +98,10 @@ A run FAILs if any of these happens:
 - A server log has a FATAL line.
 - With `--kill-interval`, a killed node does not rejoin within 600 seconds.
 
+The script passes SQLancer `--num-statement-kind-retries 20`: a failed INSERT is retried with new values, up to
+SQLancer's default of 1,000 times, so once a table's key had run out of values (a BOOLEAN or TINYINT primary key, say)
+each of a database's inserts spent 1,000 constraint violations, and SQLancer's "successful statements" fell below 70%.
+
 The cluster's data is deleted after the logs are copied, unless `--keep-cluster` is given. Several runs can share a
 machine if each has its own `--port-base`.
 
@@ -155,7 +161,7 @@ the kit's runtime JDK and makes three runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all eleven (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all thirteen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED) | 45 minutes |
 | `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
 | `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
 
@@ -223,7 +229,7 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | `--username`, `--password` | Empty for a server without security (SQLancer's default is `sqlancer`). |
 | `--host`, `--port` | A server's client port. Defaults: localhost, 21212. |
 | `--database-prefix` | Prefix of each thread's table names. Default `database`; `db` keeps the logs short. |
-| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT`, `SUBQUERY`, `WINDOW` or `SMOKE`; several are comma-separated. |
+| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT`, `SUBQUERY`, `WINDOW`, `SETOPS`, `DERIVED` or `SMOKE`; several are comma-separated. |
 | `--max-num-tables` | Tables per database, 1 to this (default 3). |
 | `--max-num-indexes` | CREATE INDEX statements per database, 0 to this (default 4). |
 | `--max-num-updates` | UPDATE statements per database, 0 to this (default 5). |
@@ -584,6 +590,42 @@ Values are compared as SQL orders them: numbers by value, strings by code point 
 VARBINARY by unsigned bytes, and TIMESTAMPs in time. A failure reports the first row whose value is wrong, or the rows
 that differ from the query without the window function.
 
+## Set operations, derived tables and WITH
+
+### The SETOPS oracle
+
+SETOPS (`oracle/VoltDBSetOperationOracle`) checks UNION, INTERSECT and EXCEPT, each with and without ALL, against the
+same operation done in Java on its operands' rows. Each operand is `SELECT c1, ... FROM t [WHERE p]` over one table,
+and the query is `A op B` or `(A op B) op C`, sometimes inside `SELECT * FROM (...) AS u`. Rows are compared as
+multisets in which NULLs are equal and exact numbers compare by value; UNION, INTERSECT and EXCEPT keep one copy of each
+row, UNION ALL adds the counts, INTERSECT ALL keeps the smaller and EXCEPT ALL the difference.
+
+VoltDB's rules, which the oracle follows:
+
+- The columns at each position must have one type: INTEGER with BIGINT, or TINYINT with SMALLINT, is "Incompatible
+  data types in UNION" (for INTERSECT and EXCEPT too); an integer literal is BIGINT. VARCHAR and VARBINARY of different
+  sizes combine. An operand without a column of a position's type outputs a constant of it, such as
+  `CAST(2 AS TINYINT)`.
+- At most one operand reads a partitioned table: "Statements are too complex in set operation using multiple
+  partitioned tables".
+
+### The DERIVED oracle
+
+DERIVED (`oracle/VoltDBDerivedTableOracle`) has three modes:
+
+- `WRAP`: a query `SELECT f FROM ... WHERE p` returns the rows of `SELECT * FROM (that query) AS d`.
+- `PUSH`: it returns the rows of `SELECT d.f' FROM (SELECT t.c AS A0, ... FROM ...) AS d WHERE p'`, which selects every
+  FROM column under an alias and reads them outside, so that VoltDB pushes p back into the derived table; or the same as
+  `WITH D AS (...) SELECT ...` when the query reads replicated tables only, as VoltDB rejects a common table over a
+  partitioned table in a multi-partition query.
+- `RECURSIVE`: `WITH RECURSIVE RC (V) AS (SELECT t.c FROM t WHERE p UNION ALL SELECT t.c FROM t, RC WHERE t.c = RC.V +
+  1) SELECT V FROM RC`, over an integer column of a replicated table, returns the closure the oracle computes in Java:
+  the start values, and from each value every row whose value is one more. A closure of more than 5,000 rows is not
+  checked.
+
+The JDBC driver runs only statements that start with SELECT as queries (ENG-30603 below), so the connection sends a
+query that starts with WITH or a parenthesis through `{call @AdHoc(?)}`.
+
 ## How the provider maps SQLancer onto VoltDB
 
 - **One schema, many databases.** A VoltDB cluster has a single schema, so each SQLancer database is the set of tables
@@ -799,6 +841,15 @@ The bugs below were found by milestone 14's oracles in milestone 15's lab runs. 
 | ENG-30599 | A window's `ORDER BY ... DESC` is applied ascending when an equality on its PARTITION BY column makes the planner use an index on (partition column, order column): `RANK() OVER (PARTITION BY a ORDER BY b DESC) ... WHERE a = 1` ranks the smallest b first. The plan is a forward range scan with no sort; `a >= 1` gets a reverse scan and is right. Found by WINDOW. Wrong result. | A window with a PARTITION BY orders ascending. |
 | ENG-30601 | `WHERE t.k < c AND t.k = u.j`, with k indexed (unique or not), drops the upper bound when the join equality becomes the unique index lookup (the plan's `uniquely match` has no filter); `t.k = u.j AND t.k < c` keeps it. Found by SUBQUERY, as the EXISTS form of an IN subquery on a primary key. Wrong result. | In the SUBQUERY oracle's EXISTS form, the comparison comes before the subquery's WHERE condition, and the WHERE condition of an IN, ANY or ALL subquery is not correlated (a non-unique index and an equality in that condition did it too: comment on the ticket). Other queries can still meet it. |
 | ENG-30600 | An IN or `= ANY` subquery inside another subquery, whose left operand is a column of the outermost query, holds for every row: `A WHERE EXISTS (SELECT 1 FROM B AS S1 WHERE A.k IN (SELECT S2.k FROM B AS S2))` returns all of A, NULLs included. NOT IN and the same written with EXISTS are right. Found by SUBQUERY. Wrong result. | A subquery inside a subquery is EXISTS. |
+
+The bugs below were found in milestone 16.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30604 | A set operation inside a derived table, with an operand pinned to one partition (`WHERE k = 1` on the partitioning column), returns the replicated operands' rows once per site: `SELECT * FROM (SELECT k FROM SP WHERE k = 1 UNION ALL SELECT k FROM SR) AS u` has 17 rows instead of 3 on 8 sites, and UNION 16 instead of 2. Found by SETOPS. Wrong result. | A set operation that reads a partitioned table is not wrapped in a derived table. |
+| ENG-30605 | String literals at one position of a set operation are padded to the longest: `'a' UNION ALL 'abc'` gives `'a  '`, and `''` against `'a'` gives `' '`. A VARCHAR column on either side is right. Found by SETOPS. Wrong result. | String and VARBINARY constants in set operations have one character or byte. |
+| ENG-30607 | A set operation inside a derived table, `SELECT * FROM (A UNION B) AS u`, fails with "The size 17 of the value '...' exceeds the size of the VARCHAR(16) column" when A's column is VARCHAR(16) or wider and a value from B is longer; the bare set operation, and A of VARCHAR(15) or narrower, are right. Found by SETOPS in lab build #28. Wrong error. | A set operation with a VARCHAR or VARBINARY output is not wrapped in a derived table. |
+| ENG-30603 (JDBC) | The driver takes a statement for a query only if it starts with SELECT: `executeQuery` rejects `WITH ... SELECT` and `(SELECT ...) EXCEPT ...` ("Cannot submit statement in current context"), and `execute` returns their first value as an update count. Filed under ENG-30559 (JDBC). | The connection sends such queries through `{call @AdHoc(?)}`. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.

@@ -6,9 +6,11 @@ import sqlancer.common.oracle.TestOracle;
 import sqlancer.common.query.ExpectedErrors;
 import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 import sqlancer.voltdb.gen.VoltDBExpressionGenerator;
+import sqlancer.voltdb.oracle.VoltDBDerivedTableOracle;
 import sqlancer.voltdb.oracle.VoltDBLimitOracle;
 import sqlancer.voltdb.oracle.VoltDBParameterOracle;
 import sqlancer.voltdb.oracle.VoltDBPivotedQuerySynthesisOracle;
+import sqlancer.voltdb.oracle.VoltDBSetOperationOracle;
 import sqlancer.voltdb.oracle.VoltDBSmokeOracle;
 import sqlancer.voltdb.oracle.VoltDBSubqueryOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPAggregateOracle;
@@ -153,6 +155,29 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBWindowOracle(globalState, expressionErrors());
+        }
+    },
+
+    /**
+     * Checks UNION, INTERSECT and EXCEPT, with and without ALL, against the same operation done in Java on the rows of
+     * their operands.
+     */
+    SETOPS {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBSetOperationOracle(globalState, expressionErrors());
+        }
+    },
+
+    /**
+     * Checks derived tables and WITH: a query against itself wrapped in a derived table, against the same query with
+     * its WHERE clause outside a derived table or common table, and a recursive WITH against its closure computed in
+     * Java.
+     */
+    DERIVED {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBDerivedTableOracle(globalState, expressionErrors());
         }
     };
 
