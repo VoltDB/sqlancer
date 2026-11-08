@@ -61,6 +61,11 @@ public class VoltDBConnection extends SQLConnection {
         return retrying(connection.prepareStatement(sql), PreparedStatement.class);
     }
 
+    // a stored procedure call, {call name(?, ...)}, retried as statements are
+    public CallableStatement prepareCall(String sql) throws SQLException {
+        return retrying(connection.prepareCall(sql), CallableStatement.class);
+    }
+
     @Override
     public synchronized void close() throws SQLException {
         if (!closed) {

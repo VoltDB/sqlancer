@@ -111,6 +111,9 @@ public final class VoltDBExpressionGenerator
     // the FROM list, comma-separated; the joins attach to its last table
     private List<VoltDBTable> fromTables = new ArrayList<>();
     private List<VoltDBJoin> joins = new ArrayList<>();
+    // the partitioned table every other partitioned table in FROM is joined to on their partitioning columns, or null
+    // when FROM reads replicated tables only
+    private VoltDBTable partitionAnchor;
     private boolean hasOuterJoin;
     // whether the FROM clause reads only replicated tables, which VoltDB can combine with UNION ALL
     private boolean replicatedOnly;
@@ -820,6 +823,7 @@ public final class VoltDBExpressionGenerator
             // a partitioned table whose partitioning column cannot be compared with the anchor's is left out
         }
         replicatedOnly = anchor == null;
+        partitionAnchor = anchor;
         if (anchor == null) {
             anchor = fromTables.remove(fromTables.size() - 1);
         }
@@ -1304,6 +1308,12 @@ public final class VoltDBExpressionGenerator
 
     public boolean isReplicatedOnly() {
         return replicatedOnly;
+    }
+
+    // The partitioned table that the other partitioned tables in FROM are joined to on their partitioning columns, so
+    // that an equality on its partitioning column pins the query to one partition; null for replicated tables only.
+    public VoltDBTable getPartitionAnchor() {
+        return partitionAnchor;
     }
 
     // A WHERE predicate always references a column. VoltDB does not support a join filter that depends on none of the

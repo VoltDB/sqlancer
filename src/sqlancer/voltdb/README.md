@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 16.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 17.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -17,7 +17,9 @@ IN, ANY and ALL against EXISTS, and the WINDOW oracle checks window functions; s
 [Subqueries and window functions](#subqueries-and-window-functions). Since milestone 15 node failures include node 0:
 SQLancer connects to every node. Since milestone 16 the SETOPS oracle checks UNION, INTERSECT and EXCEPT, and the
 DERIVED oracle checks derived tables and WITH, recursive WITH included; see
-[Set operations, derived tables and WITH](#set-operations-derived-tables-and-with).
+[Set operations, derived tables and WITH](#set-operations-derived-tables-and-with). Since milestone 17 the PROCEDURE
+oracle checks ad hoc queries against the same queries as stored procedures, single-partition ones included; see
+[The PROCEDURE oracle](#the-procedure-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -161,7 +163,7 @@ the kit's runtime JDK and makes three runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all thirteen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all fourteen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE) | 45 minutes |
 | `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
 | `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
 
@@ -229,7 +231,7 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | `--username`, `--password` | Empty for a server without security (SQLancer's default is `sqlancer`). |
 | `--host`, `--port` | A server's client port. Defaults: localhost, 21212. |
 | `--database-prefix` | Prefix of each thread's table names. Default `database`; `db` keeps the logs short. |
-| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT`, `SUBQUERY`, `WINDOW`, `SETOPS`, `DERIVED` or `SMOKE`; several are comma-separated. |
+| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT`, `SUBQUERY`, `WINDOW`, `SETOPS`, `DERIVED`, `PROCEDURE` or `SMOKE`; several are comma-separated. |
 | `--max-num-tables` | Tables per database, 1 to this (default 3). |
 | `--max-num-indexes` | CREATE INDEX statements per database, 0 to this (default 4). |
 | `--max-num-updates` | UPDATE statements per database, 0 to this (default 5). |
@@ -463,6 +465,35 @@ that folds to a subnormal FLOAT, whose plan then fails to load (ENG-30551) and w
 
 An expected error in either query skips the check; an unexpected one fails it. Rows are compared as TLP compares them.
 A failure reports both queries and the parameters' values and types, and `--use-reducer` works.
+
+## The PROCEDURE oracle
+
+PROCEDURE (`oracle/VoltDBParameterOracle` with `procedure` true) checks ad hoc execution against stored procedures. It
+writes queries as PARAMS does, one with literals and one with some of them parameters, and runs the second as a DDL
+procedure, `CREATE PROCEDURE p AS q`, called through `{call p(?, ...)}` with the literals' values. VoltDB plans a
+procedure's statement when the procedure is created, not when it runs; gives its parameters the types the statement
+implies; and converts the call's values to them. An ad hoc statement does none of these.
+
+When a query reads a partitioned table, half its procedures are single-partition. The query gets `AND t.c = ?` on the
+partitioning column of the table that every other partitioned table in it joins on that column, with a value read from
+the table, and the procedure is `CREATE PROCEDURE p PARTITION ON TABLE t COLUMN c PARAMETER n AS q`. It runs on the one
+partition that holds the value, through the single-partition planner and executor. The query with literals gets
+`t.c = value` and runs on every partition.
+
+VoltDB applies one catalog update (a DDL statement) at a time across the whole cluster. Each one blocks every partition
+and empties the plan caches. With a CREATE and a DROP per check, about two updates a second cut every oracle's rate to
+a third in a 1-node trial. So each check writes up to eight queries and keeps them. Once 24 are kept, about once per
+database, the oracle creates their procedures in one DDL batch, compares each, and drops them in another.
+
+A batch fails as a whole when VoltDB cannot plan one of its statements. A parameter can cause that where its literal
+folds: `CAST(? AS VARBINARY) IS NOT NULL` in a join's WHERE clause is "Join with filters that do not depend on joined
+tables". So each query runs ad hoc with its parameters as it is written, which is a PARAMS check, and one that fails is
+not kept. If the batch still fails, its procedures are created one by one. Procedure names
+are the database prefix, `P` and a number unique within the run. A procedure that a node failure kept from being
+dropped is dropped when its database's name is next used.
+
+A failure reports the procedure, the call and the rows only one side returned. The reproducer creates the procedure,
+calls it and drops it again, so `--use-reducer` can reduce it.
 
 ## The VIEWS oracle
 

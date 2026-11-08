@@ -1,9 +1,12 @@
 package sqlancer.voltdb;
 
 import java.sql.Connection;
+import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -151,8 +154,25 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
                 globalState.getOptions().getPassword());
         SQLConnection sqlCon = new VoltDBConnection(con, globalState.getDbmsSpecificOptions().retrySeconds,
                 globalState.getDbmsSpecificOptions().nodeFailures);
-        List<String[]> leftover = VoltDBSchema.getTables(((VoltDBConnection) sqlCon).getMetaData(),
-                prefix(globalState.getDatabaseName()));
+        DatabaseMetaData md = ((VoltDBConnection) sqlCon).getMetaData();
+        // a procedure the PROCEDURE oracle created and a node failure kept it from dropping; it reads the tables below
+        try (ResultSet rs = md.getProcedures(null, null, null)) {
+            List<String> procedures = new ArrayList<>();
+            while (rs.next()) {
+                String name = rs.getString("PROCEDURE_NAME");
+                if (name.startsWith(prefix(globalState.getDatabaseName()))) {
+                    procedures.add(name);
+                }
+            }
+            for (String p : procedures) {
+                String drop = "DROP PROCEDURE " + p + " IF EXISTS";
+                globalState.getState().logStatement(drop);
+                try (Statement s = sqlCon.createStatement()) {
+                    s.execute(drop);
+                }
+            }
+        }
+        List<String[]> leftover = VoltDBSchema.getTables(md, prefix(globalState.getDatabaseName()));
         for (String[] t : leftover) {
             String drop = "DROP TABLE " + t[0] + " IF EXISTS CASCADE";
             globalState.getState().logStatement(drop);
