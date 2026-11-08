@@ -1030,8 +1030,12 @@ public final class VoltDBExpressionGenerator
         VoltDBExpression c = new VoltDBBinaryOperation(s.getLeft(), s.getOutput(), op);
         VoltDBExpression condition = all ? new VoltDBBinaryOperation(isNull(c),
                 new VoltDBUnaryPrefixOperation(c, VoltDBUnaryPrefixOperator.NOT), VoltDBBinaryOperator.OR) : c;
+        // ENG-30601: in q AND x = e, an upper bound on e's indexed column in q is dropped when x = e becomes the
+        // unique index lookup; with the comparison first it is kept, so unless --avoid-known-bugs is false the
+        // comparison comes first
         VoltDBExpression where = s.getWhere() == null ? condition
-                : new VoltDBBinaryOperation(s.getWhere(), condition, VoltDBBinaryOperator.AND);
+                : avoidKnownBugs ? new VoltDBBinaryOperation(condition, s.getWhere(), VoltDBBinaryOperator.AND)
+                        : new VoltDBBinaryOperation(s.getWhere(), condition, VoltDBBinaryOperator.AND);
         VoltDBExpression exists = VoltDBSubquery.exists(s.getTableName(), s.getAlias(), where);
         return all ? new VoltDBUnaryPrefixOperation(exists, VoltDBUnaryPrefixOperator.NOT) : exists;
     }

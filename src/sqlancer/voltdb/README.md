@@ -547,10 +547,10 @@ IN):
 
 | Subquery | Written with EXISTS |
 | --- | --- |
-| `x IN (SELECT e FROM t AS s WHERE q)`, `x op ANY (...)` | `EXISTS (SELECT 1 FROM t AS s WHERE q AND c)` |
-| `x NOT IN (...)` (that is, `x <> ALL`), `x op ALL (...)` | `NOT EXISTS (SELECT 1 FROM t AS s WHERE q AND (c IS NULL OR NOT c))` |
+| `x IN (SELECT e FROM t AS s WHERE q)`, `x op ANY (...)` | `EXISTS (SELECT 1 FROM t AS s WHERE c AND q)` |
+| `x NOT IN (...)` (that is, `x <> ALL`), `x op ALL (...)` | `NOT EXISTS (SELECT 1 FROM t AS s WHERE (c IS NULL OR NOT c) AND q)` |
 
-The two hold, are TRUE, for the same rows, whatever is NULL and whether the subquery is empty; where either is FALSE or
+(c comes before q because of ENG-30601 below.) The two hold, are TRUE, for the same rows, whatever is NULL and whether the subquery is empty; where either is FALSE or
 NULL makes no difference to a WHERE clause. The predicate is the whole WHERE clause, or ANDed with a random predicate.
 VoltDB plans an IN subquery by turning it into EXISTS itself, moving x into the subquery, so this checks that rewrite.
 The query reads the FROM clauses and joins of TLP WHERE, and outputs a random subset of their columns.
@@ -796,6 +796,7 @@ The bugs below were found by milestone 14's oracles in milestone 15's lab runs.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30599 | A window's `ORDER BY ... DESC` is applied ascending when an equality on its PARTITION BY column makes the planner use an index on (partition column, order column): `RANK() OVER (PARTITION BY a ORDER BY b DESC) ... WHERE a = 1` ranks the smallest b first. The plan is a forward range scan with no sort; `a >= 1` gets a reverse scan and is right. Found by WINDOW. Wrong result. | A window with a PARTITION BY orders ascending. |
+| ENG-30601 | `WHERE t.k < c AND t.k = u.j`, with k a unique key, drops the upper bound when the join equality becomes the unique index lookup (the plan's `uniquely match` has no filter); `t.k = u.j AND t.k < c` keeps it. Found by SUBQUERY, as the EXISTS form of an IN subquery on a primary key. Wrong result. | In the SUBQUERY oracle's EXISTS form, the comparison comes before the subquery's WHERE condition. Other queries can still meet it. |
 | ENG-30600 | An IN or `= ANY` subquery inside another subquery, whose left operand is a column of the outermost query, holds for every row: `A WHERE EXISTS (SELECT 1 FROM B AS S1 WHERE A.k IN (SELECT S2.k FROM B AS S2))` returns all of A, NULLs included. NOT IN and the same written with EXISTS are right. Found by SUBQUERY. Wrong result. | A subquery inside a subquery is EXISTS. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
