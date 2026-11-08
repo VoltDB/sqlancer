@@ -161,6 +161,21 @@ log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$results/run.log"; }
 cluster_started=false
 sqlancer_pid=
 
+# within SECS COMMAND...: runs COMMAND, killing it after SECS seconds (macOS has no timeout(1))
+within() {
+    local secs=$1
+    shift
+    "$@" &
+    local pid=$! i
+    for ((i = 0; i < secs; i++)); do
+        kill -0 "$pid" 2>/dev/null || { wait "$pid"; return; }
+        sleep 1
+    done
+    kill -9 "$pid" 2>/dev/null
+    echo "run-sqlancer: gave up after $secs s: $*" >&2
+    return 124
+}
+
 stop_cluster() {
     $cluster_started || return 0
     cluster_started=false
@@ -170,8 +185,9 @@ stop_cluster() {
     fi
     log "Stopping the cluster"
     # by port only once this run's node 0 is known to be up, so that it cannot reach another server on that port
+    # at most 120 s: on a wedged cluster (ENG-30612) the shutdown never returns, and the processes are killed below
     if grep -q "Server completed initialization" "$cluster/node0/voltdbroot/log/volt.log" 2>/dev/null; then
-        "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port 0)" >>"$results/run.log" 2>&1
+        within 120 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port 0)" >>"$results/run.log" 2>&1
     fi
     # only processes started for this run carry its directory on their command line, and their PIDs are recorded
     for _ in $(seq 1 30); do

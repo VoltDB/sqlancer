@@ -529,8 +529,9 @@ refuses a change, the check is skipped: this oracle checks query results, not wh
 A failure has no reproducer: reducing the database's statements would lose the order of the queries and the change.
 The failure message holds the change, the undo and the query.
 
-While nodes fail (`--node-failures`), SCHEMA does nothing unless `--avoid-known-bugs` is false: ENG-30612, an MPI
-deadlock when a node dies during an @UpdateCore, which its slow ALTER TABLE makes likely.
+While nodes fail (`--node-failures`), SCHEMA and PROCEDURE do nothing unless `--avoid-known-bugs` is false:
+ENG-30612, an MPI deadlock when a node dies during an @UpdateCore. SCHEMA's slow ALTER TABLE and PROCEDURE's frequent
+DDL batches make such a kill likely. The wedge happened twice in the lab, the second time with SCHEMA already off.
 
 ## The VIEWS oracle
 
@@ -933,7 +934,7 @@ The bugs below were found in milestone 18.
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
-| ENG-30612 | A node killed while an ad hoc DDL's @UpdateCore is in flight: a surviving host reclaims the dead host's catalog-update blocker before the interrupted @UpdateCore is resolved on the leaders, the next @UpdateCore queues behind it on five leaders, and the MPI deadlocks; every later DDL is "in progress on host 2" and the node's rejoin times out after 600 s. Found by the nightly run with node failures (lab build #32). Critical. | SCHEMA does nothing while nodes fail. |
+| ENG-30612 | A node killed while an ad hoc DDL's @UpdateCore is in flight: a surviving host reclaims the dead host's catalog-update blocker before the interrupted @UpdateCore is resolved on the leaders, the next @UpdateCore queues behind it on five leaders, and the MPI deadlocks; every later DDL is "in progress on host 2" and the node's rejoin times out after 600 s. Found by the nightly run with node failures (lab builds #32 and #33). Critical. | SCHEMA and PROCEDURE do nothing while nodes fail. |
 | ENG-30602 (seen again) | Three times in lab builds #31 and #32, 1 node: a SUBQUERY EXISTS query returned one row holding 0, another returned no rows where 4 were right, and a two-column query read a one-column result. Rerunning the same statements returned the right rows each time. The rate rises with the schema changes of PROCEDURE and SCHEMA. | A failure that does not recur when rerun at once is counted, not failed (`VoltDBTransientCheck`). |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
