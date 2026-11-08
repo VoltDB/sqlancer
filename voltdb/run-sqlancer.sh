@@ -432,6 +432,8 @@ result=PASS
     echo "failed databases: ${#failures[@]}"
     echo "nodes down at the end: ${down[*]:-none}"
     echo "FATAL lines in server logs: $fatal"
+    # ENG-30602: failures that did not recur when rerun at once (VoltDBTransientCheck), counted, not failed
+    echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
     for f in ${failures[@]+"${failures[@]}"}; do
         echo

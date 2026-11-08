@@ -102,6 +102,12 @@ A run FAILs if any of these happens:
 - A server log has a FATAL line.
 - With `--kill-interval`, a killed node does not rejoin within 600 seconds.
 
+While `--avoid-known-bugs` is true (the default), a failed check whose queries no longer fail when its reproducer
+reruns them at once is not a failure. It is printed as `ENG-30602 transient: ...` in `sqlancer/out.log`, and the
+summary counts it as "transient results skipped (ENG-30602)". ENG-30602 is a VoltDB bug in which a query, now and
+then, gets another statement's result while other connections change the schema. A failure that recurs is a failure,
+and so is one from an oracle without a reproducer (SCHEMA, GEO).
+
 The script passes SQLancer `--num-statement-kind-retries 20`: a failed INSERT is retried with new values, up to
 SQLancer's default of 1,000 times, so once a table's key had run out of values (a BOOLEAN or TINYINT primary key, say)
 each of a database's inserts spent 1,000 constraint violations, and SQLancer's "successful statements" fell below 70%.
@@ -923,11 +929,12 @@ The bugs below were found in milestone 17.
 | ENG-30608 | Intermittent node crash (SIGILL): a site thread recursed without end through `SeqScanExecutor::p_execute`, `ExecutorContext::getCommonTable` and `executeExecutors` while the DERIVED oracle's `WITH RECURSIVE` query ran, beside other threads' catalog updates: twice in three 20-minute 1-node trials with PROCEDURE, never in the lab without it, and not reproducible on demand. | DERIVED's RECURSIVE mode is off. |
 | ENG-30609 | `SELECT COUNT(*) FROM rc`, rc a recursive common table, fails to plan: "TableCountPlanNode cannot be cast to SeqScanPlanNode". Found reducing ENG-30608. | DERIVED selects the common table's column, not `COUNT(*)`. |
 
-The bug below was found in milestone 18.
+The bugs below were found in milestone 18.
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30612 | A node killed while an ad hoc DDL's @UpdateCore is in flight: a surviving host reclaims the dead host's catalog-update blocker before the interrupted @UpdateCore is resolved on the leaders, the next @UpdateCore queues behind it on five leaders, and the MPI deadlocks; every later DDL is "in progress on host 2" and the node's rejoin times out after 600 s. Found by the nightly run with node failures (lab build #32). Critical. | SCHEMA does nothing while nodes fail. |
+| ENG-30602 (seen again) | Three times in lab builds #31 and #32, 1 node: a SUBQUERY EXISTS query returned one row holding 0, another returned no rows where 4 were right, and a two-column query read a one-column result. Rerunning the same statements returned the right rows each time. The rate rises with the schema changes of PROCEDURE and SCHEMA. | A failure that does not recur when rerun at once is counted, not failed (`VoltDBTransientCheck`). |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
