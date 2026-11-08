@@ -110,6 +110,18 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
     },
 
     /**
+     * Ad hoc against stored procedure: a query with literals returns the rows of the same query with parameters as a
+     * DDL stored procedure, called with the literals' values; when it reads a partitioned table, half the procedures
+     * are single-partition, pinned by an equality on its partitioning column.
+     */
+    PROCEDURE {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBParameterOracle(globalState, expressionErrors(), true);
+        }
+    },
+
+    /**
      * Checks that a materialized view holds the rows its defining query returns on the table now, after the inserts,
      * updates and deletes that built the database and sometimes one more change.
      */

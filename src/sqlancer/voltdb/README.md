@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 16.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 17.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -17,7 +17,9 @@ IN, ANY and ALL against EXISTS, and the WINDOW oracle checks window functions; s
 [Subqueries and window functions](#subqueries-and-window-functions). Since milestone 15 node failures include node 0:
 SQLancer connects to every node. Since milestone 16 the SETOPS oracle checks UNION, INTERSECT and EXCEPT, and the
 DERIVED oracle checks derived tables and WITH, recursive WITH included; see
-[Set operations, derived tables and WITH](#set-operations-derived-tables-and-with).
+[Set operations, derived tables and WITH](#set-operations-derived-tables-and-with). Since milestone 17 the PROCEDURE
+oracle checks ad hoc queries against the same queries as stored procedures, single-partition ones included; see
+[The PROCEDURE oracle](#the-procedure-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -161,7 +163,7 @@ the kit's runtime JDK and makes three runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all thirteen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all fourteen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE) | 45 minutes |
 | `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
 | `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
 
@@ -229,7 +231,7 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | `--username`, `--password` | Empty for a server without security (SQLancer's default is `sqlancer`). |
 | `--host`, `--port` | A server's client port. Defaults: localhost, 21212. |
 | `--database-prefix` | Prefix of each thread's table names. Default `database`; `db` keeps the logs short. |
-| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT`, `SUBQUERY`, `WINDOW`, `SETOPS`, `DERIVED` or `SMOKE`; several are comma-separated. |
+| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT`, `SUBQUERY`, `WINDOW`, `SETOPS`, `DERIVED`, `PROCEDURE` or `SMOKE`; several are comma-separated. |
 | `--max-num-tables` | Tables per database, 1 to this (default 3). |
 | `--max-num-indexes` | CREATE INDEX statements per database, 0 to this (default 4). |
 | `--max-num-updates` | UPDATE statements per database, 0 to this (default 5). |
@@ -464,6 +466,35 @@ that folds to a subnormal FLOAT, whose plan then fails to load (ENG-30551) and w
 An expected error in either query skips the check; an unexpected one fails it. Rows are compared as TLP compares them.
 A failure reports both queries and the parameters' values and types, and `--use-reducer` works.
 
+## The PROCEDURE oracle
+
+PROCEDURE (`oracle/VoltDBParameterOracle` with `procedure` true) checks ad hoc execution against stored procedures. It
+writes queries as PARAMS does, one with literals and one with some of them parameters, and runs the second as a DDL
+procedure, `CREATE PROCEDURE p AS q`, called through `{call p(?, ...)}` with the literals' values. VoltDB plans a
+procedure's statement when the procedure is created, not when it runs; gives its parameters the types the statement
+implies; and converts the call's values to them. An ad hoc statement does none of these.
+
+When a query reads a partitioned table, half its procedures are single-partition. The query gets `AND t.c = ?` on the
+partitioning column of the table that every other partitioned table in it joins on that column, with a value read from
+the table, and the procedure is `CREATE PROCEDURE p PARTITION ON TABLE t COLUMN c PARAMETER n AS q`. It runs on the one
+partition that holds the value, through the single-partition planner and executor. The query with literals gets
+`t.c = value` and runs on every partition.
+
+VoltDB applies one catalog update (a DDL statement) at a time across the whole cluster. Each one blocks every partition
+and empties the plan caches. With a CREATE and a DROP per check, about two updates a second cut every oracle's rate to
+a third in a 1-node trial. So each check writes up to eight queries and keeps them. Once 24 are kept, about once per
+database, the oracle creates their procedures in one DDL batch, compares each, and drops them in another.
+
+A batch fails as a whole when VoltDB cannot plan one of its statements. A parameter can cause that where its literal
+folds: `CAST(? AS VARBINARY) IS NOT NULL` in a join's WHERE clause is "Join with filters that do not depend on joined
+tables". So each query runs ad hoc with its parameters as it is written, which is a PARAMS check, and one that fails is
+not kept. If the batch still fails, its procedures are created one by one. Procedure names
+are the database prefix, `P` and a number unique within the run. A procedure that a node failure kept from being
+dropped is dropped when its database's name is next used.
+
+A failure reports the procedure, the call and the rows only one side returned. The reproducer creates the procedure,
+calls it and drops it again, so `--use-reducer` can reduce it.
+
 ## The VIEWS oracle
 
 VIEWS (`oracle/VoltDBViewOracle`) checks VoltDB's materialized views, which it keeps up to date as their tables
@@ -621,7 +652,7 @@ DERIVED (`oracle/VoltDBDerivedTableOracle`) has three modes:
 - `RECURSIVE`: `WITH RECURSIVE RC (V) AS (SELECT t.c FROM t WHERE p UNION ALL SELECT t.c FROM t, RC WHERE t.c = RC.V +
   1) SELECT V FROM RC`, over an integer column of a replicated table, returns the closure the oracle computes in Java:
   the start values, and from each value every row whose value is one more. A closure of more than 5,000 rows is not
-  checked.
+  checked. Since milestone 17 this mode runs only with `--avoid-known-bugs false` (ENG-30608, a node crash).
 
 The JDBC driver runs only statements that start with SELECT as queries (ENG-30603 below), so the connection sends a
 query that starts with WITH or a parenthesis through `{call @AdHoc(?)}`.
@@ -850,6 +881,16 @@ The bugs below were found in milestone 16.
 | ENG-30605 | String literals at one position of a set operation are padded to the longest: `'a' UNION ALL 'abc'` gives `'a  '`, and `''` against `'a'` gives `' '`. A VARCHAR column on either side is right. Found by SETOPS. Wrong result. | String and VARBINARY constants in set operations have one character or byte. |
 | ENG-30607 | A set operation inside a derived table, `SELECT * FROM (A UNION B) AS u`, fails with "The size 17 of the value '...' exceeds the size of the VARCHAR(16) column" when A's column is VARCHAR(16) or wider and a value from B is longer; the bare set operation, and A of VARCHAR(15) or narrower, are right. Found by SETOPS in lab build #28. Wrong error. | A set operation with a VARCHAR or VARBINARY output is not wrapped in a derived table. |
 | ENG-30603 (JDBC) | The driver takes a statement for a query only if it starts with SELECT: `executeQuery` rejects `WITH ... SELECT` and `(SELECT ...) EXCEPT ...` ("Cannot submit statement in current context"), and `execute` returns their first value as an update count. Filed under ENG-30559 (JDBC). | The connection sends such queries through `{call @AdHoc(?)}`. |
+
+The bugs below were found in milestone 17.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30606 | `CREATE PROCEDURE p AS ...` turns a newline inside a string literal into a space, so `UPPER('<newline>')` returns a space from the procedure and a newline ad hoc; a tab is kept. ENG-4997 (fixed in V3.5) was the same for `voltdb compile`. Found by PROCEDURE. Wrong result. | In the PROCEDURE oracle a string constant with a line break is always a parameter, and a query that keeps one in its text is skipped. |
+| ENG-30602 (seen again) | A WINDOW query on 1 node read a one-column result ("Column index out of range: '2' (Column count: 1)") while the PROCEDURE oracle's catalog updates ran beside it; the query was not logged, which it now is. | None. |
+| ENG-30610 | A join with a constant ON condition (`ON 1 = 1`) is not auto-parameterized, and with `WHERE p.c = x'..'` on a VARBINARY partitioning column it runs single-partition on the wrong partition: `SELECT VB.c0 FROM VB JOIN R ON 1 = 1 WHERE VB.c0 = x'03'` returns no row (with `ON TRUE`, or a parameter, it is right). Found by PROCEDURE's PARAMS check on 3 nodes. Wrong result. | No table is partitioned on a VARBINARY column. |
+| ENG-30608 | Intermittent node crash (SIGILL): a site thread recursed without end through `SeqScanExecutor::p_execute`, `ExecutorContext::getCommonTable` and `executeExecutors` while the DERIVED oracle's `WITH RECURSIVE` query ran, beside other threads' catalog updates: twice in three 20-minute 1-node trials with PROCEDURE, never in the lab without it, and not reproducible on demand. | DERIVED's RECURSIVE mode is off. |
+| ENG-30609 | `SELECT COUNT(*) FROM rc`, rc a recursive common table, fails to plan: "TableCountPlanNode cannot be cast to SeqScanPlanNode". Found reducing ENG-30608. | DERIVED selects the common table's column, not `COUNT(*)`. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.

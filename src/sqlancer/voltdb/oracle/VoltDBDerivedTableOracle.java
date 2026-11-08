@@ -68,7 +68,12 @@ public class VoltDBDerivedTableOracle implements TestOracle<VoltDBGlobalState> {
     @Override
     public void check() throws Exception {
         reproducer = null;
-        Mode mode = Randomly.fromOptions(Mode.values());
+        // ENG-30608: a node crashed twice, beside the PROCEDURE oracle's catalog updates, in an endless recursion of
+        // the
+        // execution engine's common-table code while running this oracle's WITH RECURSIVE query, so unless
+        // --avoid-known-bugs is false the RECURSIVE mode is off
+        Mode mode = state.getDbmsSpecificOptions().avoidKnownBugs ? Randomly.fromOptions(Mode.WRAP, Mode.PUSH)
+                : Randomly.fromOptions(Mode.values());
         if (mode == Mode.RECURSIVE) {
             checkRecursive();
             return;
