@@ -652,7 +652,7 @@ DERIVED (`oracle/VoltDBDerivedTableOracle`) has three modes:
 - `RECURSIVE`: `WITH RECURSIVE RC (V) AS (SELECT t.c FROM t WHERE p UNION ALL SELECT t.c FROM t, RC WHERE t.c = RC.V +
   1) SELECT V FROM RC`, over an integer column of a replicated table, returns the closure the oracle computes in Java:
   the start values, and from each value every row whose value is one more. A closure of more than 5,000 rows is not
-  checked.
+  checked. Since milestone 17 this mode runs only with `--avoid-known-bugs false` (ENG-30608, a node crash).
 
 The JDBC driver runs only statements that start with SELECT as queries (ENG-30603 below), so the connection sends a
 query that starts with WITH or a parenthesis through `{call @AdHoc(?)}`.
@@ -888,7 +888,7 @@ The bugs below were found in milestone 17.
 | --- | --- | --- |
 | ENG-30606 | `CREATE PROCEDURE p AS ...` turns a newline inside a string literal into a space, so `UPPER('<newline>')` returns a space from the procedure and a newline ad hoc; a tab is kept. ENG-4997 (fixed in V3.5) was the same for `voltdb compile`. Found by PROCEDURE. Wrong result. | In the PROCEDURE oracle a string constant with a line break is always a parameter, and a query that keeps one in its text is skipped. |
 | ENG-30602 (seen again) | A WINDOW query on 1 node read a one-column result ("Column index out of range: '2' (Column count: 1)") while the PROCEDURE oracle's catalog updates ran beside it; the query was not logged, which it now is. | None. |
-| ENG-30608 | Intermittent node crash (SIGILL): a site thread recursed without end through `SeqScanExecutor::p_execute`, `ExecutorContext::getCommonTable` and `executeExecutors` while the DERIVED oracle's `WITH RECURSIVE` query ran on an empty table, beside other threads' catalog updates. Once in a 20-minute 1-node trial; the seed passed when rerun. | None: if it recurs, the run fails on it. |
+| ENG-30608 | Intermittent node crash (SIGILL): a site thread recursed without end through `SeqScanExecutor::p_execute`, `ExecutorContext::getCommonTable` and `executeExecutors` while the DERIVED oracle's `WITH RECURSIVE` query ran, beside other threads' catalog updates: twice in three 20-minute 1-node trials with PROCEDURE, never in the lab without it, and not reproducible on demand. | DERIVED's RECURSIVE mode is off. |
 | ENG-30609 | `SELECT COUNT(*) FROM rc`, rc a recursive common table, fails to plan: "TableCountPlanNode cannot be cast to SeqScanPlanNode". Found reducing ENG-30608. | DERIVED selects the common table's column, not `COUNT(*)`. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
