@@ -1,7 +1,9 @@
 package sqlancer.voltdb;
 
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.sql.CallableStatement;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
@@ -9,6 +11,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.regex.Pattern;
 
 import sqlancer.IgnoreMeException;
 import sqlancer.SQLConnection;
@@ -31,6 +34,10 @@ import sqlancer.SQLConnection;
  * </ul>
  */
 public class VoltDBConnection extends SQLConnection {
+
+    // a statement the JDBC driver takes for a query (ENG-30603, see adHocQuery)
+    private static final Pattern SELECT_PREAMBLE = Pattern.compile("^\\s*select\\s+.*",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
     private final Connection connection;
     private final long retryMillis;
@@ -101,7 +108,8 @@ public class VoltDBConnection extends SQLConnection {
                     long deadline = System.currentTimeMillis() + retryMillis;
                     while (true) {
                         try {
-                            Object result = method.invoke(statement, args);
+                            Object result = isNonSelectQuery(method, args) ? adHocQuery((String) args[0])
+                                    : method.invoke(statement, args);
                             return result instanceof ResultSet ? nullReading((ResultSet) result) : result;
                         } catch (InvocationTargetException e) {
                             Throwable cause = e.getCause();
@@ -115,6 +123,27 @@ public class VoltDBConnection extends SQLConnection {
                         }
                     }
                 }));
+    }
+
+    // ENG-30603: the JDBC driver takes a statement for a query only if it starts with SELECT, and executeQuery()
+    // rejects
+    // any other ("Cannot submit statement in current context"), so a query that starts with WITH or with a
+    // parenthesized set operation goes through @AdHoc as a stored procedure call instead, which returns its rows
+
+    private static boolean isNonSelectQuery(Method method, Object... args) {
+        return method.getName().equals("executeQuery") && args != null && args.length == 1 && args[0] instanceof String
+                && !SELECT_PREAMBLE.matcher((String) args[0]).matches();
+    }
+
+    // its errors as the statement's would be, wrapped in InvocationTargetException
+    private ResultSet adHocQuery(String sql) throws InvocationTargetException {
+        try {
+            CallableStatement call = connection.prepareCall("{call @AdHoc(?)}");
+            call.setString(1, sql);
+            return call.executeQuery();
+        } catch (SQLException e) {
+            throw new InvocationTargetException(e);
+        }
     }
 
     // wraps a result set so that getString() and getObject() return null for a NULL value (ENG-4643); getObject()
