@@ -33,6 +33,10 @@ final class VoltDBRows {
                 }
                 rows.add(row);
             }
+        } catch (SQLException e) {
+            // reading a result that does not have the query's columns (ENG-30602: "Column index out of range"), with
+            // the query, which the error alone does not name
+            throw new AssertionError(sql, e);
         }
         return rows;
     }

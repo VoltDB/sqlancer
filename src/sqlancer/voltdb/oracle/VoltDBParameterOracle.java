@@ -284,6 +284,10 @@ public class VoltDBParameterOracle implements TestOracle<VoltDBGlobalState> {
             // ENG-30571: a string literal left in the query holds a ?, in a part the Chooser does not visit
             throw new IgnoreMeException();
         }
+        if (procedure && avoidKnownBugs && (visitor.get().contains("\n") || visitor.get().contains("\r"))) {
+            // ENG-30606: the same for a line break, which only a string literal holds
+            throw new IgnoreMeException();
+        }
         Queries queries = new Queries(select.asString(), visitor.get(), visitor.values, visitor.types,
                 select.getFetchColumns().size());
         if (procedure) {
@@ -397,8 +401,12 @@ public class VoltDBParameterOracle implements TestOracle<VoltDBGlobalState> {
             // JDBC driver counts a ? inside a string literal as a parameter (ENG-30571). Unless --avoid-known-bugs is
             // false, such constants are always parameters, and a query that must keep one as a literal is skipped
             // (see also check).
+            // ENG-30606: CREATE PROCEDURE turns a line break inside a string literal into a space, so in a procedure
+            // such
+            // a string is always a parameter too.
             boolean mustBeParameter = avoidKnownBugs && (value instanceof BigDecimal || value instanceof Binary
-                    || text.startsWith("'") && text.contains("?"));
+                    || text.startsWith("'") && text.contains("?")
+                    || procedure && text.startsWith("'") && (text.contains("\n") || text.contains("\r")));
             if (literalsOnly || avoidKnownBugs && parent != null && VoltDBExpressionEvaluator.isConstant(parent)) {
                 if (mustBeParameter) {
                     throw new IgnoreMeException();

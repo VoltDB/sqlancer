@@ -882,6 +882,13 @@ The bugs below were found in milestone 16.
 | ENG-30607 | A set operation inside a derived table, `SELECT * FROM (A UNION B) AS u`, fails with "The size 17 of the value '...' exceeds the size of the VARCHAR(16) column" when A's column is VARCHAR(16) or wider and a value from B is longer; the bare set operation, and A of VARCHAR(15) or narrower, are right. Found by SETOPS in lab build #28. Wrong error. | A set operation with a VARCHAR or VARBINARY output is not wrapped in a derived table. |
 | ENG-30603 (JDBC) | The driver takes a statement for a query only if it starts with SELECT: `executeQuery` rejects `WITH ... SELECT` and `(SELECT ...) EXCEPT ...` ("Cannot submit statement in current context"), and `execute` returns their first value as an update count. Filed under ENG-30559 (JDBC). | The connection sends such queries through `{call @AdHoc(?)}`. |
 
+The bugs below were found in milestone 17.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30606 | `CREATE PROCEDURE p AS ...` turns a newline inside a string literal into a space, so `UPPER('<newline>')` returns a space from the procedure and a newline ad hoc; a tab is kept. ENG-4997 (fixed in V3.5) was the same for `voltdb compile`. Found by PROCEDURE. Wrong result. | In the PROCEDURE oracle a string constant with a line break is always a parameter, and a query that keeps one in its text is skipped. |
+| ENG-30602 (seen again) | A WINDOW query on 1 node read a one-column result ("Column index out of range: '2' (Column count: 1)") while the PROCEDURE oracle's catalog updates ran beside it; the query was not logged, which it now is. | None. |
+
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
 

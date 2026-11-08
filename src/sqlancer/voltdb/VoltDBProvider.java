@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 
 import com.google.auto.service.AutoService;
 
@@ -160,7 +161,9 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
             List<String> procedures = new ArrayList<>();
             while (rs.next()) {
                 String name = rs.getString("PROCEDURE_NAME");
-                if (name.startsWith(prefix(globalState.getDatabaseName()))) {
+                // the PROCEDURE oracle's names are the prefix, P and a number; the tables' default procedures, such as
+                // DB0_T0.insert, go with their tables
+                if (name.matches(Pattern.quote(prefix(globalState.getDatabaseName())) + "P[0-9]+")) {
                     procedures.add(name);
                 }
             }
