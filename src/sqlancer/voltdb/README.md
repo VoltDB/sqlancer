@@ -524,8 +524,9 @@ and WINDOW (its WHERE clause) may hold subqueries:
   for comparisons, one numeric or temporal domain;
 - `(SELECT MIN(e) | MAX(e) | COUNT(*) FROM t AS s [WHERE q])`, a scalar subquery, in place of a value.
 
-The WHERE condition q references the outer query's columns (a correlated subquery), and so does the output e while
-`--avoid-known-bugs` is false (ENG-30597 below). A
+The WHERE condition q references the outer query's columns (a correlated subquery), except in an IN, ANY or ALL
+subquery, and so does the output e, while `--avoid-known-bugs` is false (ENG-30597 and ENG-30601 below); EXISTS
+subqueries are correlated either way. A
 subquery can hold another, two deep (EXISTS only while `--avoid-known-bugs` is true: ENG-30600). Each reads one table under its own alias (`S0`, `S1`, ...), which may be the outer
 query's table too. PQS, PARAMS, VIEWS and LIMIT generate no subqueries, and a generator with subqueries off makes the
 same random choices as before milestone 14.
@@ -791,12 +792,12 @@ The bugs below were found in milestone 14, by subqueries and the SUBQUERY oracle
 | ENG-16927 (comment) | An old bug, open since 2019: any subquery in the string argument of SUBSTRING or TRIM crashes the SQL parser (NullPointerException in `QueryExpression.getColumns`). Other functions of a subquery work. Found by TLP AGGREGATE. | SUBSTRING's string argument has no subquery (and TRIM is already written `LTRIM(RTRIM(x))`). |
 | ENG-30497 (comment) | The milestone 2 bug, through subqueries: NOT IN, `<> ALL` and a correlated NOT EXISTS over an outer join's inner table turn the join into an inner join, though each can be TRUE for the null-extended row. `oa LEFT JOIN ob ... WHERE NOT EXISTS (SELECT 1 FROM ob AS s WHERE s.x = ob.x)` loses the unmatched rows. Found by TLP WHERE. Wrong result. | No subquery predicates with an outer join. |
 
-The bugs below were found by milestone 14's oracles in milestone 15's lab runs.
+The bugs below were found by milestone 14's oracles in milestone 15's lab runs. ENG-30602 is not reproducible on demand and has no workaround: a multi-partition SELECT once failed with "Column count mismatch. Expecting 3, but 1 given" and a one-column `modified_tuples` table, as if it had received a DML statement's fragment result (once in 175,000 checks). If it recurs, the nightly run fails on it.
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30599 | A window's `ORDER BY ... DESC` is applied ascending when an equality on its PARTITION BY column makes the planner use an index on (partition column, order column): `RANK() OVER (PARTITION BY a ORDER BY b DESC) ... WHERE a = 1` ranks the smallest b first. The plan is a forward range scan with no sort; `a >= 1` gets a reverse scan and is right. Found by WINDOW. Wrong result. | A window with a PARTITION BY orders ascending. |
-| ENG-30601 | `WHERE t.k < c AND t.k = u.j`, with k a unique key, drops the upper bound when the join equality becomes the unique index lookup (the plan's `uniquely match` has no filter); `t.k = u.j AND t.k < c` keeps it. Found by SUBQUERY, as the EXISTS form of an IN subquery on a primary key. Wrong result. | In the SUBQUERY oracle's EXISTS form, the comparison comes before the subquery's WHERE condition. Other queries can still meet it. |
+| ENG-30601 | `WHERE t.k < c AND t.k = u.j`, with k indexed (unique or not), drops the upper bound when the join equality becomes the unique index lookup (the plan's `uniquely match` has no filter); `t.k = u.j AND t.k < c` keeps it. Found by SUBQUERY, as the EXISTS form of an IN subquery on a primary key. Wrong result. | In the SUBQUERY oracle's EXISTS form, the comparison comes before the subquery's WHERE condition, and the WHERE condition of an IN, ANY or ALL subquery is not correlated (a non-unique index and an equality in that condition did it too: comment on the ticket). Other queries can still meet it. |
 | ENG-30600 | An IN or `= ANY` subquery inside another subquery, whose left operand is a column of the outermost query, holds for every row: `A WHERE EXISTS (SELECT 1 FROM B AS S1 WHERE A.k IN (SELECT S2.k FROM B AS S2))` returns all of A, NULLs included. NOT IN and the same written with EXISTS are right. Found by SUBQUERY. Wrong result. | A subquery inside a subquery is EXISTS. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads

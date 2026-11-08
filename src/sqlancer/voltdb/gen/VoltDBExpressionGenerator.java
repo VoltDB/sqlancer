@@ -932,12 +932,16 @@ public final class VoltDBExpressionGenerator
         }
     }
 
-    // a subquery's WHERE condition, which may reference the outer query's columns, or null
+    // a subquery's WHERE condition, which may reference the outer query's columns when correlated, or null
     private VoltDBExpression generateSubqueryWhere(VoltDBTable alias, int depth) {
+        return generateSubqueryWhere(alias, depth, true);
+    }
+
+    private VoltDBExpression generateSubqueryWhere(VoltDBTable alias, int depth, boolean correlated) {
         if (Randomly.getBooleanWithRatherLowProbability()) {
             return null;
         }
-        return inSubquery(alias, true, () -> generateExpression(Kind.BOOLEAN, depth + 1));
+        return inSubquery(alias, correlated, () -> generateExpression(Kind.BOOLEAN, depth + 1));
     }
 
     // EXISTS, IN, or a comparison with ANY or ALL. VoltDB's parser rejects IN inside an operand of a comparison or IN,
@@ -988,7 +992,10 @@ public final class VoltDBExpressionGenerator
             VoltDBExpression output = avoidKnownBugs
                     ? withoutSubqueries(() -> inSubquery(alias, correlated, () -> generateExpression(k, depth + 1)))
                     : inSubquery(alias, correlated, () -> generateExpression(k, depth + 1));
-            VoltDBExpression where = generateSubqueryWhere(alias, depth);
+            // ENG-30601 (comment): a bound on an indexed column of the subquery's table, then an equality with an outer
+            // column, loses the bound; the EXISTS form (existsRewrite) puts x op e next to the WHERE condition, so
+            // unless --avoid-known-bugs is false the WHERE condition of an IN, ANY or ALL subquery is not correlated
+            VoltDBExpression where = generateSubqueryWhere(alias, depth, !avoidKnownBugs);
             if (Randomly.getBoolean()) {
                 return VoltDBSubquery.inSet(left, Randomly.getBoolean(), table.getName(), alias, output, where);
             }
