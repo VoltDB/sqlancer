@@ -981,6 +981,12 @@ The bugs below were found in milestone 18.
 | ENG-30614 | An outer join whose ON condition is, or folds to, FALSE returns no rows at all, not the preserved rows null-extended: `A LEFT JOIN B ON 1 = 0` returns nothing (the plan's `filter by false` is applied to the join's output). Also on 16.0.0. Found by PARAMS on 1 node (lab build #34), where the literal form of the ON condition folded to FALSE and the parameterized one did not. Wrong result. | No AND, OR or NOT in an ON condition has a column-free operand, so nothing in it folds to a constant. |
 | ENG-30602 (seen again) | Three times in lab builds #31 and #32, 1 node: a SUBQUERY EXISTS query returned one row holding 0, another returned no rows where 4 were right, and a two-column query read a one-column result. Rerunning the same statements returned the right rows each time. The rate rises with the schema changes of PROCEDURE and SCHEMA. | A failure that does not recur when rerun at once is counted, not failed (`VoltDBTransientCheck`). |
 
+The bug below was found in milestone 19.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30510 (comment) | The RIGHT JOIN bug through a FULL JOIN: a WHERE clause that rejects the right table's NULLs turns `a FULL JOIN b ON c >= b.k` into a RIGHT JOIN and then a LEFT JOIN that uses the ON condition as b's index range, dropping b's row. Found by TLP WHERE. Wrong result. | A FULL JOIN's ON condition reads the left table only. |
+
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
 

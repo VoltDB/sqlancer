@@ -989,7 +989,7 @@ public final class VoltDBExpressionGenerator
             // only with some WHERE clauses, and the error is expected (VoltDBErrors)
             VoltDBJoin.JoinType type = partitionJoined.isEmpty() ? randomJoinType()
                     : Randomly.fromOptions(VoltDBJoin.JoinType.LEFT, VoltDBJoin.JoinType.FULL);
-            joins.add(new VoltDBJoin(new VoltDBTableReference(t), type, joinCondition(anchor, t)));
+            joins.add(new VoltDBJoin(new VoltDBTableReference(t), type, joinCondition(anchor, t, type)));
             all.addAll(t.getColumns());
         }
         this.columns = all;
@@ -1285,9 +1285,15 @@ public final class VoltDBExpressionGenerator
     }
 
     // a random condition over the columns of the two tables
-    private VoltDBExpression joinCondition(VoltDBTable anchor, VoltDBTable t) {
+    private VoltDBExpression joinCondition(VoltDBTable anchor, VoltDBTable t, VoltDBJoin.JoinType type) {
         List<VoltDBColumn> joinColumns = new ArrayList<>(anchor.getColumns());
-        joinColumns.addAll(t.getColumns());
+        // ENG-30510 (comment): a WHERE clause that rejects the NULLs of a FULL JOIN's right table makes it a RIGHT
+        // JOIN, which VoltDB turns into a LEFT JOIN and then uses an ON condition on that table as its index range,
+        // dropping rows (FROM a FULL JOIN b ON c >= b.k WHERE b.k IS NOT NULL); unless --avoid-known-bugs is false a
+        // FULL JOIN's ON condition reads the left table only
+        if (!(avoidKnownBugs && type == VoltDBJoin.JoinType.FULL)) {
+            joinColumns.addAll(t.getColumns());
+        }
         VoltDBExpressionGenerator gen = new VoltDBExpressionGenerator(state).setColumns(joinColumns);
         // ENG-30497 applies to ON conditions too: a later join's condition sees the null-extended rows of the outer
         // joins before it, as (t0.b OR t2.b) IS NOT NULL in t1 LEFT JOIN t2 ... FULL JOIN t0 ON ... did
