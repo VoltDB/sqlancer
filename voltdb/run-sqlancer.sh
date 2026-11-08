@@ -209,7 +209,7 @@ stop_cluster() {
         within 120 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port 0)" >>"$results/run.log" 2>&1
     fi
     if [ -n "$mirror_home" ] && grep -q "Server completed initialization" "$cluster/mirror/voltdbroot/log/volt.log" 2>/dev/null; then
-        "$mirror_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $nodes)" >>"$results/run.log" 2>&1
+        within 120 "$mirror_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $nodes)" >>"$results/run.log" 2>&1
     fi
     # only processes started for this run carry its directory on their command line, and their PIDs are recorded
     for _ in $(seq 1 30); do
