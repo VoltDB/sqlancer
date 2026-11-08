@@ -7,6 +7,7 @@ import sqlancer.voltdb.ast.VoltDBCase;
 import sqlancer.voltdb.ast.VoltDBConstant;
 import sqlancer.voltdb.ast.VoltDBExpression;
 import sqlancer.voltdb.ast.VoltDBJoin;
+import sqlancer.voltdb.ast.VoltDBKeyword;
 import sqlancer.voltdb.ast.VoltDBSelect;
 import sqlancer.voltdb.ast.VoltDBSubquery;
 import sqlancer.voltdb.ast.VoltDBWindowFunction;
@@ -15,7 +16,7 @@ public class VoltDBToStringVisitor extends NewToStringVisitor<VoltDBExpression> 
 
     @Override
     public void visitSpecific(VoltDBExpression expr) {
-        if (expr instanceof VoltDBConstant) {
+        if (expr instanceof VoltDBConstant || expr instanceof VoltDBKeyword) {
             sb.append(expr.toString());
         } else if (expr instanceof VoltDBSelect) {
             visit((VoltDBSelect) expr);

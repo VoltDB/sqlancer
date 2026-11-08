@@ -32,6 +32,7 @@ import sqlancer.voltdb.ast.VoltDBFunction;
 import sqlancer.voltdb.ast.VoltDBFunction.VoltDBFunctionName;
 import sqlancer.voltdb.ast.VoltDBInOperation;
 import sqlancer.voltdb.ast.VoltDBJoin;
+import sqlancer.voltdb.ast.VoltDBKeyword;
 import sqlancer.voltdb.ast.VoltDBSelect;
 import sqlancer.voltdb.ast.VoltDBSubquery;
 import sqlancer.voltdb.ast.VoltDBTableReference;
@@ -98,12 +99,25 @@ public final class VoltDBExpressionGenerator
     }
 
     private enum NumericExpression {
-        UNARY_MINUS, ARITHMETIC, ABS, FLOOR_CEILING, MOD, CHAR_LENGTH, CASE, COALESCE
+        UNARY_MINUS, ARITHMETIC, ABS, FLOOR_CEILING, MOD, CHAR_LENGTH, CASE, COALESCE,
+        // milestone 19
+        FLOAT_MATH, DATE_PART, SINCE_EPOCH, JSON_ARRAY_LENGTH
     }
 
     private enum StringExpression {
-        CONCAT, SUBSTRING, CASE_CONVERSION, TRIM, CASE, COALESCE
+        CONCAT, SUBSTRING, CASE_CONVERSION, TRIM, CASE, COALESCE,
+        // milestone 19
+        JSON
     }
+
+    private enum TemporalExpression {
+        DATEADD, TRUNCATE, TO_TIMESTAMP
+    }
+
+    // JSON documents for the JSON functions (milestone 19); FIELD's names and ARRAY_ELEMENT's indexes reach into them
+    private static final String[] JSON_DOCUMENTS = { "{\"a\":1,\"b\":[1,2,3],\"c\":\"x\"}",
+            "{\"a\":\"one\",\"b\":[],\"d\":{\"e\":null}}", "{\"b\":[\"p\",\"q\"],\"c\":true}", "[1,2]", "{}",
+            "{\"a\":-2.5,\"c\":\"\"}" };
 
     private final VoltDBGlobalState state;
     private final boolean avoidKnownBugs;
@@ -170,9 +184,70 @@ public final class VoltDBExpressionGenerator
                 return generateStringExpression(depth);
             }
             return generateLeafNode(kind);
+        case TEMPORAL:
+            if (Randomly.getBoolean()) {
+                return generateTemporalExpression(depth);
+            }
+            return generateLeafNode(kind);
         default:
             return generateLeafNode(kind);
         }
+    }
+
+    // DATEADD(unit, n, t) and TRUNCATE(unit, t), of t's type, and TO_TIMESTAMP(unit, n), a TIMESTAMP (milestone 19)
+    private VoltDBExpression generateTemporalExpression(int depth) {
+        TemporalExpression choice = Randomly.fromOptions(TemporalExpression.values());
+        if (choice == TemporalExpression.TO_TIMESTAMP && temporalType == VoltDBDataType.DATE) {
+            choice = TemporalExpression.DATEADD;
+        }
+        Randomly r = state.getRandomly();
+        switch (choice) {
+        case DATEADD:
+            return new VoltDBFunction(List.of(
+                    new VoltDBKeyword(Randomly.fromOptions("YEAR", "QUARTER", "MONTH", "DAY", "HOUR", "MINUTE",
+                            "SECOND", "MILLISECOND", "MICROSECOND")),
+                    Randomly.getBoolean() ? integerConstant(r.getInteger(-400, 400)) : generateIntegerOperand(),
+                    generateExpression(Kind.TEMPORAL, depth + 1)), VoltDBFunctionName.DATEADD);
+        case TRUNCATE:
+            return new VoltDBFunction(
+                    List.of(new VoltDBKeyword(Randomly.fromOptions("YEAR", "QUARTER", "MONTH", "DAY", "HOUR", "MINUTE",
+                            "SECOND", "MILLISECOND")), generateExpression(Kind.TEMPORAL, depth + 1)),
+                    VoltDBFunctionName.TRUNCATE);
+        case TO_TIMESTAMP:
+            return new VoltDBFunction(
+                    List.of(new VoltDBKeyword(Randomly.fromOptions("SECOND", "MILLISECOND", "MICROSECOND")),
+                            Randomly.getBoolean() ? integerConstant(r.getLong(-100_000_000_000L, 100_000_000_000L))
+                                    : generateIntegerOperand()),
+                    VoltDBFunctionName.TO_TIMESTAMP);
+        default:
+            throw new AssertionError(choice);
+        }
+    }
+
+    // A TIMESTAMP expression, for SINCE_EPOCH, which rejects a DATE ("Type DATE can't be cast as TIMESTAMP")
+    private VoltDBExpression generateTimestamp(int depth) {
+        VoltDBDataType outer = temporalType;
+        temporalType = VoltDBDataType.TIMESTAMP;
+        try {
+            return canGenerateColumnOfType(Kind.TEMPORAL) || Randomly.getBoolean()
+                    ? generateExpression(Kind.TEMPORAL, depth + 1) : generateConstant(Kind.TEMPORAL, false);
+        } finally {
+            temporalType = outer;
+        }
+    }
+
+    // A JSON document: one of JSON_DOCUMENTS, or a string expression, which is mostly not JSON ("Invalid JSON")
+    private VoltDBExpression generateJsonDocument(int depth) {
+        if (Randomly.getBooleanWithRatherLowProbability()) {
+            return generateExpression(Kind.STRING, depth + 1);
+        }
+        return new VoltDBConstant(VoltDBConstantGenerator.quote(Randomly.fromOptions(JSON_DOCUMENTS)));
+    }
+
+    // FIELD(doc, 'b'), the array most documents hold
+    private VoltDBExpression generateJsonArray(int depth) {
+        return new VoltDBFunction(List.of(generateJsonDocument(depth), new VoltDBConstant("'b'")),
+                VoltDBFunctionName.FIELD);
     }
 
     private VoltDBExpression generateStringExpression(int depth) {
@@ -226,6 +301,23 @@ public final class VoltDBExpressionGenerator
             return generateCase(Kind.STRING, depth);
         case COALESCE:
             return generateCoalesce(Kind.STRING, depth);
+        case JSON:
+            switch (Randomly.fromOptions(0, 1, 2)) {
+            case 0:
+                return new VoltDBFunction(
+                        List.of(generateJsonDocument(depth),
+                                new VoltDBConstant(Randomly.fromOptions("'a'", "'b'", "'c'", "'d'", "'zz'"))),
+                        VoltDBFunctionName.FIELD);
+            case 1:
+                return new VoltDBFunction(
+                        List.of(generateJsonArray(depth), integerConstant(state.getRandomly().getInteger(-1, 4))),
+                        VoltDBFunctionName.ARRAY_ELEMENT);
+            default:
+                return new VoltDBFunction(
+                        List.of(generateJsonDocument(depth), new VoltDBConstant(Randomly.fromOptions("'a'", "'z'")),
+                                new VoltDBConstant(Randomly.fromOptions("'5'", "'\"s\"'", "'null'", "'[1]'"))),
+                        VoltDBFunctionName.SET_FIELD);
+            }
         default:
             throw new AssertionError();
         }
@@ -570,6 +662,51 @@ public final class VoltDBExpressionGenerator
             return generateCase(Kind.NUMERIC, depth);
         case COALESCE:
             return generateCoalesce(Kind.NUMERIC, depth);
+        case FLOAT_MATH:
+            // FLOAT results; a result that is NaN or infinite is "Invalid result value", expected
+            if (numericDomain == NumericDomain.EXACT) {
+                return generateLeafNode(Kind.NUMERIC);
+            }
+            VoltDBFunctionName math = Randomly.fromOptions(VoltDBFunctionName.SQRT, VoltDBFunctionName.EXP,
+                    VoltDBFunctionName.LN, VoltDBFunctionName.LOG10, VoltDBFunctionName.POWER, VoltDBFunctionName.SIN,
+                    VoltDBFunctionName.COS);
+            // ENG-30550 (see ARITHMETIC): no multiplication or division inside, as in ABS
+            typedFunctionNesting++;
+            try {
+                List<VoltDBExpression> mathArgs = new ArrayList<>();
+                mathArgs.add(generateExpression(Kind.NUMERIC, depth + 1));
+                if (math == VoltDBFunctionName.POWER) {
+                    mathArgs.add(integerConstant(state.getRandomly().getInteger(-3, 4)));
+                }
+                return new VoltDBFunction(mathArgs, math);
+            } finally {
+                typedFunctionNesting--;
+            }
+        case DATE_PART:
+            if (numericDomain == NumericDomain.FLOAT) {
+                return generateLeafNode(Kind.NUMERIC);
+            }
+            VoltDBFunctionName part = Randomly.fromOptions(VoltDBFunctionName.YEAR, VoltDBFunctionName.MONTH,
+                    VoltDBFunctionName.DAY, VoltDBFunctionName.HOUR, VoltDBFunctionName.MINUTE,
+                    VoltDBFunctionName.DAYOFWEEK, VoltDBFunctionName.DAYOFYEAR, VoltDBFunctionName.QUARTER,
+                    VoltDBFunctionName.WEEK, VoltDBFunctionName.WEEKDAY);
+            // a DATE has no hour or minute: HOUR(d) and MINUTE(d) are "incompatible data type in conversion"
+            boolean timeOfDay = part == VoltDBFunctionName.HOUR || part == VoltDBFunctionName.MINUTE;
+            return new VoltDBFunction(
+                    List.of(timeOfDay ? generateTimestamp(depth) : generateExpression(Kind.TEMPORAL, depth + 1)), part);
+        case SINCE_EPOCH:
+            if (numericDomain == NumericDomain.FLOAT) {
+                return generateLeafNode(Kind.NUMERIC);
+            }
+            return new VoltDBFunction(
+                    List.of(new VoltDBKeyword(Randomly.fromOptions("SECOND", "MILLISECOND", "MICROSECOND")),
+                            generateTimestamp(depth)),
+                    VoltDBFunctionName.SINCE_EPOCH);
+        case JSON_ARRAY_LENGTH:
+            if (numericDomain == NumericDomain.FLOAT) {
+                return generateLeafNode(Kind.NUMERIC);
+            }
+            return new VoltDBFunction(List.of(generateJsonArray(depth)), VoltDBFunctionName.ARRAY_LENGTH);
         default:
             throw new AssertionError();
         }

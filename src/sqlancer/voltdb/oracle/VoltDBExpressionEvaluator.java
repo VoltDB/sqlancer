@@ -24,6 +24,7 @@ import sqlancer.voltdb.ast.VoltDBConstant;
 import sqlancer.voltdb.ast.VoltDBExpression;
 import sqlancer.voltdb.ast.VoltDBFunction;
 import sqlancer.voltdb.ast.VoltDBInOperation;
+import sqlancer.voltdb.ast.VoltDBKeyword;
 import sqlancer.voltdb.ast.VoltDBUnaryPostfixOperation;
 import sqlancer.voltdb.ast.VoltDBUnaryPostfixOperation.VoltDBUnaryPostfixOperator;
 import sqlancer.voltdb.ast.VoltDBUnaryPrefixOperation;
@@ -292,6 +293,9 @@ public final class VoltDBExpressionEvaluator {
     }
 
     private Object function(VoltDBFunction f) {
+        if (!f.getFunc().isModelled()) {
+            throw new Unpredictable(f.getFunc() + " is not modelled");
+        }
         List<VoltDBExpression> argExprs = f.getArgs();
         Object[] args = argExprs.stream().map(this::evaluate).toArray();
         switch (f.getFunc()) {
@@ -422,7 +426,27 @@ public final class VoltDBExpressionEvaluator {
                 return numericType(f.getArgs().get(0));
             case MOD:
             case CHAR_LENGTH:
+            case YEAR:
+            case MONTH:
+            case DAY:
+            case HOUR:
+            case MINUTE:
+            case DAYOFWEEK:
+            case DAYOFYEAR:
+            case QUARTER:
+            case WEEK:
+            case WEEKDAY:
+            case SINCE_EPOCH:
+            case ARRAY_LENGTH:
                 return Long.class;
+            case SQRT:
+            case EXP:
+            case LN:
+            case LOG10:
+            case POWER:
+            case SIN:
+            case COS:
+                return Double.class;
             case COALESCE:
                 Class<?> type = null;
                 for (VoltDBExpression arg : f.getArgs()) {
@@ -510,7 +534,7 @@ public final class VoltDBExpressionEvaluator {
 
     // whether the expression has no column, so that the planner folds it
     static boolean isConstant(VoltDBExpression expr) {
-        if (expr instanceof VoltDBConstant) {
+        if (expr instanceof VoltDBConstant || expr instanceof VoltDBKeyword) {
             return true;
         }
         if (expr instanceof VoltDBBinaryOperation) {
