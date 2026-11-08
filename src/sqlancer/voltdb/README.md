@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 17.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 18.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -19,7 +19,9 @@ SQLancer connects to every node. Since milestone 16 the SETOPS oracle checks UNI
 DERIVED oracle checks derived tables and WITH, recursive WITH included; see
 [Set operations, derived tables and WITH](#set-operations-derived-tables-and-with). Since milestone 17 the PROCEDURE
 oracle checks ad hoc queries against the same queries as stored procedures, single-partition ones included; see
-[The PROCEDURE oracle](#the-procedure-oracle).
+[The PROCEDURE oracle](#the-procedure-oracle). Since milestone 18 the SCHEMA oracle changes a table's schema in the
+middle of the run and checks that queries return the same rows from new plans, cached plans and plans made after the
+change; see [The SCHEMA oracle](#the-schema-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -163,7 +165,7 @@ the kit's runtime JDK and makes three runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all fourteen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all fifteen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA) | 45 minutes |
 | `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
 | `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
 
@@ -231,7 +233,7 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | `--username`, `--password` | Empty for a server without security (SQLancer's default is `sqlancer`). |
 | `--host`, `--port` | A server's client port. Defaults: localhost, 21212. |
 | `--database-prefix` | Prefix of each thread's table names. Default `database`; `db` keeps the logs short. |
-| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT`, `SUBQUERY`, `WINDOW`, `SETOPS`, `DERIVED`, `PROCEDURE` or `SMOKE`; several are comma-separated. |
+| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT`, `SUBQUERY`, `WINDOW`, `SETOPS`, `DERIVED`, `PROCEDURE`, `SCHEMA` or `SMOKE`; several are comma-separated. |
 | `--max-num-tables` | Tables per database, 1 to this (default 3). |
 | `--max-num-indexes` | CREATE INDEX statements per database, 0 to this (default 4). |
 | `--max-num-updates` | UPDATE statements per database, 0 to this (default 5). |
@@ -494,6 +496,32 @@ dropped is dropped when its database's name is next used.
 
 A failure reports the procedure, the call and the rows only one side returned. The reproducer creates the procedure,
 calls it and drops it again, so `--use-reducer` can reduce it.
+
+## The SCHEMA oracle
+
+SCHEMA (`oracle/VoltDBSchemaChangeOracle`) checks schema changes made in the middle of a run, and VoltDB's plan cache.
+It writes up to eight queries over one table, each a SELECT of columns or expressions with a WHERE clause half the
+time. It runs each query twice: the first run plans it, and the second runs the cached plan. Then it changes the table
+and runs the queries again; the catalog changed, so they need new plans. It undoes the change and runs them a fourth
+time. All four runs must return the same rows.
+
+The change is one of:
+
+- `CREATE INDEX` on one to three of the table's columns, undone by `DROP INDEX`. It can change every plan that reads
+  the table.
+- `ALTER TABLE t ADD COLUMN x type [DEFAULT d]`, undone by `DROP COLUMN`. It rewrites every row, so every row's new
+  value must be d, or NULL without a DEFAULT: `SELECT COUNT(*) FROM t WHERE x = d` must count every row. The types
+  include a VARCHAR(100) whose default VoltDB stores outside the tuple.
+- `ALTER TABLE t ALTER COLUMN c VARCHAR(n)` with a larger n, on a VARCHAR column outside the primary key and the
+  partitioning column. It isn't undone. It can move the column's values out of
+  the tuple when n crosses 63 bytes.
+
+Each catalog update blocks every partition, so the oracle changes the schema once per database, on its first check,
+and skips its later checks. Tables with a materialized view are left out: VoltDB refuses most changes to them. If VoltDB
+refuses a change, the check is skipped: this oracle checks query results, not which changes VoltDB allows.
+
+A failure has no reproducer: reducing the database's statements would lose the order of the queries and the change.
+The failure message holds the change, the undo and the query.
 
 ## The VIEWS oracle
 

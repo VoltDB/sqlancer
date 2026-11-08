@@ -32,18 +32,18 @@ import sqlancer.voltdb.gen.VoltDBExpressionGenerator;
  * every plan that reads the table;</li>
  * <li>{@code ALTER TABLE t ADD COLUMN x type [DEFAULT d]} (undone by {@code DROP COLUMN}), which moves no existing
  * column but rewrites every row; every row's new value must be d, or NULL without a DEFAULT;</li>
- * <li>{@code ALTER TABLE t ALTER COLUMN c VARCHAR(n)} with a larger n, on a VARCHAR column that no index or key holds
- * (not undone: VoltDB cannot shrink it back), which can move the column's values out of the tuple when n crosses 63
+ * <li>{@code ALTER TABLE t ALTER COLUMN c VARCHAR(n)} with a larger n, on a VARCHAR column outside the primary key and
+ * the partitioning column (not undone), which can move the column's values out of the tuple when n crosses 63
  * bytes.</li>
  * </ul>
  * VoltDB applies one catalog update at a time for the whole cluster, blocking every partition, so the oracle changes
  * the schema once per database (its first check) and skips its later checks.
  *
  * <p>
- * VoltDB refuses some changes, for example on a table with a materialized view or on a column an index holds; a refused
- * change skips the check, as this oracle checks query results, not which changes are allowed. A failure has no
- * reproducer, as reducing the database's statements would lose the order of the queries and the change; its message
- * holds the change and the query.
+ * If VoltDB refuses a change (tables with a materialized view are left out, as it refuses most changes to them), the
+ * check is skipped, as this oracle checks query results, not which changes are allowed. A failure has no reproducer, as
+ * reducing the database's statements would lose the order of the queries and the change; its message holds the change
+ * and the query.
  */
 public class VoltDBSchemaChangeOracle implements TestOracle<VoltDBGlobalState> {
 
