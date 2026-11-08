@@ -1155,7 +1155,35 @@ public final class VoltDBExpressionGenerator
         // ENG-30497 applies to ON conditions too: a later join's condition sees the null-extended rows of the outer
         // joins before it, as (t0.b OR t2.b) IS NOT NULL in t1 LEFT JOIN t2 ... FULL JOIN t0 ON ... did
         gen.hasOuterJoin = true;
-        return gen.generatePredicateWithColumn();
+        // ENG-30614: an outer join whose ON condition folds to FALSE returns no rows at all, not the preserved rows
+        // null-extended, so unless --avoid-known-bugs is false no AND, OR or NOT in an ON condition has a column-free
+        // operand, and nothing in it folds to a constant
+        for (int i = 0; i < 100; i++) {
+            VoltDBExpression condition = gen.generatePredicateWithColumn();
+            if (!avoidKnownBugs || !gen.hasConstantBooleanPart(condition)) {
+                return condition;
+            }
+        }
+        throw new IgnoreMeException();
+    }
+
+    // whether an operand of an AND, OR or NOT in the expression references no column
+    private boolean hasConstantBooleanPart(VoltDBExpression expr) {
+        if (expr instanceof VoltDBUnaryPrefixOperation && ((VoltDBUnaryPrefixOperation) expr)
+                .getOperatorRepresentation().equals(VoltDBUnaryPrefixOperator.NOT.getTextRepresentation())) {
+            VoltDBExpression operand = ((VoltDBUnaryPrefixOperation) expr).getExpr();
+            return !referencesColumn(operand) || hasConstantBooleanPart(operand);
+        }
+        if (expr instanceof VoltDBBinaryOperation) {
+            VoltDBBinaryOperation op = (VoltDBBinaryOperation) expr;
+            String text = op.getOperatorRepresentation();
+            if (text.equals(VoltDBBinaryOperator.AND.getTextRepresentation())
+                    || text.equals(VoltDBBinaryOperator.OR.getTextRepresentation())) {
+                return !referencesColumn(op.getLeft()) || !referencesColumn(op.getRight())
+                        || hasConstantBooleanPart(op.getLeft()) || hasConstantBooleanPart(op.getRight());
+            }
+        }
+        return false;
     }
 
     @Override
