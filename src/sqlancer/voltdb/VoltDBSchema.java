@@ -159,8 +159,9 @@ public class VoltDBSchema extends AbstractSchema<VoltDBGlobalState, VoltDBSchema
         try (ResultSet rs = md.getTables(null, null, null, new String[] { "TABLE" })) {
             while (rs.next()) {
                 String name = rs.getString("TABLE_NAME");
-                // compare in Java: '_' in the prefix is a LIKE wildcard
-                if (!name.startsWith(prefix)) {
+                // compare in Java: '_' in the prefix is a LIKE wildcard. The GEO oracle's table, whose GEOGRAPHY
+                // columns no other oracle reads, is left out
+                if (!name.startsWith(prefix) || name.equals(prefix + "GEO")) {
                     continue;
                 }
                 String remarks = rs.getString("REMARKS");
