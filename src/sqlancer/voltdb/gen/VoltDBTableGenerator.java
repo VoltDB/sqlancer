@@ -49,9 +49,17 @@ public final class VoltDBTableGenerator {
         Column partitionColumn = null;
         if (Randomly.getBoolean()) {
             int i = (int) Randomly.getNotCachedInteger(0, columns.size());
-            if (!columns.get(i).type.getType().isPartitionable()) {
-                columns.set(i, new Column(columns.get(i).name,
-                        VoltDBCompositeDataType.getRandom(VoltDBDataType.getRandomPartitionable()), true));
+            // ENG-30610: a single-partition query whose VARBINARY partitioning value is an inline literal (a join with
+            // a constant ON condition is not auto-parameterized) runs on the wrong partition, so unless
+            // --avoid-known-bugs is false no table is partitioned on a VARBINARY column
+            boolean avoid = globalState.getDbmsSpecificOptions().avoidKnownBugs;
+            VoltDBDataType type = columns.get(i).type.getType();
+            if (!type.isPartitionable() || avoid && type == VoltDBDataType.VARBINARY) {
+                VoltDBDataType partitionType;
+                do {
+                    partitionType = VoltDBDataType.getRandomPartitionable();
+                } while (avoid && partitionType == VoltDBDataType.VARBINARY);
+                columns.set(i, new Column(columns.get(i).name, VoltDBCompositeDataType.getRandom(partitionType), true));
             }
             partitionColumn = columns.get(i);
             partitionColumn.notNull = true;
