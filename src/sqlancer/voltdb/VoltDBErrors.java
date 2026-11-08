@@ -24,7 +24,11 @@ public final class VoltDBErrors {
             // the same while a node fails or rejoins (run-sqlancer.sh --kill-interval): VoltZK's catalog update
             // blocker refuses DDL, before it starts, while a rejoin, leader promotion, transaction repair or an
             // interrupted catalog update is in progress ("Can't do catalog update(@AdHoc) while ...")
-            "Can't do catalog update(@AdHoc) while" };
+            "Can't do catalog update(@AdHoc) while",
+            // another connection's catalog update (@UpdateCore) is still running; its blocker can be gone when the
+            // node that held it failed, so a DDL statement gets this far and is refused before it stages anything
+            // (UpdateApplicationBase). Seen once node 0 was among the nodes killed (milestone 15).
+            "@UpdateCore in progress" };
 
     /**
      * Errors a node failure causes while nodes are killed and rejoined during the run (--node-failures). A statement in
@@ -39,7 +43,10 @@ public final class VoltDBErrors {
             "failed, connection lost",
             // a DDL statement that one of the errors above interrupted can still commit after its client was told it
             // failed, so a later CREATE of the same name collides with an object the provider never saw
-            "object name already exists" };
+            "object name already exists",
+            // a call in flight on the connection to a node that was killed (with --servers, the other connections
+            // carry the next calls)
+            "was lost before a response was received" };
 
     private VoltDBErrors() {
     }

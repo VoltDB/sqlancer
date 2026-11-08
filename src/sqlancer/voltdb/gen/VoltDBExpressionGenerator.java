@@ -932,18 +932,24 @@ public final class VoltDBExpressionGenerator
         }
     }
 
-    // a subquery's WHERE condition, which may reference the outer query's columns, or null
+    // a subquery's WHERE condition, which may reference the outer query's columns when correlated, or null
     private VoltDBExpression generateSubqueryWhere(VoltDBTable alias, int depth) {
+        return generateSubqueryWhere(alias, depth, true);
+    }
+
+    private VoltDBExpression generateSubqueryWhere(VoltDBTable alias, int depth, boolean correlated) {
         if (Randomly.getBooleanWithRatherLowProbability()) {
             return null;
         }
-        return inSubquery(alias, true, () -> generateExpression(Kind.BOOLEAN, depth + 1));
+        return inSubquery(alias, correlated, () -> generateExpression(Kind.BOOLEAN, depth + 1));
     }
 
     // EXISTS, IN, or a comparison with ANY or ALL. VoltDB's parser rejects IN inside an operand of a comparison or IN,
     // as for IN lists, and ANY and ALL with it, so there it is EXISTS.
+    // ENG-30600: an IN or = ANY subquery inside another subquery, whose left operand is a column of the outermost
+    // query, holds for every row; unless --avoid-known-bugs is false, a subquery inside a subquery is EXISTS.
     private VoltDBExpression generateSubqueryPredicate(int depth) {
-        if (comparandNesting > 0 || Randomly.getBoolean()) {
+        if (comparandNesting > 0 || subqueryNesting > 0 && avoidKnownBugs || Randomly.getBoolean()) {
             VoltDBTable table = Randomly.fromList(subqueryTables);
             VoltDBTable alias = aliasOf(table);
             return VoltDBSubquery.exists(table.getName(), alias, generateSubqueryWhere(alias, depth));
@@ -967,6 +973,15 @@ public final class VoltDBExpressionGenerator
             // has no subquery
             VoltDBExpression left = avoidKnownBugs ? withoutSubqueries(() -> generateComparand(k, depth))
                     : generateComparand(k, depth);
+            if (k == Kind.STRING && avoidKnownBugs && !referencesColumn(left)) {
+                // ENG-30549: the planner folds a comparison of two string constants ignoring trailing spaces, while
+                // the EE compares exactly; with a constant on both sides, the EXISTS form of the predicate (see
+                // existsRewrite) is folded and the subquery form is not, so the left operand reads a column
+                if (!canGenerateColumnOfType(Kind.STRING)) {
+                    throw new IgnoreMeException();
+                }
+                left = generateColumn(Kind.STRING);
+            }
             VoltDBTable alias = aliasOf(table);
             // ENG-30594: a subquery in the output of an IN or = ANY subquery crashes the planner (NullPointerException
             // on "m_subqueryNode"), so unless --avoid-known-bugs is false the output has none
@@ -977,7 +992,10 @@ public final class VoltDBExpressionGenerator
             VoltDBExpression output = avoidKnownBugs
                     ? withoutSubqueries(() -> inSubquery(alias, correlated, () -> generateExpression(k, depth + 1)))
                     : inSubquery(alias, correlated, () -> generateExpression(k, depth + 1));
-            VoltDBExpression where = generateSubqueryWhere(alias, depth);
+            // ENG-30601 (comment): a bound on an indexed column of the subquery's table, then an equality with an outer
+            // column, loses the bound; the EXISTS form (existsRewrite) puts x op e next to the WHERE condition, so
+            // unless --avoid-known-bugs is false the WHERE condition of an IN, ANY or ALL subquery is not correlated
+            VoltDBExpression where = generateSubqueryWhere(alias, depth, !avoidKnownBugs);
             if (Randomly.getBoolean()) {
                 return VoltDBSubquery.inSet(left, Randomly.getBoolean(), table.getName(), alias, output, where);
             }
@@ -1019,8 +1037,12 @@ public final class VoltDBExpressionGenerator
         VoltDBExpression c = new VoltDBBinaryOperation(s.getLeft(), s.getOutput(), op);
         VoltDBExpression condition = all ? new VoltDBBinaryOperation(isNull(c),
                 new VoltDBUnaryPrefixOperation(c, VoltDBUnaryPrefixOperator.NOT), VoltDBBinaryOperator.OR) : c;
+        // ENG-30601: in q AND x = e, an upper bound on e's indexed column in q is dropped when x = e becomes the
+        // unique index lookup; with the comparison first it is kept, so unless --avoid-known-bugs is false the
+        // comparison comes first
         VoltDBExpression where = s.getWhere() == null ? condition
-                : new VoltDBBinaryOperation(s.getWhere(), condition, VoltDBBinaryOperator.AND);
+                : avoidKnownBugs ? new VoltDBBinaryOperation(condition, s.getWhere(), VoltDBBinaryOperator.AND)
+                        : new VoltDBBinaryOperation(s.getWhere(), condition, VoltDBBinaryOperator.AND);
         VoltDBExpression exists = VoltDBSubquery.exists(s.getTableName(), s.getAlias(), where);
         return all ? new VoltDBUnaryPrefixOperation(exists, VoltDBUnaryPrefixOperator.NOT) : exists;
     }
@@ -1291,11 +1313,16 @@ public final class VoltDBExpressionGenerator
         return generatePredicateWithColumn();
     }
 
+    // whether the expression references a column in scope
+    private boolean referencesColumn(VoltDBExpression expr) {
+        String text = VoltDBToStringVisitor.asString(expr);
+        return columns.stream().anyMatch(c -> text.contains(c.getFullQualifiedName()));
+    }
+
     private VoltDBExpression generatePredicateWithColumn() {
         for (int i = 0; i < 100; i++) {
             VoltDBExpression predicate = generateExpression(Kind.BOOLEAN);
-            String text = VoltDBToStringVisitor.asString(predicate);
-            if (columns.stream().anyMatch(c -> text.contains(c.getFullQualifiedName()))) {
+            if (referencesColumn(predicate)) {
                 return predicate;
             }
         }

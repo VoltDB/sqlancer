@@ -141,8 +141,14 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
         }
         // the published voltdbclient jar does not register the driver through java.sql.Driver
         Class.forName("org.voltdb.jdbc.Driver");
-        Connection con = DriverManager.getConnection(String.format("jdbc:voltdb://%s:%d", host, port),
-                globalState.getOptions().getUserName(), globalState.getOptions().getPassword());
+        // With --servers the driver connects to every node and sends each call through any live connection, so a node
+        // failure costs only the calls in flight on that node; topologychangeaware reconnects to a node once it has
+        // rejoined
+        String servers = globalState.getDbmsSpecificOptions().servers;
+        String url = servers == null || servers.isBlank() ? String.format("jdbc:voltdb://%s:%d", host, port)
+                : "jdbc:voltdb://" + servers.trim() + "?topologychangeaware=true";
+        Connection con = DriverManager.getConnection(url, globalState.getOptions().getUserName(),
+                globalState.getOptions().getPassword());
         SQLConnection sqlCon = new VoltDBConnection(con, globalState.getDbmsSpecificOptions().retrySeconds,
                 globalState.getDbmsSpecificOptions().nodeFailures);
         List<String[]> leftover = VoltDBSchema.getTables(((VoltDBConnection) sqlCon).getMetaData(),

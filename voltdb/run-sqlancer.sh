@@ -28,7 +28,7 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
                      ephemeral ports Linux and macOS give outgoing connections)
   --results DIR      where the run's directory is created (default ./sqlancer-results)
   --use-reducer      reduce each failure with SQLancer's statement reducer
-  --kill-interval S  every S seconds, kill a node other than node 0 with kill -9 and restart it,
+  --kill-interval S  every S seconds, kill a random node, node 0 included, with kill -9 and restart it,
                      which rejoins it to the cluster (default 0: never). Needs --kfactor 1 or more.
   --keep-cluster     leave the cluster running and its data in place after the run
   -h, --help         this help
@@ -123,6 +123,20 @@ fi
 # Ports: node i uses port_base + 10*i + 0..5 for client, admin, internal, zookeeper, replication and metrics
 port() { echo $((port_base + 10 * $1 + $2)); }
 client_port() { port "$1" 0; }
+# every node's address, as a comma-separated list: hosts() internal for the cluster's host list, hosts client for
+# SQLancer's connections
+hosts() {
+    local list= i
+    for ((i = 0; i < nodes; i++)); do
+        list+="${list:+,}localhost:$("$1_port" $i)"
+    done
+    echo "$list"
+}
+# SQLancer connects to every node (--servers), so that it keeps running while any one of them is down; --host and
+# --port remain for the run's other uses of SQLancer's options
+if [ "$nodes" -gt 1 ]; then
+    provider_args+=(--servers "$(hosts client)")
+fi
 admin_port() { port "$1" 1; }
 internal_port() { port "$1" 2; }
 
@@ -236,7 +250,8 @@ start_node() {
     # in the foreground under nohup: "voltdb start --background" allows one server per user (a shared PID file).
     # In a subshell, so that the server is not one of this script's jobs and its kill -9 is not reported. The
     # launcher execs the server's JVM, so the PID it starts with is the server's, which node<i>.pid records.
-    (nohup "$voltdb_home/bin/voltdb" start -D "$cluster/node$1" -c "$nodes" -H "localhost:$(internal_port 0)" \
+    # Every node gets the whole host list, so that a restarted node, node 0 included, finds a live one to rejoin through
+    (nohup "$voltdb_home/bin/voltdb" start -D "$cluster/node$1" -c "$nodes" -H "$(hosts internal)" \
         --client="$(client_port $1)" --admin="$(admin_port $1)" --internal="$(internal_port $1)" \
         --zookeeper="$(port $1 3)" --replication="$(port $1 4)" --metrics="$(port $1 5)" \
         >"$2" 2>&1 &
@@ -276,8 +291,8 @@ sqlancer_args=(--num-threads "$threads" --num-tries "$threads" --timeout-seconds
 $use_reducer && sqlancer_args+=(--use-reducer)
 # --- node failures -----------------------------------------------------------------------------------------------
 
-# Every kill_interval seconds: kill -9 a random node other than node 0, which SQLancer connects to, wait until its
-# client port closes, restart it and wait until it has rejoined. Each event is a line of chaos.log; a rejoin that
+# Every kill_interval seconds: kill -9 a random node, node 0 included (SQLancer is connected to every node), wait
+# until its client port closes, restart it and wait until it has rejoined. Each event is a line of chaos.log; a rejoin that
 # does not complete within 600 s ends the loop and fails the run. The loop stops when $results/chaos.stop exists,
 # after the node it is handling has rejoined, so the run ends with every node up.
 # rejoin_node I N: restarts node I after kill N and waits until it has rejoined, up to 600 s. A restart that exits
@@ -313,7 +328,7 @@ chaos_loop() {
             [ -e "$results/chaos.stop" ] && return 0
             sleep 1
         done
-        i=$((1 + RANDOM % (nodes - 1)))
+        i=$((RANDOM % nodes))
         n=$((n + 1))
         # the PID start_node recorded; a pattern match on the command line is not reliable, as the server's command
         # line carries a long classpath before its voltdbroot directory
@@ -341,7 +356,7 @@ if [ "$kill_interval" -gt 0 ]; then
     : >"$results/chaos.log"
     chaos_loop &
     chaos_pid=$!
-    log "Killing and rejoining a node other than node 0 every $kill_interval s (chaos.log)"
+    log "Killing and rejoining a random node every $kill_interval s (chaos.log)"
 fi
 
 log "Running SQLancer for $duration s: oracles $oracles, seed $seed, $threads threads"

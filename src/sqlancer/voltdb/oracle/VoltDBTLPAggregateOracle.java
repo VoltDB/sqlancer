@@ -34,7 +34,9 @@ import sqlancer.voltdb.gen.VoltDBExpressionGenerator;
  */
 public class VoltDBTLPAggregateOracle implements TestOracle<VoltDBGlobalState> {
 
-    // the relative difference two FLOAT SUMs may have, as they add the same values in a different order
+    // the difference two FLOAT SUMs may have, as they add the same values in a different order, relative to the
+    // largest magnitude among them and the partitions' SUMs: when large terms cancel, the rounding error is relative
+    // to the terms, not to the small result (lab build #25: partitions of +-1.49e9 summing to 2.53, off by 1e-6)
     private static final double FLOAT_TOLERANCE = 1e-9;
 
     private final VoltDBGlobalState state;
@@ -215,13 +217,19 @@ public class VoltDBTLPAggregateOracle implements TestOracle<VoltDBGlobalState> {
     }
 
     static boolean same(Object a, Object b) {
+        return same(a, b, 0);
+    }
+
+    // magnitude: the largest absolute value of the FLOAT values combined into a or b, which bounds their rounding
+    static boolean same(Object a, Object b, double magnitude) {
         if (a == null || b == null) {
             return a == b;
         }
         if (a instanceof Double || b instanceof Double) {
             double x = ((Number) a).doubleValue();
             double y = ((Number) b).doubleValue();
-            return x == y || Math.abs(x - y) <= FLOAT_TOLERANCE * Math.max(Math.abs(x), Math.abs(y));
+            double scale = Math.max(magnitude, Math.max(Math.abs(x), Math.abs(y)));
+            return x == y || Math.abs(x - y) <= FLOAT_TOLERANCE * scale;
         }
         return compare(a, b) == 0;
     }
@@ -262,7 +270,13 @@ public class VoltDBTLPAggregateOracle implements TestOracle<VoltDBGlobalState> {
 
         boolean differs() {
             for (int i = 0; i < original.size(); i++) {
-                if (!same(original.get(i), combined.get(i))) {
+                double magnitude = 0;
+                for (List<Object> p : partitions) {
+                    if (p.get(i) instanceof Double) {
+                        magnitude = Math.max(magnitude, Math.abs((Double) p.get(i)));
+                    }
+                }
+                if (!same(original.get(i), combined.get(i), magnitude)) {
                     return true;
                 }
             }

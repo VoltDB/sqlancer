@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 14.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 15.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -14,7 +14,8 @@ can kill and rejoin nodes while SQLancer runs (`--kill-interval`), which the nig
 milestone 13 the nightly job also runs a third cluster shape: 3 nodes with k=2 and 2 sites per host. Since
 milestone 14 expressions also hold subqueries (EXISTS, IN, ANY, ALL and scalar subqueries), the SUBQUERY oracle checks
 IN, ANY and ALL against EXISTS, and the WINDOW oracle checks window functions; see
-[Subqueries and window functions](#subqueries-and-window-functions).
+[Subqueries and window functions](#subqueries-and-window-functions). Since milestone 15 node failures include node 0:
+SQLancer connects to every node.
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -71,7 +72,7 @@ voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 -
 | `--port-base N` | 30000 | The cluster's first port. Node *i* uses the 6 ports from N + 10*i (client, admin, internal, zookeeper, replication, metrics). The script refuses to start if any is in use, and it never touches other servers. The default is below the ephemeral ports Linux and macOS give outgoing connections, one of which can take a killed node's port before it restarts. |
 | `--results DIR` | `./sqlancer-results` | Where the run's directory is created. |
 | `--use-reducer` | off | Reduce each failure before saving it (see [Reducing a failure](#reducing-a-failure)). |
-| `--kill-interval SECS` | 0 (never) | Every SECS seconds, kill a node other than node 0 with `kill -9`, restart it and wait until it has rejoined (see [Node failures](#node-failures)). Needs k-safety 1 or more. |
+| `--kill-interval SECS` | 0 (never) | Every SECS seconds, kill a random node, node 0 included, with `kill -9`, restart it and wait until it has rejoined (see [Node failures](#node-failures)). Needs k-safety 1 or more. |
 | `--keep-cluster` | off | Leave the cluster running, with its data, after the run. |
 | `-- ...` | | Everything after `--` goes to the provider, for example `-- --avoid-known-bugs false`. |
 
@@ -103,7 +104,12 @@ machine if each has its own `--port-base`.
 With `--kill-interval SECS`, the script kills a node every SECS seconds while SQLancer runs, and the oracles keep
 checking query results through the failures:
 
-1. It picks a node other than node 0 at random. SQLancer connects to node 0 only, so its connections survive.
+1. It picks a node at random, node 0 included. With more than one node, the script passes the provider
+   `--servers` with every node's client port, and the JDBC URL lists them all with `topologychangeaware=true`: the
+   driver connects to each node and sends every call through a live connection, so SQLancer keeps working while any one
+   node is down, and reconnects to a node once it has rejoined. Every node also starts with the whole host list
+   (`voltdb start -H`), so a restarted node 0 rejoins through another node. Until milestone 15, SQLancer connected to
+   node 0 alone, and node 0 was never killed.
 2. It kills the node's server with `kill -9`, waits until its client port closes, and waits 5 seconds more for the
    survivors to notice.
 3. It restarts the node with the same `voltdb start` command, which rejoins it to the running cluster: it gets its
@@ -128,6 +134,8 @@ handle the errors a node failure causes:
 | `The errors for @VerifyCatalogAndWriteJar from host N: Host N failed, connection lost` | A DDL statement's catalog update was waiting on the dead node. | The same. |
 | `object name already exists` | A DDL statement that a failure interrupted committed after all, so a later CREATE of the same name collides with a table or index the provider never saw. | Skips, as above. Without `--node-failures` this fails the run, as it would be a provider bug. |
 | `Catalog has been updated. The planner is outdated.`, `... was no longer live`, `Ad Hoc Planner task queue is full` | The statement was planned while a catalog update, frequent around a rejoin, replaced the planner, or the planner was busy. VoltDB rejects it before running it. | Retries it, with or without `--node-failures`, like a concurrent schema change. |
+| `@UpdateCore in progress` | Another connection's catalog update is still running. Its blocker can be gone when the node that held it failed, so a DDL statement gets as far as staging and is refused there, before it changes anything. Found by the lab once node 0 was killed too (milestone 15). | Retries the statement, like a concurrent schema change. |
+| `Connection to database host (localhost) was lost before a response was received` | The statement was in flight on the connection to the node that was killed; it may have committed. The driver sends the next calls through the other connections. | Skips, as for a change in mastership. |
 | `Can't do catalog update(@AdHoc) while ...`: a node rejoin, leader promotion or transaction repair, or a catalog update transaction, is in progress | VoltDB's catalog update blocker (`VoltZK`) refuses DDL until the failure is handled and the rejoin is done. | Retries the statement, like a concurrent schema change, for up to `--retry-seconds`. VoltDB rejects it before running it. |
 
 Without `--node-failures`, these errors fail the run as before. The OPS timeout makes each failure cost up to a minute
@@ -223,6 +231,7 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | `--max-num-views` | CREATE VIEW statements per database, 0 to this (default 2). |
 | `--retry-seconds` | How long a statement rejected because of another thread's schema change is retried (default 120). |
 | `--avoid-known-bugs` | `true` (the default) keeps the generator away from the VoltDB bugs listed below, so a failure is something new. `false` generates them too. |
+| `--servers` | Comma-separated `host:port` client addresses of every node. SQLancer connects to all of them (instead of `--host` and `--port`), so it keeps working while any one node is down. `run-sqlancer.sh` passes it for more than one node. |
 
 ## Reading the results
 
@@ -515,9 +524,10 @@ and WINDOW (its WHERE clause) may hold subqueries:
   for comparisons, one numeric or temporal domain;
 - `(SELECT MIN(e) | MAX(e) | COUNT(*) FROM t AS s [WHERE q])`, a scalar subquery, in place of a value.
 
-The WHERE condition q references the outer query's columns (a correlated subquery), and so does the output e while
-`--avoid-known-bugs` is false (ENG-30597 below). A
-subquery can hold another, two deep. Each reads one table under its own alias (`S0`, `S1`, ...), which may be the outer
+The WHERE condition q references the outer query's columns (a correlated subquery), except in an IN, ANY or ALL
+subquery, and so does the output e, while `--avoid-known-bugs` is false (ENG-30597 and ENG-30601 below); EXISTS
+subqueries are correlated either way. A
+subquery can hold another, two deep (EXISTS only while `--avoid-known-bugs` is true: ENG-30600). Each reads one table under its own alias (`S0`, `S1`, ...), which may be the outer
 query's table too. PQS, PARAMS, VIEWS and LIMIT generate no subqueries, and a generator with subqueries off makes the
 same random choices as before milestone 14.
 
@@ -538,10 +548,10 @@ IN):
 
 | Subquery | Written with EXISTS |
 | --- | --- |
-| `x IN (SELECT e FROM t AS s WHERE q)`, `x op ANY (...)` | `EXISTS (SELECT 1 FROM t AS s WHERE q AND c)` |
-| `x NOT IN (...)` (that is, `x <> ALL`), `x op ALL (...)` | `NOT EXISTS (SELECT 1 FROM t AS s WHERE q AND (c IS NULL OR NOT c))` |
+| `x IN (SELECT e FROM t AS s WHERE q)`, `x op ANY (...)` | `EXISTS (SELECT 1 FROM t AS s WHERE c AND q)` |
+| `x NOT IN (...)` (that is, `x <> ALL`), `x op ALL (...)` | `NOT EXISTS (SELECT 1 FROM t AS s WHERE (c IS NULL OR NOT c) AND q)` |
 
-The two hold, are TRUE, for the same rows, whatever is NULL and whether the subquery is empty; where either is FALSE or
+(c comes before q because of ENG-30601 below.) The two hold, are TRUE, for the same rows, whatever is NULL and whether the subquery is empty; where either is FALSE or
 NULL makes no difference to a WHERE clause. The predicate is the whole WHERE clause, or ANDed with a random predicate.
 VoltDB plans an IN subquery by turning it into EXISTS itself, moving x into the subquery, so this checks that rewrite.
 The query reads the FROM clauses and joins of TLP WHERE, and outputs a random subset of their columns.
@@ -722,7 +732,7 @@ in every query, which only an oracle that computes values outside VoltDB sees; E
 | ENG-30551 | **Node crash.** A FLOAT constant in the subnormal range (such as `1.0E-309`, written or folded from `0.28E0 / 1.79E308`) in a statement that is not parameterized makes the plan fail to load ("JSON parse failure"); running it again after any DDL crashes the node with SIGSEGV in `ExecutorContext::cleanupAllExecutors`. Found by PQS in the 30-minute 3-node acceptance run. Critical. | No subnormal FLOAT literals are generated, and PQS never sends an expression of constants that folds to one. |
 | ENG-30552 | The string literal `'\N'` in ad hoc SQL becomes NULL, apparently because a parameter string `\N` is read as the NULL token: INSERT stores NULL, `SELECT '\N'` and the folded `'\' \|\| 'N'` return NULL. Found by PQS in the 30-minute 3-node acceptance run. Wrong result, lost data. | The constant generator never writes `'\N'`, and PQS never sends an expression of constants that is `\N`. |
 | ENG-30550 | ABS of a BIGINT multiplication is typed DECIMAL, so a division inside or after it keeps a fraction: `ABS((b * 1) / 2)` is 3.5 for `b = 7`, while `(b * 1) / 2` is 3. More generally ABS pushes a DECIMAL or FLOAT argument's type into an integer division inside it: `ABS((7 / i) - d)` divides 7 by 2 as 3.5 (comment on the ticket). Found by PQS in 5- and 10-minute trials. Wrong result. | No multiplication or division inside ABS. |
-| ENG-30549 | The planner folds a comparison of two string constants ignoring trailing spaces (`'a' = 'a '` is TRUE), while the EE compares exactly. Found by PQS. Wrong result. | PQS does not check a folded string comparison that trailing spaces decide. |
+| ENG-30549 | The planner folds a comparison of two string constants ignoring trailing spaces (`'a' = 'a '` is TRUE), while the EE compares exactly. Found by PQS. Wrong result. | PQS does not check a folded string comparison that trailing spaces decide. The left operand of a string IN, ANY or ALL subquery reads a column (milestone 15: SUBQUERY found it, as the EXISTS form of `' ' <> ALL (SELECT '' ...)` folds and the subquery form does not). |
 
 The bugs below were found by the nightly lab job's first runs in milestone 7, or while reducing what they found.
 
@@ -781,6 +791,14 @@ The bugs below were found in milestone 14, by subqueries and the SUBQUERY oracle
 | ENG-30597 | With GROUP BY and an aggregate, an ALL or IN subquery whose output is a column of the outer query fails: `<> ALL` in the EE ("invalid column type 'INVALID'", or a garbage type such as 'UNKNOWN[-47]'), IN in the planner (IndexOutOfBoundsException in `rewriteInSubqueryAsExists`). Found by TLP DISTINCT. | The output of an IN, ANY or ALL subquery reads only the subquery's own columns. |
 | ENG-16927 (comment) | An old bug, open since 2019: any subquery in the string argument of SUBSTRING or TRIM crashes the SQL parser (NullPointerException in `QueryExpression.getColumns`). Other functions of a subquery work. Found by TLP AGGREGATE. | SUBSTRING's string argument has no subquery (and TRIM is already written `LTRIM(RTRIM(x))`). |
 | ENG-30497 (comment) | The milestone 2 bug, through subqueries: NOT IN, `<> ALL` and a correlated NOT EXISTS over an outer join's inner table turn the join into an inner join, though each can be TRUE for the null-extended row. `oa LEFT JOIN ob ... WHERE NOT EXISTS (SELECT 1 FROM ob AS s WHERE s.x = ob.x)` loses the unmatched rows. Found by TLP WHERE. Wrong result. | No subquery predicates with an outer join. |
+
+The bugs below were found by milestone 14's oracles in milestone 15's lab runs. ENG-30602 is not reproducible on demand and has no workaround: a multi-partition SELECT once failed with "Column count mismatch. Expecting 3, but 1 given" and a one-column `modified_tuples` table, as if it had received a DML statement's fragment result (once in 175,000 checks). If it recurs, the nightly run fails on it.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30599 | A window's `ORDER BY ... DESC` is applied ascending when an equality on its PARTITION BY column makes the planner use an index on (partition column, order column): `RANK() OVER (PARTITION BY a ORDER BY b DESC) ... WHERE a = 1` ranks the smallest b first. The plan is a forward range scan with no sort; `a >= 1` gets a reverse scan and is right. Found by WINDOW. Wrong result. | A window with a PARTITION BY orders ascending. |
+| ENG-30601 | `WHERE t.k < c AND t.k = u.j`, with k indexed (unique or not), drops the upper bound when the join equality becomes the unique index lookup (the plan's `uniquely match` has no filter); `t.k = u.j AND t.k < c` keeps it. Found by SUBQUERY, as the EXISTS form of an IN subquery on a primary key. Wrong result. | In the SUBQUERY oracle's EXISTS form, the comparison comes before the subquery's WHERE condition, and the WHERE condition of an IN, ANY or ALL subquery is not correlated (a non-unique index and an equality in that condition did it too: comment on the ticket). Other queries can still meet it. |
+| ENG-30600 | An IN or `= ANY` subquery inside another subquery, whose left operand is a column of the outermost query, holds for every row: `A WHERE EXISTS (SELECT 1 FROM B AS S1 WHERE A.k IN (SELECT S2.k FROM B AS S2))` returns all of A, NULLs included. NOT IN and the same written with EXISTS are right. Found by SUBQUERY. Wrong result. | A subquery inside a subquery is EXISTS. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
