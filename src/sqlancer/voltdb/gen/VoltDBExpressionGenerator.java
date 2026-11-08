@@ -203,9 +203,14 @@ public final class VoltDBExpressionGenerator
         Randomly r = state.getRandomly();
         switch (choice) {
         case DATEADD:
-            return new VoltDBFunction(List.of(
-                    new VoltDBKeyword(Randomly.fromOptions("YEAR", "QUARTER", "MONTH", "DAY", "HOUR", "MINUTE",
-                            "SECOND", "MILLISECOND", "MICROSECOND")),
+            // ENG-30611: DATEADD(YEAR, n, d) on a DATE February 29 into a non-leap year is an error, and with a DATE
+            // literal it aborts the server; unless --avoid-known-bugs is false, there is no YEAR (MONTH clamps)
+            String unit;
+            do {
+                unit = Randomly.fromOptions("YEAR", "QUARTER", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
+                        "MILLISECOND", "MICROSECOND");
+            } while (avoidKnownBugs && unit.equals("YEAR"));
+            return new VoltDBFunction(List.of(new VoltDBKeyword(unit),
                     Randomly.getBoolean() ? integerConstant(r.getInteger(-400, 400)) : generateIntegerOperand(),
                     generateExpression(Kind.TEMPORAL, depth + 1)), VoltDBFunctionName.DATEADD);
         case TRUNCATE:
