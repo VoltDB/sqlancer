@@ -1029,6 +1029,7 @@ result=PASS
     echo "nodes down at the end: ${down[*]:-none}"
     echo "FATAL lines in server logs: $fatal"
     # ENG-30602: failures that did not recur when rerun at once (VoltDBTransientCheck), counted, not failed
+    grep -m1 "^PLANS compared different plans:" "$results/sqlancer/out.log" 2>/dev/null
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
     [ "$crash_interval" -gt 0 ] && echo "crashes: $crashes crashes, $recoveries recoveries$($crash_failed && echo ", a recovery FAILED (crash.log)")"

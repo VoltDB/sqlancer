@@ -33,7 +33,8 @@ it can run two clusters linked by XDCR (`--xdcr`), and the XDCR oracle checks th
 Since milestone 24 it can start the cluster on the last release and upgrade it in service, one node at a time, while
 SQLancer runs (`--upgrade-from`); see [In-service upgrades](#in-service-upgrades). Since milestone 25,
 `voltdb/run-repros.sh` reruns the minimal reproduction of every bug the provider found, and the nightly job reports
-which are fixed; see [Bug reproductions](#bug-reproductions).
+which are fixed; see [Bug reproductions](#bug-reproductions). Since milestone 26 the PLANS oracle checks that the
+same query planned two ways returns the same rows; see [The PLANS oracle](#the-plans-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -384,7 +385,7 @@ the kit's runtime JDK and makes seven runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all nineteen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
 | `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
 | `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
@@ -833,6 +834,32 @@ in DIR beside the cluster, on the port slot after the last node's, k=0 with the 
 runs on: 16.0.0 needs Java 17 or 21 and exits at once on Java 25 ("Unsupported openjdk version"), so the lab job
 passes `/opt/oracle_java21`. A mirror that exits stops the run at once, with the last line of its start log.
 
+## The PLANS oracle
+
+Differential query plans (DQP, after Ba and Rigger, SIGMOD 2024): the same query, planned two ways, must return the same
+rows. PLANS generates a query, with columns and a WHERE clause over the FROM clauses and joins the other oracles use,
+and changes how VoltDB can plan it without changing what it means:
+
+| Change | What it does to the plan |
+| --- | --- |
+| index off | A numeric column the WHERE clause reads becomes `(c + 0)` there. VoltDB can use it neither for an index scan nor to send the query to one partition, so an index scan becomes a sequential scan, or a single-partition plan a multi-partition one. |
+| join order | The FROM list of an inner join, reversed (the selected columns stay in their order). |
+| index on | At most once per database: `CREATE INDEX` on a column the WHERE clause reads, the query run again, the index dropped. |
+
+PLANS asks `@Explain` for both plans and compares their nodes (EXPLAIN's lines that start with a capital letter: the
+scans, joins, sends and receives, without their predicates). When the plans have the same nodes, it skips the check
+without running the queries; otherwise it compares the two queries' rows as multisets, FLOATs to 12 significant
+digits, and a failure shows both queries and both plans. Only numeric columns are wrapped: the identities of the other
+types run into known bugs (`v || ''` is NULL when v is '', ENG-30546). At exit, PLANS prints the number of checks that
+compared different plans, of each kind, and of those it skipped as the same plan; the summary has the line.
+
+Most checks keep their plan: wrapping a column changes nothing when no index covers it and the query reads every
+partition anyway. In 5-minute trials of PLANS alone, 1 node compared 116 index-off, 98 join-order and 5 index-on pairs
+of plans (4,154 skipped), and 3 nodes 95, 53 and 3 (2,920 skipped).
+
+CERT-style checks (a more restrictive query must not get a larger estimated row count) do not apply: VoltDB's plans
+carry no row estimates in EXPLAIN or EXPLAINJSON, and its planner estimates from fixed table sizes, not from the data.
+
 ## The VIEWS oracle
 
 VIEWS (`oracle/VoltDBViewOracle`) checks VoltDB's materialized views, which it keeps up to date as their tables
@@ -1251,6 +1278,12 @@ The bugs below were found in milestone 21.
 | --- | --- | --- |
 | ENG-30622 | An elastic remove hangs for good at "Building index for data migration" when a table is dropped while it streams its index snapshot: the hosts being removed log "No table streamer of Type TABLE_STREAM_ELASTIC_INDEX" and "Snapshot of table ... failed to complete", and `voltadmin resize --status` stays at "Planning data migration". Also on 16.0.0. Found by a local `--resize-interval` trial, where SQLancer's cleanup of an old database dropped its tables during a shrink; a script reproduces it in a few cycles. Critical. | DDL waits during each shrink (`--ddl-hold`). |
 | ENG-30229 (existing) | System requests time out for 60 seconds during an elastic join, as during a rejoin, and the JDBC metadata calls with them. | The connection retries them for up to 150 seconds. |
+
+The bugs below were found in milestone 26.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30626 | `MOD(x, c + 1)` inside LN, SQRT or EXP fails with "unsupported non-integral or non-decimal type for SQL MOD function": the literal, made a parameter, seems to take FLOAT from the outer function. `MOD(20, c)`, `MOD(20, c + c)` and `ABS(MOD(20, c + 0))` are right. Also on 16.0.0. Found by PLANS, which writes `(c + 0)`. | PLANS leaves a WHERE clause with MOD as it is. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
