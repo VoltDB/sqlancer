@@ -36,7 +36,8 @@ SQLancer runs (`--upgrade-from`); see [In-service upgrades](#in-service-upgrades
 which are fixed; see [Bug reproductions](#bug-reproductions). Since milestone 26 the PLANS oracle checks that the
 same query planned two ways returns the same rows; see [The PLANS oracle](#the-plans-oracle). Since milestone 28 the
 run script can enable security (`--security`), and the PERMS oracle checks what users may and may not do; see
-[The PERMS oracle](#the-perms-oracle).
+[The PERMS oracle](#the-perms-oracle). Since milestone 29 the STREAMS oracle checks export streams and their views, and
+`--export` checks that every row a stream got was exported; see [The STREAMS oracle](#the-streams-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -101,6 +102,7 @@ voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 -
 | `--upgrade-java-home DIR` | the environment's | JAVA_HOME for the older kit's nodes (16.0.0 needs Java 17 or 21). |
 | `--upgrade-at SECS` | a third of `--duration` | When the upgrade starts. |
 | `--security` | off | Enable security: SQLancer connects as the administrator `sqlancer`, and the PERMS oracle runs statements as the users `reader` (role `sqlancer_read`, SQLREAD) and `writer` (role `sqlancer_write`, SQL); see [The PERMS oracle](#the-perms-oracle). Does not mix with the node failure, resize, crash, XDCR and upgrade options. |
+| `--export` | off | Add a file export target, `sqlancer` (CSV, into the cluster directory), for the STREAMS oracle's streams, and check at the end that every row they got was exported (see [The STREAMS oracle](#the-streams-oracle)). |
 | `--keep-cluster` | off | Leave the cluster running, with its data, after the run. |
 | `-- ...` | | Everything after `--` goes to the provider, for example `-- --avoid-known-bugs false`. |
 
@@ -388,9 +390,9 @@ the kit's runtime JDK and makes seven runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-one (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-two (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
 | `sqlancer-1n-k0-security` | 1 node, 8 sites per host, security on (see [The PERMS oracle](#the-perms-oracle)); `sqlancer-1n-k0` until milestone 28 | the same | 45 minutes |
-| `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
+| `sqlancer-3n-k2-export-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all; the streams export (see [The STREAMS oracle](#the-streams-oracle)); `sqlancer-3n-k2-s2` until milestone 29 | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
 | `sqlancer-3n-k1-xdcr-s4` | Two clusters of 3 nodes, k=1, 4 sites per host, linked by XDCR (see [XDCR](#xdcr)) | the same | 45 minutes |
 | `sqlancer-3n-k1-upgrade` | 3 nodes, k=1, 8 sites per host, started on 16.0.0 and upgraded in service to the kit a third of the way in (see [In-service upgrades](#in-service-upgrades)) | the same | 45 minutes |
@@ -422,8 +424,8 @@ server.
 
 The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor[:chaos[:sites]]`, where chaos is the
 seconds between node failures, `r` and the seconds between elastic resizes, `c` and the seconds between crashes, or
-`x` for an XDCR pair, `u` for an in-service upgrade from `MIRROR_VERSION`, or `sec` for security, and sites the sites
-per host, default `3:1:300 1:0:sec 3:2:0:2 3:1:r120 3:1:x:4 3:1:u 3:1:c600`), `DURATION` (seconds
+`x` for an XDCR pair, `u` for an in-service upgrade from `MIRROR_VERSION`, `sec` for security, or `exp` for export, and
+sites the sites per host, default `3:1:300 1:0:sec 3:2:exp:2 3:1:r120 3:1:x:4 3:1:u 3:1:c600`), `DURATION` (seconds
 per run, default 2700), `ORACLES`, `SEED`, `EXTRA_ARGS` (provider options) and `SQLANCER_REF`. A run of the job alone
 needs a kit: give `releasedir`, for example `releases/one-offs/16.1.0-SNAPSHOT-master/<kit build>`.
 
@@ -882,6 +884,33 @@ update in progress before it checks a user's permission, so DDL can be refused w
 first; PERMS retries that until the permission error comes. At exit, PERMS prints how many allowed and refused
 statements it checked; the summary has the line. Without `--security`, it skips every check. In a 5-minute trial on
 1 node it checked 307 allowed and 283 refused statements.
+
+## The STREAMS oracle
+
+A stream cannot be read, so STREAMS puts each row into a stream and into a shadow table with the same columns, and
+checks the stream's materialized view against the same GROUP BY over the shadow table. Each database gets, at its
+first STREAMS check:
+
+```sql
+CREATE STREAM XS_DB0_ST PARTITION ON COLUMN k [EXPORT TO TARGET sqlancer] (k INTEGER NOT NULL, v BIGINT, s VARCHAR(16), f FLOAT);
+CREATE TABLE XS_DB0_SH (...the same columns...); PARTITION TABLE XS_DB0_SH ON COLUMN k;
+CREATE VIEW XS_DB0_SV (k, s, n, sv, mn, mx) AS SELECT k, s, COUNT(*), SUM(v), MIN(f), MAX(v) FROM XS_DB0_ST GROUP BY k, s;
+```
+
+(VoltDB requires a view of a partitioned stream to group by the partitioning column.) Each check inserts 1 to 20 rows,
+with NULLs now and then, into the stream and the shadow table, and compares the view with the GROUP BY. The names start
+with `XS_`, outside the database's own names, so no generator or other oracle touches them, and they stay for the run:
+a later database of the same name goes on with them, and no stream is dropped with rows still to export.
+
+With `--export`, the deployment adds a file export target, and the provider gets `--export-target sqlancer`, so the
+streams export to it. When SQLancer stops, the script runs `@Quiesce`, shuts the cluster down gracefully, which closes
+the export files (the file target writes some rows only when it rolls or closes a file, minutes after `@Quiesce`
+returns while many catalog updates run), and counts the distinct rows in them. That must equal the rows STREAMS
+inserted, which it prints at exit. Export is at least once: an identical line (the same transaction id and sequence
+number) counts once, and the summary reports how many were exported twice. A missing row fails the run.
+
+In a 5-minute trial on 3 nodes with k=2 and 2 sites per host, beside VIEWS, NoREC, TLP WHERE, DIFF and SCHEMA, STREAMS
+compared 1,548 views and all 15,695 rows were exported.
 
 ## The VIEWS oracle
 

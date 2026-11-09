@@ -18,6 +18,7 @@ import sqlancer.voltdb.oracle.VoltDBPlanOracle;
 import sqlancer.voltdb.oracle.VoltDBSchemaChangeOracle;
 import sqlancer.voltdb.oracle.VoltDBSetOperationOracle;
 import sqlancer.voltdb.oracle.VoltDBSmokeOracle;
+import sqlancer.voltdb.oracle.VoltDBStreamOracle;
 import sqlancer.voltdb.oracle.VoltDBSubqueryOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPAggregateOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPOracle;
@@ -135,6 +136,18 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBDurabilityOracle(globalState);
+        }
+    },
+
+    /**
+     * Streams: each row goes into a stream and a shadow table, and the stream's materialized view must match the same
+     * GROUP BY over the shadow table; with --export-target the streams are exported, and run-sqlancer.sh --export
+     * checks that every row was.
+     */
+    STREAMS {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBStreamOracle(globalState);
         }
     },
 
