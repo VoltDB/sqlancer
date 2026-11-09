@@ -1337,6 +1337,12 @@ The bugs below were found in milestone 26.
 | --- | --- | --- |
 | ENG-30626 | `MOD(x, c + 1)` inside LN, SQRT or EXP fails with "unsupported non-integral or non-decimal type for SQL MOD function": the literal, made a parameter, seems to take FLOAT from the outer function. `MOD(20, c)`, `MOD(20, c + c)` and `ABS(MOD(20, c + 0))` are right. Also on 16.0.0. Found by PLANS, which writes `(c + 0)`. | PLANS leaves a WHERE clause with MOD as it is. |
 
+The bugs below were found in milestone 29's lab run of the milestones before it.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
 The bugs below were found in milestone 28.
 
 | Ticket | Issue | Workaround |
