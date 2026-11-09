@@ -1057,7 +1057,10 @@ public final class VoltDBExpressionGenerator
         VoltDBTable alias = aliasOf(table);
         List<VoltDBAggregateFunction> functions = new ArrayList<>(
                 List.of(VoltDBAggregateFunction.MIN, VoltDBAggregateFunction.MAX));
-        if (kind == Kind.NUMERIC && numericDomain != NumericDomain.FLOAT) {
+        // ENG-30497 (comment): a COUNT(*) subquery correlated to an outer join's inner table is 0, not NULL, for the
+        // null-extended row, but VoltDB takes a comparison with it to reject NULLs and turns the join into an inner
+        // join; so unless --avoid-known-bugs is false, a scalar subquery with an outer join is a MIN or MAX
+        if (kind == Kind.NUMERIC && numericDomain != NumericDomain.FLOAT && !(hasOuterJoin && avoidKnownBugs)) {
             functions.add(VoltDBAggregateFunction.COUNT);
         }
         VoltDBAggregateFunction function = Randomly.fromList(functions);
