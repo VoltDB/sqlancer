@@ -7,6 +7,7 @@ import sqlancer.common.query.ExpectedErrors;
 import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 import sqlancer.voltdb.gen.VoltDBExpressionGenerator;
 import sqlancer.voltdb.oracle.VoltDBDerivedTableOracle;
+import sqlancer.voltdb.oracle.VoltDBGeographyOracle;
 import sqlancer.voltdb.oracle.VoltDBLimitOracle;
 import sqlancer.voltdb.oracle.VoltDBParameterOracle;
 import sqlancer.voltdb.oracle.VoltDBPivotedQuerySynthesisOracle;
@@ -107,6 +108,17 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBParameterOracle(globalState, expressionErrors());
+        }
+    },
+
+    /**
+     * GEOGRAPHY_POINT and GEOGRAPHY against geography computed in Java: coordinates, DISTANCE and CONTAINS, with and
+     * without a geography index, on a table of its own. Once per database.
+     */
+    GEO {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBGeographyOracle(globalState, expressionErrors());
         }
     },
 

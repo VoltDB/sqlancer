@@ -41,6 +41,7 @@ import sqlancer.voltdb.ast.VoltDBExpression;
 import sqlancer.voltdb.ast.VoltDBFunction;
 import sqlancer.voltdb.ast.VoltDBInOperation;
 import sqlancer.voltdb.ast.VoltDBJoin;
+import sqlancer.voltdb.ast.VoltDBKeyword;
 import sqlancer.voltdb.ast.VoltDBSelect;
 import sqlancer.voltdb.ast.VoltDBUnaryPostfixOperation;
 import sqlancer.voltdb.ast.VoltDBUnaryPrefixOperation;
@@ -344,6 +345,9 @@ public class VoltDBParameterOracle implements TestOracle<VoltDBGlobalState> {
 
         // expr is an operand of parent, beside the operand sibling (null when it has none of interest)
         private void visit(VoltDBExpression expr, VoltDBExpression parent, VoltDBExpression sibling) {
+            if (expr instanceof VoltDBKeyword) {
+                return; // a function's unit, such as DAY in DATEADD(DAY, n, t): never a parameter
+            }
             if (avoidKnownBugs && !(expr instanceof VoltDBConstant) && VoltDBExpressionEvaluator.isConstant(expr)
                     && (parent == null || !VoltDBExpressionEvaluator.isConstant(parent))) {
                 // ENG-30551: a statement with parameters keeps its other constants inline, and an expression of

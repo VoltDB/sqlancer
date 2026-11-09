@@ -106,6 +106,16 @@ public final class VoltDBErrors {
         // ENG-30522: FLOAT overflow to infinity in an expression of constants, which the parser folds, fails with an
         // internal NumberFormatException instead of "Invalid result value"
         errors.add("Character I is neither a decimal digit number");
+        // milestone 19: a JSON function's document is a VARCHAR column or a generated document, and most column values
+        // are not JSON
+        errors.add("Invalid JSON");
+        // DATEADD with a random interval can leave TIMESTAMP's range
+        errors.add("interval is too large for DATEADD");
+        // DATEADD and TO_TIMESTAMP inputs or results outside TIMESTAMP's years 1583 to 9999 ("would produce a value
+        // outside of the supported range", "Input to SQL function DATEADD is outside of the supported range"), and
+        // TO_TIMESTAMP of a value beyond TIMESTAMP's microseconds
+        errors.add("outside of the supported range (years 1583 to 9999");
+        errors.add("would overflow TIMESTAMP data type");
     }
 
     public static void addInsertErrors(ExpectedErrors errors) {
