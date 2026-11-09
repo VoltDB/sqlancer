@@ -603,10 +603,14 @@ the other oracles use.
   GROUP BY on a DECIMAL that is NULL aborts a 16.0.0 server (`NValue::hashCombine` throws in the hash aggregate).
   DIFF found it in its first trial against 16.0.0.
 
-`run-sqlancer.sh --mirror-voltdb DIR [--mirror-license FILE]` starts one node of the kit in DIR beside the cluster,
-on the port slot after the last node's, k=0 with the same sites per host. It passes `--mirror` to the provider,
-records the mirror's version in the manifest, and saves its server log under `servers/mirror`. Without `--mirror`,
-DIFF skips every check.
+`run-sqlancer.sh --mirror-voltdb DIR [--mirror-license FILE] [--mirror-java-home DIR]` starts one node of the kit
+in DIR beside the cluster, on the port slot after the last node's, k=0 with the same sites per host. It passes
+`--mirror` to the provider, records the mirror's version in the manifest, and saves its server log under
+`servers/mirror`. Without `--mirror`, DIFF skips every check.
+
+`--mirror-java-home DIR` gives the mirror its own JAVA_HOME. An older release may refuse the newer JDK the cluster
+runs on: 16.0.0 needs Java 17 or 21 and exits at once on Java 25 ("Unsupported openjdk version"), so the lab job
+passes `/opt/oracle_java21`. A mirror that exits stops the run at once, with the last line of its start log.
 
 ## The VIEWS oracle
 
