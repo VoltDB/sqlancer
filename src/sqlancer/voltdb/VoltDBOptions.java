@@ -44,6 +44,9 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--resizes", description = "The cluster grows and shrinks elastically during the run (run-sqlancer.sh --resize-interval): expect and retry the errors that hosts leaving the cluster cause, as for --node-failures", arity = 1)
     public boolean resizes;
 
+    @Parameter(names = "--xdcr", description = "Comma-separated host:port client addresses of a second cluster linked to the first by XDCR (run-sqlancer.sh --xdcr): each database writes through one of the two, chosen at random, its DDL runs on both with DR TABLE for each table, and the XDCR oracle compares their rows")
+    public String xdcr;
+
     @Parameter(names = "--crashes", description = "Every node is killed at once and the cluster recovered from its command log during the run (run-sqlancer.sh --crash-interval): expect the errors that causes, as for --node-failures, and wait for the cluster to come back before connecting", arity = 1)
     public boolean crashes;
 

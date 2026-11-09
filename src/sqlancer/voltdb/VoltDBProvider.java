@@ -28,6 +28,7 @@ import sqlancer.SQLGlobalState;
 import sqlancer.SQLProviderAdapter;
 import sqlancer.StatementExecutor;
 import sqlancer.common.oracle.TestOracle;
+import sqlancer.common.query.ExpectedErrors;
 import sqlancer.common.query.SQLQueryAdapter;
 import sqlancer.common.query.SQLQueryProvider;
 import sqlancer.voltdb.gen.VoltDBDeleteGenerator;
@@ -161,6 +162,18 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
         // a shrink (--resizes) removes hosts the driver is connected to (topologychangeaware), so the calls in flight
         // on them fail as on a killed node; the oracles' --node-failures workarounds (ENG-30612) do not apply
         // a crash (--crashes) fails every call in flight, as a killed node does for its own
+        // XDCR (milestone 23): the database writes through one of the pair, chosen at random, and repeats its DDL on
+        // the other; each database's tables are written from one side only, so XDCR has no conflicts to resolve
+        String xdcr = globalState.getDbmsSpecificOptions().xdcr;
+        String peerUrl = null;
+        if (xdcr != null && !xdcr.isBlank()) {
+            peerUrl = "jdbc:voltdb://" + xdcr.trim() + (xdcr.contains(",") ? "?topologychangeaware=true" : "");
+            if (Randomly.getBoolean()) {
+                String here = url;
+                url = peerUrl;
+                peerUrl = here;
+            }
+        }
         VoltDBConnection sqlCon = connect(globalState, url, globalState.getDbmsSpecificOptions().nodeFailures
                 || globalState.getDbmsSpecificOptions().resizes || globalState.getDbmsSpecificOptions().crashes);
         String hold = globalState.getDbmsSpecificOptions().ddlHold;
@@ -168,6 +181,11 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
             sqlCon.setDdlHold(Paths.get(hold));
         }
         dropLeftovers(globalState, sqlCon, true);
+        if (peerUrl != null) {
+            VoltDBConnection peerCon = connect(globalState, peerUrl, false);
+            dropLeftovers(globalState, peerCon, false);
+            sqlCon.setPeer(peerCon);
+        }
         // DIFF (milestone 20): a second cluster, normally the last release, that every change is repeated on
         String mirror = globalState.getDbmsSpecificOptions().mirror;
         if (mirror != null && !mirror.isBlank()) {
@@ -262,6 +280,14 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
                 globalState.executeStatement(VoltDBViewGenerator.getQuery(globalState));
             } catch (IgnoreMeException e) {
                 // no view this time
+            }
+        }
+        // with --xdcr, every table is a DR table, on both clusters, before it holds any rows
+        String xdcr = globalState.getDbmsSpecificOptions().xdcr;
+        if (xdcr != null && !xdcr.isBlank()) {
+            for (VoltDBSchema.VoltDBTable table : globalState.getSchema().getDatabaseTables()) {
+                globalState.executeStatement(
+                        new SQLQueryAdapter("DR TABLE " + table.getName(), ExpectedErrors.newErrors().build(), true));
             }
         }
         StatementExecutor<VoltDBGlobalState, Action> se = new StatementExecutor<>(globalState, Action.values(),

@@ -56,6 +56,10 @@ public class VoltDBConnection extends SQLConnection {
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
     private static final long DDL_HOLD_MILLIS = 900_000;
 
+    // a schema change, which --xdcr runs on both clusters: DR TABLE too, which the mirror does not get
+    private static final Pattern PEER_DDL = Pattern.compile("^\\s*(create|drop|alter|partition|dr)\\b.*",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+
     private final Connection connection;
     private final long retryMillis;
     private final boolean nodeFailures;
@@ -67,6 +71,11 @@ public class VoltDBConnection extends SQLConnection {
     private volatile boolean diverged;
     // whether a node failure or crash interrupted a call since the DURABLE oracle last compared the database
     private volatile boolean failureSeen;
+    // with --xdcr, the other cluster of the XDCR pair, or null: DDL runs on both (XDCR replicates rows, not the
+    // schema),
+    // and the database is marked split when the peer refuses a change this cluster made
+    private VoltDBConnection peer;
+    private volatile boolean peerSplit;
     // the --ddl-hold file, or null
     private Path ddlHold;
 
@@ -123,6 +132,31 @@ public class VoltDBConnection extends SQLConnection {
         }
     }
 
+    public void setPeer(VoltDBConnection peer) {
+        this.peer = peer;
+    }
+
+    public VoltDBConnection getPeer() {
+        return peer;
+    }
+
+    // whether a schema change succeeded here and failed on the XDCR peer, after which their tables may differ
+    public boolean isPeerSplit() {
+        return peerSplit;
+    }
+
+    // repeats a schema change that succeeded here on the XDCR peer
+    private void peerDdl(Method method, Object... args) {
+        if (peer == null || !isWrite(method, args) || !PEER_DDL.matcher((String) args[0]).matches()) {
+            return;
+        }
+        try (Statement st = peer.createStatement()) {
+            st.execute((String) args[0]);
+        } catch (SQLException | IgnoreMeException e) {
+            peerSplit = true;
+        }
+    }
+
     public VoltDBConnection getMirror() {
         return mirror;
     }
@@ -158,6 +192,10 @@ public class VoltDBConnection extends SQLConnection {
             return;
         }
         String sql = (String) args[0];
+        // XDCR's DR TABLE: the mirror has no DR
+        if (sql.trim().regionMatches(true, 0, "DR ", 0, 3)) {
+            return;
+        }
         boolean mirrored;
         try (Statement st = mirror.createStatement()) {
             st.execute(sql);
@@ -236,6 +274,7 @@ public class VoltDBConnection extends SQLConnection {
                             Object result = isNonSelectQuery(method, args) ? adHocQuery((String) args[0])
                                     : method.invoke(statement, args);
                             mirrorWrite(method, args, true);
+                            peerDdl(method, args);
                             return result instanceof ResultSet ? nullReading((ResultSet) result) : result;
                         } catch (InvocationTargetException e) {
                             Throwable cause = e.getCause();

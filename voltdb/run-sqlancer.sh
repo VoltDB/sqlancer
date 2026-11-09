@@ -36,6 +36,10 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
   --crash-interval S every S seconds, kill every node at once with kill -9 and restart them all, which
                      recovers the database from its snapshots and synchronous command log (default 0:
                      never). Not with --kill-interval or --resize-interval.
+  --xdcr             also start a second cluster of the same shape, linked to the first by XDCR (active-active
+                     DR), and run the provider with --xdcr: each database writes through one of the two, its DDL
+                     runs on both, and the XDCR oracle compares their rows. Not with --kill-interval,
+                     --resize-interval or --crash-interval.
   --keep-cluster     leave the cluster running and its data in place after the run
   --mirror-voltdb DIR  also start one node of this other VoltDB kit (normally the last release) and run
                      the provider with --mirror: every change is repeated on it, and the DIFF oracle
@@ -75,6 +79,7 @@ use_reducer=false
 keep_cluster=false
 kill_interval=0
 crash_interval=0
+xdcr=false
 resize_interval=0
 mirror_home=
 mirror_license=
@@ -100,6 +105,7 @@ while [ $# -gt 0 ]; do
     --keep-cluster) keep_cluster=true; shift ;;
     --kill-interval) kill_interval=$2; shift 2 ;;
     --crash-interval) crash_interval=$2; shift 2 ;;
+    --xdcr) xdcr=true; shift ;;
     --resize-interval) resize_interval=$2; shift 2 ;;
     --mirror-voltdb) mirror_home=$2; shift 2 ;;
     --mirror-license) mirror_license=$2; shift 2 ;;
@@ -139,6 +145,10 @@ fi
 [ "$kill_interval" -eq 0 ] || [ "$resize_interval" -eq 0 ] || die "--kill-interval and --resize-interval do not mix"
 [ "$crash_interval" -eq 0 ] || { [ "$kill_interval" -eq 0 ] && [ "$resize_interval" -eq 0 ]; } ||
     die "--crash-interval does not mix with --kill-interval or --resize-interval"
+if $xdcr; then
+    [ "$kill_interval" -eq 0 ] && [ "$resize_interval" -eq 0 ] && [ "$crash_interval" -eq 0 ] ||
+        die "--xdcr does not mix with --kill-interval, --resize-interval or --crash-interval"
+fi
 if [ "$crash_interval" -gt 0 ]; then
     # a crash drops every call in flight and every connection; the provider skips what it interrupted and waits for
     # the cluster to recover (see VoltDBErrors)
@@ -190,6 +200,8 @@ port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 added=0
 [ "$resize_interval" -gt 0 ] && added=$((kfactor + 1))
 added_slot=$((nodes + 1))
+# the XDCR peer's nodes take the slots from 20
+xdcr_slot=20
 for ((i = 0; i < added_slot + added; i++)); do
     [ "$i" -eq "$nodes" ] && [ -z "$mirror_home" ] && continue
     for j in 0 1 2 3 4 5; do
@@ -197,6 +209,31 @@ for ((i = 0; i < added_slot + added; i++)); do
         port_in_use "$p" && die "port $p is in use; pick another --port-base"
     done
 done
+if $xdcr; then
+    [ "$nodes" -le "$xdcr_slot" ] || die "--xdcr allows at most $xdcr_slot nodes"
+    for ((i = xdcr_slot; i < xdcr_slot + nodes; i++)); do
+        for j in 0 1 2 3 4 5; do
+            p=$(port $i $j)
+            port_in_use "$p" && die "port $p is in use; pick another --port-base"
+        done
+    done
+fi
+# the XDCR peer's addresses, like hosts(): xdcr_hosts client|internal|replication
+xdcr_hosts() {
+    local list= i k
+    case $1 in client) k=0 ;; internal) k=2 ;; replication) k=4 ;; esac
+    for ((i = 0; i < nodes; i++)); do
+        list+="${list:+,}localhost:$(port $((xdcr_slot + i)) $k)"
+    done
+    echo "$list"
+}
+replication_hosts() {
+    local list= i
+    for ((i = 0; i < nodes; i++)); do
+        list+="${list:+,}localhost:$(port $i 4)"
+    done
+    echo "$list"
+}
 
 run_id=sqlancer-$(date -u +%Y%m%dT%H%M%SZ)-seed$seed
 results=$results_root/$run_id
@@ -254,6 +291,9 @@ stop_cluster() {
     if [ -n "$mirror_home" ] && grep -q "Server completed initialization" "$cluster/mirror/voltdbroot/log/volt.log" 2>/dev/null; then
         within 120 mirror_cmd "$mirror_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $nodes)" >>"$results/run.log" 2>&1
     fi
+    if $xdcr && grep -q "Server completed initialization" "$cluster/xdcr0/voltdbroot/log/volt.log" 2>/dev/null; then
+        within 120 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $xdcr_slot)" >>"$results/run.log" 2>&1
+    fi
     # only processes started for this run carry its directory on their command line, and their PIDs are recorded
     for _ in $(seq 1 30); do
         pgrep -f "$cluster/" >/dev/null || break
@@ -306,6 +346,7 @@ sqlancer_dirty=$(git -C "$repo_dir" status --porcelain 2>/dev/null | grep -v '^?
     echo "queries per db:   $queries"
     echo "use reducer:      $use_reducer"
     echo "kill interval:    $([ "$kill_interval" -gt 0 ] && echo "$kill_interval s" || echo never)"
+    echo "xdcr:             $($xdcr && echo "a second cluster of $nodes node(s), k=$kfactor, client ports $(xdcr_hosts client)" || echo no)"
     echo "crash interval:   $([ "$crash_interval" -gt 0 ] && echo "$crash_interval s, every node killed and recovered" || echo never)"
     echo "resize interval:  $([ "$resize_interval" -gt 0 ] && echo "$resize_interval s, $added nodes added and removed by turns" || echo never)"
     echo "provider options: ${provider_args[*]:-}"
@@ -322,11 +363,19 @@ if [ "$crash_interval" -gt 0 ]; then
     <commandlog enabled="true" synchronous="true"/>
     <snapshot prefix="auto" frequency="2m" retain="2"/>'
 fi
+# with --xdcr, DR id 1 here and 2 on the peer, each the other's source
+dr=
+if $xdcr; then
+    dr='
+    <dr id="1" role="xdcr">
+        <connection source="'$(xdcr_hosts replication)'"/>
+    </dr>'
+fi
 cat >"$cluster/deployment.xml" <<EOF
 <?xml version="1.0"?>
 <deployment>
     <cluster sitesperhost="$sites" kfactor="$kfactor"/>
-    <httpd enabled="false"/>$durability
+    <httpd enabled="false"/>$durability$dr
 </deployment>
 EOF
 
@@ -375,14 +424,48 @@ if [ "$ready" -ne "$nodes" ]; then
 fi
 log "Cluster ready: $(grep -h -m1 "^Build:" "$cluster/init0.log" 2>/dev/null)"
 
+# --- XDCR peer ---------------------------------------------------------------------------------------------------
+
+# a second cluster of the same shape, DR id 2, linked to the first by XDCR; its nodes take the slots from 20
+if $xdcr; then
+    sed -e 's/<dr id="1"/<dr id="2"/' -e "s|<connection source=\"[^\"]*\"|<connection source=\"$(replication_hosts)\"|" \
+        "$cluster/deployment.xml" >"$cluster/deployment-xdcr.xml"
+    for ((i = 0; i < nodes; i++)); do
+        "$voltdb_home/bin/voltdb" init --force -D "$cluster/xdcr$i" -C "$cluster/deployment-xdcr.xml" \
+            ${license_args[@]+"${license_args[@]}"} >"$cluster/init-xdcr$i.log" 2>&1 ||
+            die "voltdb init failed for XDCR node $i; see $cluster/init-xdcr$i.log"
+    done
+    for ((i = 0; i < nodes; i++)); do
+        x=$((xdcr_slot + i))
+        (nohup "$voltdb_home/bin/voltdb" start -D "$cluster/xdcr$i" -c "$nodes" -H "$(xdcr_hosts internal)" \
+            --client="$(client_port $x)" --admin="$(admin_port $x)" --internal="$(internal_port $x)" \
+            --zookeeper="$(port $x 3)" --replication="$(port $x 4)" --metrics="$(port $x 5)" \
+            >"$cluster/start-xdcr$i.log" 2>&1 &
+            echo $! >"$cluster/xdcr$i.pid")
+    done
+    ready=0
+    for _ in $(seq 1 300); do
+        ready=0
+        for ((i = 0; i < nodes; i++)); do
+            grep -q "Server completed initialization" "$cluster/xdcr$i/voltdbroot/log/volt.log" 2>/dev/null &&
+                ready=$((ready + 1))
+        done
+        [ "$ready" -eq "$nodes" ] && break
+        sleep 1
+    done
+    [ "$ready" -eq "$nodes" ] || die "the XDCR peer did not start within 300 s ($ready of $nodes nodes ready)"
+    log "XDCR peer ready: client ports $(xdcr_hosts client)"
+    provider_args+=(--xdcr "$(xdcr_hosts client)")
+fi
+
 # --- mirror (DIFF) -----------------------------------------------------------------------------------------------
 
 # one node of the other kit, k=0, the same sites per host, on the port slot after the last node's
 if [ -n "$mirror_home" ]; then
     m=$nodes
     # the mirror never crashes: no command log or snapshots
-    sed -e "s/kfactor=\"$kfactor\"/kfactor=\"0\"/" -e '/<commandlog /d' -e '/<snapshot /d' "$cluster/deployment.xml" \
-        >"$cluster/deployment-mirror.xml"
+    sed -e "s/kfactor=\"$kfactor\"/kfactor=\"0\"/" -e '/<commandlog /d' -e '/<snapshot /d' \
+        -e '/<dr /d' -e '/<connection /d' -e '/<\/dr>/d' "$cluster/deployment.xml" >"$cluster/deployment-mirror.xml"
     mirror_cmd "$mirror_home/bin/voltdb" init --force -D "$cluster/mirror" -C "$cluster/deployment-mirror.xml" \
         ${mirror_license_args[@]+"${mirror_license_args[@]}"} >"$cluster/init-mirror.log" 2>&1 ||
         die "voltdb init failed for the mirror; see $cluster/init-mirror.log"
@@ -745,6 +828,7 @@ fi
 down=()
 for ((i = 0; i < nodes; i++)); do
     port_in_use "$(client_port $i)" || down+=("node$i")
+    $xdcr && { port_in_use "$(client_port $((xdcr_slot + i)))" || down+=("xdcr$i"); }
 done
 stop_cluster
 for ((i = 0; i < nodes; i++)); do
@@ -759,12 +843,29 @@ for d in "$cluster"/add*-*; do
     cp "$d.init.log" "$d.start.log" "$results/servers/$a/" 2>/dev/null
     cp -R "$d/voltdbroot/log/." "$results/servers/$a/" 2>/dev/null
 done
+if $xdcr; then
+    for ((i = 0; i < nodes; i++)); do
+        mkdir -p "$results/servers/xdcr$i"
+        cp "$cluster/start-xdcr$i.log" "$cluster/init-xdcr$i.log" "$results/servers/xdcr$i/" 2>/dev/null
+        cp -R "$cluster/xdcr$i/voltdbroot/log/." "$results/servers/xdcr$i/" 2>/dev/null
+    done
+fi
 if [ -n "$mirror_home" ]; then
     mkdir -p "$results/servers/mirror"
     cp "$cluster/start-mirror.log" "$cluster/init-mirror.log" "$results/servers/mirror/" 2>/dev/null
     cp -R "$cluster/mirror/voltdbroot/log/." "$results/servers/mirror/" 2>/dev/null
 fi
 cp "$cluster/deployment.xml" "$results/"
+# XDCR's conflict log: each database writes through one cluster only, so XDCR has nothing to resolve, and any
+# conflict it logged fails the run
+conflicts=0
+if $xdcr; then
+    mkdir -p "$results/xdcr_conflicts"
+    for f in $(find "$cluster" -path "*xdcr_conflicts*" -type f 2>/dev/null); do
+        cp "$f" "$results/xdcr_conflicts/$(echo "${f#"$cluster"/}" | tr / _)"
+        conflicts=$((conflicts + $(wc -l <"$f")))
+    done
+fi
 $keep_cluster || rm -rf "$cluster"
 
 failures=()
@@ -787,6 +888,10 @@ for ((i = 0; i < nodes; i++)); do
         END { print c + 0 }' "$results/servers/node$i/volt.log" 2>/dev/null)
     fatal=$((fatal + ${n:-0}))
 done
+for f in "$results"/servers/xdcr*/volt.log; do
+    [ -e "$f" ] || continue
+    fatal=$((fatal + $(grep -c " FATAL " "$f")))
+done
 for f in "$results"/servers/add*-*/volt.log; do
     [ -e "$f" ] || continue
     case $f in *-rejected*) continue ;; esac
@@ -797,7 +902,7 @@ done
 
 result=PASS
 [ "$sqlancer_exit" -eq 0 ] && [ ${#failures[@]} -eq 0 ] && [ ${#down[@]} -eq 0 ] && [ "$fatal" -eq 0 ] &&
-    ! $chaos_failed && ! $resize_failed && ! $crash_failed || result=FAIL
+    ! $chaos_failed && ! $resize_failed && ! $crash_failed && [ "$conflicts" -eq 0 ] || result=FAIL
 {
     echo "RESULT: $result"
     echo "run: $run_id"
@@ -810,6 +915,8 @@ result=PASS
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
     [ "$crash_interval" -gt 0 ] && echo "crashes: $crashes crashes, $recoveries recoveries$($crash_failed && echo ", a recovery FAILED (crash.log)")"
+    $xdcr && echo "XDCR conflicts logged: $conflicts$([ "$conflicts" -eq 0 ] || echo " (xdcr_conflicts/)")"
+    $xdcr && echo "databases XDCR compared after convergence: $(grep -c "^XDCR converged:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$crash_interval" -gt 0 ] && echo "databases DURABLE compared across a crash: $(grep -c "^DURABLE across a crash:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$resize_interval" -gt 0 ] && echo "resizes: $grows grows, $shrinks shrinks$($resize_failed && echo ", a step FAILED (resize.log)")"
     for f in ${failures[@]+"${failures[@]}"}; do

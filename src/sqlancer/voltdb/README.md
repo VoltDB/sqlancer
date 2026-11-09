@@ -28,7 +28,8 @@ compares this VoltDB with another version, normally the last release, on the sam
 [The DIFF oracle](#the-diff-oracle). Since milestone 21 the run script can also grow and shrink the cluster
 elastically while SQLancer runs (`--resize-interval`); see [Elastic resizes](#elastic-resizes). Since milestone 22 it
 can also crash the whole cluster and recover it from its command log (`--crash-interval`), and the DURABLE oracle
-checks that no acknowledged change was lost; see [Whole-cluster crashes](#whole-cluster-crashes).
+checks that no acknowledged change was lost; see [Whole-cluster crashes](#whole-cluster-crashes). Since milestone 23
+it can run two clusters linked by XDCR (`--xdcr`), and the XDCR oracle checks that they converge; see [XDCR](#xdcr).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -88,6 +89,7 @@ voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 -
 | `--kill-interval SECS` | 0 (never) | Every SECS seconds, kill a random node, node 0 included, with `kill -9`, restart it and wait until it has rejoined (see [Node failures](#node-failures)). Needs k-safety 1 or more. |
 | `--resize-interval SECS` | 0 (never) | Every SECS seconds, add k+1 nodes with `voltdb start --add`, or remove them again with `voltadmin resize`, by turns (see [Elastic resizes](#elastic-resizes)). Does not mix with `--kill-interval`. |
 | `--crash-interval SECS` | 0 (never) | Every SECS seconds, kill every node at once with `kill -9` and restart them all, which recovers the database from its snapshots and synchronous command log (see [Whole-cluster crashes](#whole-cluster-crashes)). Does not mix with `--kill-interval` or `--resize-interval`. |
+| `--xdcr` | off | Also start a second cluster of the same shape, linked to the first by XDCR (see [XDCR](#xdcr)). Does not mix with `--kill-interval`, `--resize-interval` or `--crash-interval`. |
 | `--keep-cluster` | off | Leave the cluster running, with its data, after the run. |
 | `-- ...` | | Everything after `--` goes to the provider, for example `-- --avoid-known-bugs false`. |
 
@@ -104,6 +106,8 @@ that did not start). Each run writes `<results>/sqlancer-<UTC time>-seed<N>/`:
 | `sqlancer/` | SQLancer's output (`out.log`) and its `logs/voltdb/` directory (see [Reading the results](#reading-the-results)). |
 | `chaos.log` | With `--kill-interval`: each kill and rejoin, with its time. |
 | `crash.log` | With `--crash-interval`: each crash and recovery, with its time and how long the recovery took. `servers/node<i>/recover<i>-<n>.log` is node i's output from recovery n. |
+| `servers/xdcr<i>/` | With `--xdcr`: the logs of the second cluster's node i, like `servers/node<i>/`. |
+| `xdcr_conflicts/` | With `--xdcr`: every conflict XDCR logged (there should be none). |
 | `resize.log` | With `--resize-interval`: each grow and shrink, with its time, the planned removal and how long it took. |
 | `servers/add<n>-<j>/` | With `--resize-interval`: the logs of node j added by grow n, like `servers/node<i>/`. A join VoltDB refused is kept as `add<n>-<j>-rejected<a>`. |
 | `reproductions/` | The log of each database whose thread failed: the statements that set it up, then the failing queries. With `--use-reducer`, these are reduced, and `<db>-reduce.log` shows the steps. |
@@ -115,6 +119,7 @@ A run FAILs if any of these happens:
 - With `--kill-interval`, a killed node does not rejoin within 600 seconds.
 - With `--resize-interval`, a grow or a shrink does not complete within 600 seconds.
 - With `--crash-interval`, the cluster does not recover within 600 seconds of a crash.
+- With `--xdcr`, either cluster has a node down at the end, or XDCR logged a conflict.
 
 While `--avoid-known-bugs` is true (the default), a failed check whose queries no longer fail when its reproducer
 reruns them at once is not a failure. It is printed as `ENG-30602 transient: ...` in `sqlancer/out.log`, and the
@@ -244,6 +249,38 @@ snapshot yet, recovery lost the tables created since start, and DURABLE failed 3
 ("object not found: DB0_T0 here, 24 on the mirror"). An earlier control with DIFF alone passed: recovery had left
 the tables empty or missing, which DIFF skips.
 
+## XDCR
+
+With `--xdcr`, the script starts a second cluster of the same shape (nodes, k-safety, sites per host) on the port
+slots from 20, and links the two by XDCR, active-active DR: DR id 1 here and 2 there, each with the other's
+replication ports as its source. The mirror, if any, gets no DR.
+
+The script passes the provider `--xdcr` with the second cluster's client ports, and each database then works like this:
+
+1. SQLancer connects to one of the two clusters, chosen at random per database, and writes and reads there only. The
+   connection to the other cluster is its peer. Both directions of replication are exercised across a run, and no
+   table is written on both sides, so XDCR has no conflicts to resolve.
+2. XDCR replicates rows, not the schema, so every schema change (CREATE, DROP, ALTER, PARTITION and DR TABLE) that
+   succeeds runs on the peer too. A change the peer refuses marks the database split, and XDCR skips it.
+3. Before any rows go in, every table becomes a DR table (`DR TABLE t`) on both sides. Tables without a unique index
+   replicate updates and deletes by matching the whole row, which VoltDB warns is slow but allows.
+
+### The XDCR oracle
+
+XDCR reads every table and materialized view of the database on both clusters and compares their rows as multisets.
+Replication is asynchronous, so a difference is retried every second for up to 60 seconds; one that persists fails
+with the rows found on one side only. A view's rows on the peer come from rows that XDCR applied, so this also checks
+view maintenance on that path. The database's thread is its only writer and is in the check, so nothing changes the
+rows while they are read. The first comparison of each database prints `XDCR converged: <database>`, and the summary
+counts these as "databases XDCR compared after convergence".
+
+The script also collects XDCR's conflict log (`xdcr_conflicts/` in each node's root) into the results, and a conflict
+fails the run, as the provider never writes a table on both sides. A failure has no reproducer, as it depends on
+replication.
+
+A control run showed XDCR catches a broken link: with the second cluster's DR source pointed at a closed port, every
+database written on the first cluster failed within 4 minutes ("DB0_T0: 19 rows here, 0 on the other cluster").
+
 ## The nightly lab job
 
 `matrix-systemtest-apprunner-sqlancer` on jenkins-st runs this script against master's kit as part of the nightly
@@ -254,21 +291,22 @@ system test (`matrix-systemtest/master`, on the nights the rotation in `internal
 
 The job fetches this repository at the commit in its `SQLANCER_REF` parameter. That commit is pinned in the Jenkinsfile,
 so a change here reaches the nightly run only when the Jenkinsfile is changed to name it. It then builds SQLancer with
-the kit's runtime JDK and makes five runs, one after the other, every node on the agent:
+the kit's runtime JDK and makes six runs, one after the other, every node on the agent:
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all eighteen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all nineteen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
 | `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
 | `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
+| `sqlancer-3n-k1-xdcr-s4` | Two clusters of 3 nodes, k=1, 4 sites per host, linked by XDCR (see [XDCR](#xdcr)) | the same | 45 minutes |
 | `sqlancer-3n-k1-crash600` | 3 nodes, k=1, 8 sites per host, a synchronous command log; every 10 minutes every node is killed and the cluster recovered (see [Whole-cluster crashes](#whole-cluster-crashes)) | the same | 45 minutes |
 
 The shapes differ in what the planner and the execution engine do. With one node and 8 sites, a multi-partition query
 gathers 8 partitions' results in one process. With 3 nodes, k=1, the partitions' leaders are spread over the nodes and
 each has one replica, and node failures move them; elastic resizes add a partition group and move data to it and
 back; crashes replay the command log. With k=2 and 2 sites per host, every node holds every partition, so
-there are only 2 partitions and every write is replicated twice. The whole job takes about 4 hours.
+there are only 2 partitions and every write is replicated twice. The whole job takes about 4 hours 50 minutes.
 
 Every run uses `--use-reducer`. The first run's seed is the UTC time as `yyyymmddHHMM`, and each next run's is one
 more.
@@ -284,8 +322,8 @@ them against the same build. The reproduction in `reproductions/` is usually qui
 server.
 
 The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor[:chaos[:sites]]`, where chaos is the
-seconds between node failures, `r` and the seconds between elastic resizes, or `c` and the seconds between crashes,
-and sites the sites per host, default `3:1:300 1:0 3:2:0:2 3:1:r120 3:1:c600`), `DURATION` (seconds
+seconds between node failures, `r` and the seconds between elastic resizes, `c` and the seconds between crashes, or
+`x` for an XDCR pair, and sites the sites per host, default `3:1:300 1:0 3:2:0:2 3:1:r120 3:1:x:4 3:1:c600`), `DURATION` (seconds
 per run, default 2700), `ORACLES`, `SEED`, `EXTRA_ARGS` (provider options) and `SQLANCER_REF`. A run of the job alone
 needs a kit: give `releasedir`, for example `releases/one-offs/16.1.0-SNAPSHOT-master/<kit build>`.
 
