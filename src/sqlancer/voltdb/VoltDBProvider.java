@@ -1,5 +1,6 @@
 package sqlancer.voltdb;
 
+import java.nio.file.Paths;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
@@ -153,7 +154,14 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
         String servers = globalState.getDbmsSpecificOptions().servers;
         String url = servers == null || servers.isBlank() ? String.format("jdbc:voltdb://%s:%d", host, port)
                 : "jdbc:voltdb://" + servers.trim() + "?topologychangeaware=true";
-        VoltDBConnection sqlCon = connect(globalState, url, globalState.getDbmsSpecificOptions().nodeFailures);
+        // a shrink (--resizes) removes hosts the driver is connected to (topologychangeaware), so the calls in flight
+        // on them fail as on a killed node; the oracles' --node-failures workarounds (ENG-30612) do not apply
+        VoltDBConnection sqlCon = connect(globalState, url,
+                globalState.getDbmsSpecificOptions().nodeFailures || globalState.getDbmsSpecificOptions().resizes);
+        String hold = globalState.getDbmsSpecificOptions().ddlHold;
+        if (hold != null && !hold.isBlank() && globalState.getDbmsSpecificOptions().avoidKnownBugs) {
+            sqlCon.setDdlHold(Paths.get(hold));
+        }
         dropLeftovers(globalState, sqlCon, true);
         // DIFF (milestone 20): a second cluster, normally the last release, that every change is repeated on
         String mirror = globalState.getDbmsSpecificOptions().mirror;

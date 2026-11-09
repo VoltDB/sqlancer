@@ -41,6 +41,12 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--node-failures", description = "Nodes are killed and rejoined during the run (run-sqlancer.sh --kill-interval): expect and retry the errors that causes", arity = 1)
     public boolean nodeFailures;
 
+    @Parameter(names = "--resizes", description = "The cluster grows and shrinks elastically during the run (run-sqlancer.sh --resize-interval): expect and retry the errors that hosts leaving the cluster cause, as for --node-failures", arity = 1)
+    public boolean resizes;
+
+    @Parameter(names = "--ddl-hold", description = "A file that, while it exists, holds every DDL statement until it is gone (run-sqlancer.sh creates it during each shrink, ENG-30622); ignored with --avoid-known-bugs false")
+    public String ddlHold;
+
     @Parameter(names = "--mirror", description = "Comma-separated host:port client addresses of a second cluster, normally running another VoltDB version: every statement that changes the database is repeated on it, and the DIFF oracle compares the two clusters' rows for the same query")
     public String mirror;
 
