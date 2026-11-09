@@ -8,6 +8,7 @@ import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 import sqlancer.voltdb.gen.VoltDBExpressionGenerator;
 import sqlancer.voltdb.oracle.VoltDBDerivedTableOracle;
 import sqlancer.voltdb.oracle.VoltDBDifferentialOracle;
+import sqlancer.voltdb.oracle.VoltDBDurabilityOracle;
 import sqlancer.voltdb.oracle.VoltDBGeographyOracle;
 import sqlancer.voltdb.oracle.VoltDBLimitOracle;
 import sqlancer.voltdb.oracle.VoltDBParameterOracle;
@@ -120,6 +121,17 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBDifferentialOracle(globalState, expressionErrors());
+        }
+    },
+
+    /**
+     * Durability across whole-cluster crashes: with --mirror, every table holds as many rows on this cluster, crashed
+     * and recovered, as on the mirror, which never crashes.
+     */
+    DURABLE {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBDurabilityOracle(globalState);
         }
     },
 

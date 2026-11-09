@@ -49,6 +49,10 @@ import sqlancer.voltdb.oracle.VoltDBTransientCheck;
 @AutoService(DatabaseProvider.class)
 public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlobalState, VoltDBOptions> {
 
+    // with --crashes, how long a connection is retried while the cluster recovers (run-sqlancer.sh gives a recovery
+    // 600 s)
+    private static final long CRASH_CONNECT_MILLIS = 660_000;
+
     public VoltDBProvider() {
         super(VoltDBGlobalState.class, VoltDBOptions.class);
     }
@@ -156,8 +160,9 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
                 : "jdbc:voltdb://" + servers.trim() + "?topologychangeaware=true";
         // a shrink (--resizes) removes hosts the driver is connected to (topologychangeaware), so the calls in flight
         // on them fail as on a killed node; the oracles' --node-failures workarounds (ENG-30612) do not apply
-        VoltDBConnection sqlCon = connect(globalState, url,
-                globalState.getDbmsSpecificOptions().nodeFailures || globalState.getDbmsSpecificOptions().resizes);
+        // a crash (--crashes) fails every call in flight, as a killed node does for its own
+        VoltDBConnection sqlCon = connect(globalState, url, globalState.getDbmsSpecificOptions().nodeFailures
+                || globalState.getDbmsSpecificOptions().resizes || globalState.getDbmsSpecificOptions().crashes);
         String hold = globalState.getDbmsSpecificOptions().ddlHold;
         if (hold != null && !hold.isBlank() && globalState.getDbmsSpecificOptions().avoidKnownBugs) {
             sqlCon.setDdlHold(Paths.get(hold));
@@ -177,9 +182,24 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
 
     private static VoltDBConnection connect(VoltDBGlobalState globalState, String url, boolean nodeFailures)
             throws SQLException {
-        Connection con = DriverManager.getConnection(url, globalState.getOptions().getUserName(),
-                globalState.getOptions().getPassword());
-        return new VoltDBConnection(con, globalState.getDbmsSpecificOptions().retrySeconds, nodeFailures);
+        long deadline = System.currentTimeMillis() + CRASH_CONNECT_MILLIS;
+        while (true) {
+            try {
+                Connection con = DriverManager.getConnection(url, globalState.getOptions().getUserName(),
+                        globalState.getOptions().getPassword());
+                return new VoltDBConnection(con, globalState.getDbmsSpecificOptions().retrySeconds, nodeFailures);
+            } catch (SQLException e) {
+                if (!globalState.getDbmsSpecificOptions().crashes || System.currentTimeMillis() >= deadline) {
+                    throw e;
+                }
+                try {
+                    Thread.sleep(2000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
     }
 
     // drops the database's procedures and tables left by an earlier use of its name; logged only for the main cluster,

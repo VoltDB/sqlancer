@@ -65,6 +65,8 @@ public class VoltDBConnection extends SQLConnection {
     // succeeded
     private VoltDBConnection mirror;
     private volatile boolean diverged;
+    // whether a node failure or crash interrupted a call since the DURABLE oracle last compared the database
+    private volatile boolean failureSeen;
     // the --ddl-hold file, or null
     private Path ddlHold;
 
@@ -131,17 +133,31 @@ public class VoltDBConnection extends SQLConnection {
         return diverged;
     }
 
+    public boolean isFailureSeen() {
+        return failureSeen;
+    }
+
+    public void clearFailureSeen() {
+        failureSeen = false;
+    }
+
+    // whether a call is a statement that changes the database: execute or executeUpdate of anything but a query
+    private static boolean isWrite(Method method, Object... args) {
+        if (args == null || args.length != 1 || !(args[0] instanceof String)
+                || !method.getName().equals("execute") && !method.getName().equals("executeUpdate")) {
+            return false;
+        }
+        String sql = ((String) args[0]).trim();
+        return !SELECT_PREAMBLE.matcher(sql).matches() && !sql.startsWith("(")
+                && !sql.regionMatches(true, 0, "WITH", 0, 4);
+    }
+
     // repeats a statement that changes the database on the mirror, and records whether the two disagreed
     private void mirrorWrite(Method method, Object[] args, boolean succeeded) {
-        if (mirror == null || args == null || args.length != 1 || !(args[0] instanceof String)
-                || !method.getName().equals("execute") && !method.getName().equals("executeUpdate")) {
+        if (mirror == null || !isWrite(method, args)) {
             return;
         }
         String sql = (String) args[0];
-        if (SELECT_PREAMBLE.matcher(sql).matches() || sql.trim().startsWith("(")
-                || sql.trim().regionMatches(true, 0, "WITH", 0, 4)) {
-            return;
-        }
         boolean mirrored;
         try (Statement st = mirror.createStatement()) {
             st.execute(sql);
@@ -231,8 +247,9 @@ public class VoltDBConnection extends SQLConnection {
                             }
                             Throwable thrown = skippedIfNodeFailure(cause);
                             if (thrown instanceof IgnoreMeException) {
-                                // a node failure: the statement may or may not have committed
-                                diverged = mirror != null || diverged;
+                                failureSeen = true;
+                                // a node failure: a change may or may not have committed; a query changed nothing
+                                diverged = mirror != null && isWrite(method, args) || diverged;
                             } else {
                                 mirrorWrite(method, args, false);
                             }

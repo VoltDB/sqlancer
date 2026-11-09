@@ -44,6 +44,9 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--resizes", description = "The cluster grows and shrinks elastically during the run (run-sqlancer.sh --resize-interval): expect and retry the errors that hosts leaving the cluster cause, as for --node-failures", arity = 1)
     public boolean resizes;
 
+    @Parameter(names = "--crashes", description = "Every node is killed at once and the cluster recovered from its command log during the run (run-sqlancer.sh --crash-interval): expect the errors that causes, as for --node-failures, and wait for the cluster to come back before connecting", arity = 1)
+    public boolean crashes;
+
     @Parameter(names = "--ddl-hold", description = "A file that, while it exists, holds every DDL statement until it is gone (run-sqlancer.sh creates it during each shrink, ENG-30622); ignored with --avoid-known-bugs false")
     public String ddlHold;
 

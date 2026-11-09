@@ -33,6 +33,9 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
   --resize-interval S  every S seconds, resize the cluster elastically, growing and shrinking by turns: add
                      k+1 nodes (voltdb start --add), then remove them (voltadmin resize) (default 0: never).
                      Not with --kill-interval.
+  --crash-interval S every S seconds, kill every node at once with kill -9 and restart them all, which
+                     recovers the database from its snapshots and synchronous command log (default 0:
+                     never). Not with --kill-interval or --resize-interval.
   --keep-cluster     leave the cluster running and its data in place after the run
   --mirror-voltdb DIR  also start one node of this other VoltDB kit (normally the last release) and run
                      the provider with --mirror: every change is repeated on it, and the DIFF oracle
@@ -71,6 +74,7 @@ results_root=$PWD/sqlancer-results
 use_reducer=false
 keep_cluster=false
 kill_interval=0
+crash_interval=0
 resize_interval=0
 mirror_home=
 mirror_license=
@@ -95,6 +99,7 @@ while [ $# -gt 0 ]; do
     --use-reducer) use_reducer=true; shift ;;
     --keep-cluster) keep_cluster=true; shift ;;
     --kill-interval) kill_interval=$2; shift 2 ;;
+    --crash-interval) crash_interval=$2; shift 2 ;;
     --resize-interval) resize_interval=$2; shift 2 ;;
     --mirror-voltdb) mirror_home=$2; shift 2 ;;
     --mirror-license) mirror_license=$2; shift 2 ;;
@@ -122,7 +127,7 @@ if [ -n "$mirror_home" ]; then
         mirror_license_args=(--license "$mirror_license")
     fi
 fi
-for n in "$nodes" "$sites" "$duration" "$threads" "$queries" "$port_base" "$kill_interval" "$resize_interval"; do
+for n in "$nodes" "$sites" "$duration" "$threads" "$queries" "$port_base" "$kill_interval" "$resize_interval" "$crash_interval"; do
     case $n in '' | *[!0-9]*) die "not a number: '$n'" ;; esac
 done
 [ "$nodes" -ge 1 ] || die "--nodes must be at least 1"
@@ -132,6 +137,13 @@ fi
 [ "$kfactor" -lt "$nodes" ] || die "--kfactor must be less than --nodes"
 [ -n "$seed" ] || seed=$(date +%s)
 [ "$kill_interval" -eq 0 ] || [ "$resize_interval" -eq 0 ] || die "--kill-interval and --resize-interval do not mix"
+[ "$crash_interval" -eq 0 ] || { [ "$kill_interval" -eq 0 ] && [ "$resize_interval" -eq 0 ]; } ||
+    die "--crash-interval does not mix with --kill-interval or --resize-interval"
+if [ "$crash_interval" -gt 0 ]; then
+    # a crash drops every call in flight and every connection; the provider skips what it interrupted and waits for
+    # the cluster to recover (see VoltDBErrors)
+    provider_args=(--crashes true ${provider_args[@]+"${provider_args[@]}"})
+fi
 if [ "$resize_interval" -gt 0 ]; then
     # a shrink drops the calls in flight on the hosts it removes, which the provider then expects (see VoltDBErrors)
     provider_args=(--resizes true ${provider_args[@]+"${provider_args[@]}"})
@@ -294,6 +306,7 @@ sqlancer_dirty=$(git -C "$repo_dir" status --porcelain 2>/dev/null | grep -v '^?
     echo "queries per db:   $queries"
     echo "use reducer:      $use_reducer"
     echo "kill interval:    $([ "$kill_interval" -gt 0 ] && echo "$kill_interval s" || echo never)"
+    echo "crash interval:   $([ "$crash_interval" -gt 0 ] && echo "$crash_interval s, every node killed and recovered" || echo never)"
     echo "resize interval:  $([ "$resize_interval" -gt 0 ] && echo "$resize_interval s, $added nodes added and removed by turns" || echo never)"
     echo "provider options: ${provider_args[*]:-}"
 } >"$results/manifest.txt"
@@ -301,11 +314,19 @@ cat "$results/manifest.txt"
 
 # --- cluster -----------------------------------------------------------------------------------------------------
 
+# with --crash-interval, a synchronous command log (a transaction is acknowledged once it is on disk, so none that was
+# acknowledged may be lost) and a snapshot every 2 minutes, which recovery starts from before replaying the log
+durability=
+if [ "$crash_interval" -gt 0 ]; then
+    durability='
+    <commandlog enabled="true" synchronous="true"/>
+    <snapshot prefix="auto" frequency="2m" retain="2"/>'
+fi
 cat >"$cluster/deployment.xml" <<EOF
 <?xml version="1.0"?>
 <deployment>
     <cluster sitesperhost="$sites" kfactor="$kfactor"/>
-    <httpd enabled="false"/>
+    <httpd enabled="false"/>$durability
 </deployment>
 EOF
 
@@ -359,7 +380,9 @@ log "Cluster ready: $(grep -h -m1 "^Build:" "$cluster/init0.log" 2>/dev/null)"
 # one node of the other kit, k=0, the same sites per host, on the port slot after the last node's
 if [ -n "$mirror_home" ]; then
     m=$nodes
-    sed "s/kfactor=\"$kfactor\"/kfactor=\"0\"/" "$cluster/deployment.xml" >"$cluster/deployment-mirror.xml"
+    # the mirror never crashes: no command log or snapshots
+    sed -e "s/kfactor=\"$kfactor\"/kfactor=\"0\"/" -e '/<commandlog /d' -e '/<snapshot /d' "$cluster/deployment.xml" \
+        >"$cluster/deployment-mirror.xml"
     mirror_cmd "$mirror_home/bin/voltdb" init --force -D "$cluster/mirror" -C "$cluster/deployment-mirror.xml" \
         ${mirror_license_args[@]+"${mirror_license_args[@]}"} >"$cluster/init-mirror.log" 2>&1 ||
         die "voltdb init failed for the mirror; see $cluster/init-mirror.log"
@@ -458,6 +481,79 @@ if [ "$kill_interval" -gt 0 ]; then
     chaos_loop &
     chaos_pid=$!
     log "Killing and rejoining a random node every $kill_interval s (chaos.log)"
+fi
+
+# Every crash_interval seconds: kill -9 every node at once, wait until their client ports close, restart them all with
+# the same command, which recovers the database from the last snapshot and the command log, and wait until every node
+# has finished ("Server completed initialization"), up to 600 s. A restart that cannot bind a port is tried again, as in
+# rejoin_node. Each event is a line of crash.log; a recovery that does not complete ends the loop and fails the run. The
+# loop stops when $results/crash.stop exists, after the recovery it is waiting for, so the run ends with every node up.
+crash_loop() {
+    local n=0 i pid t0 up deadline log vlog pids attempts befores
+    while true; do
+        for _ in $(seq 1 "$crash_interval"); do
+            [ -e "$results/crash.stop" ] && return 0
+            sleep 1
+        done
+        n=$((n + 1))
+        pids=()
+        for ((i = 0; i < nodes; i++)); do
+            pid=$(cat "$cluster/node$i.pid" 2>/dev/null)
+            if [ -z "$pid" ] || ! is_server "$pid"; then
+                echo "$(date '+%H:%M:%S') crash $n: node$i is not running" >>"$results/crash.log"
+                return 1
+            fi
+            pids+=("$pid")
+        done
+        kill -9 "${pids[@]}"
+        t0=$(date +%s)
+        echo "$(date '+%H:%M:%S') crash $n: every node killed (pids ${pids[*]})" >>"$results/crash.log"
+        for ((i = 0; i < nodes; i++)); do
+            while port_in_use "$(client_port $i)"; do sleep 1; done
+        done
+        attempts=()
+        befores=()
+        for ((i = 0; i < nodes; i++)); do
+            attempts[i]=1
+            befores[i]=$(wc -l <"$cluster/node$i/voltdbroot/log/volt.log" 2>/dev/null || echo 0)
+            start_node $i "$cluster/recover$i-$n.log"
+        done
+        deadline=$((SECONDS + 600))
+        while true; do
+            up=0
+            for ((i = 0; i < nodes; i++)); do
+                log=$cluster/recover$i-$n.log
+                if grep -q "Server completed initialization" "$log" 2>/dev/null; then
+                    up=$((up + 1))
+                elif grep -q "Address already in use" "$log" 2>/dev/null && [ "${attempts[i]}" -lt 5 ]; then
+                    # another process's outgoing connection took the port; the attempt's FATAL lines are not the run's
+                    sleep 2
+                    vlog=$cluster/node$i/voltdbroot/log/volt.log
+                    echo "node$i $((befores[i] + 1)) $(wc -l <"$vlog")" >>"$results/chaos.excluded"
+                    echo "$(date '+%H:%M:%S') recover $n: node$i could not bind a port (attempt ${attempts[i]}), retrying" >>"$results/crash.log"
+                    mv "$log" "${log%.log}-bind${attempts[i]}.log"
+                    attempts[i]=$((attempts[i] + 1))
+                    befores[i]=$(wc -l <"$vlog" 2>/dev/null || echo 0)
+                    start_node $i "$log"
+                fi
+            done
+            [ "$up" -eq "$nodes" ] && break
+            if [ $SECONDS -ge $deadline ]; then
+                echo "$(date '+%H:%M:%S') recover $n: $up of $nodes nodes up after 600 s" >>"$results/crash.log"
+                return 1
+            fi
+            sleep 1
+        done
+        echo "$(date '+%H:%M:%S') recover $n: every node up, $(($(date +%s) - t0)) s after the crash" >>"$results/crash.log"
+    done
+}
+
+crash_pid=
+if [ "$crash_interval" -gt 0 ]; then
+    : >"$results/crash.log"
+    crash_loop &
+    crash_pid=$!
+    log "Killing every node and recovering the cluster every $crash_interval s (crash.log)"
 fi
 
 # Every resize_interval seconds, by turns: grow the cluster by k+1 nodes, then shrink it by the same nodes. A grow
@@ -625,6 +721,16 @@ if [ -n "$chaos_pid" ]; then
     rejoins=$(grep -c " rejoin [0-9]*: node[0-9]*, " "$results/chaos.log")
     log "Node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", the last one FAILED")"
 fi
+crash_failed=false
+crashes=0
+recoveries=0
+if [ -n "$crash_pid" ]; then
+    touch "$results/crash.stop"
+    wait "$crash_pid" || crash_failed=true
+    crashes=$(grep -c " crash [0-9]*: every node killed" "$results/crash.log")
+    recoveries=$(grep -c " recover [0-9]*: every node up" "$results/crash.log")
+    log "Crashes: $crashes, recoveries: $recoveries$($crash_failed && echo ", the last one FAILED")"
+fi
 resize_failed=false
 if [ -n "$resize_pid" ]; then
     touch "$results/resize.stop"
@@ -643,7 +749,7 @@ done
 stop_cluster
 for ((i = 0; i < nodes; i++)); do
     mkdir -p "$results/servers/node$i"
-    cp "$cluster/start$i.log" "$cluster/init$i.log" "$cluster"/restart$i-*.log "$results/servers/node$i/" 2>/dev/null
+    cp "$cluster/start$i.log" "$cluster/init$i.log" "$cluster"/restart$i-*.log "$cluster"/recover$i-*.log "$results/servers/node$i/" 2>/dev/null
     cp -R "$cluster/node$i/voltdbroot/log/." "$results/servers/node$i/" 2>/dev/null
 done
 for d in "$cluster"/add*-*; do
@@ -691,7 +797,7 @@ done
 
 result=PASS
 [ "$sqlancer_exit" -eq 0 ] && [ ${#failures[@]} -eq 0 ] && [ ${#down[@]} -eq 0 ] && [ "$fatal" -eq 0 ] &&
-    ! $chaos_failed && ! $resize_failed || result=FAIL
+    ! $chaos_failed && ! $resize_failed && ! $crash_failed || result=FAIL
 {
     echo "RESULT: $result"
     echo "run: $run_id"
@@ -703,6 +809,8 @@ result=PASS
     # ENG-30602: failures that did not recur when rerun at once (VoltDBTransientCheck), counted, not failed
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
+    [ "$crash_interval" -gt 0 ] && echo "crashes: $crashes crashes, $recoveries recoveries$($crash_failed && echo ", a recovery FAILED (crash.log)")"
+    [ "$crash_interval" -gt 0 ] && echo "databases DURABLE compared across a crash: $(grep -c "^DURABLE across a crash:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$resize_interval" -gt 0 ] && echo "resizes: $grows grows, $shrinks shrinks$($resize_failed && echo ", a step FAILED (resize.log)")"
     for f in ${failures[@]+"${failures[@]}"}; do
         echo
