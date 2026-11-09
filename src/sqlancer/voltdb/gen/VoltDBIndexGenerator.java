@@ -27,7 +27,12 @@ public final class VoltDBIndexGenerator {
         if (Randomly.getBooleanWithRatherLowProbability()) {
             boolean hasPartitionColumn = !table.isPartitioned()
                     || columns.stream().anyMatch(c -> c.getName().equals(table.getPartitionColumn()));
-            sb.append(hasPartitionColumn ? "UNIQUE " : "ASSUMEUNIQUE ");
+            if (hasPartitionColumn) {
+                sb.append("UNIQUE ");
+            } else if (!globalState.getDbmsSpecificOptions().resizes) {
+                // no ASSUMEUNIQUE index while the cluster resizes (see VoltDBTableGenerator)
+                sb.append("ASSUMEUNIQUE ");
+            }
         }
         sb.append("INDEX ").append(globalState.getFreeIndexName()).append(" ON ").append(table.getName()).append(" (")
                 .append(columns.stream().map(VoltDBColumn::getName).collect(Collectors.joining(", "))).append(')');

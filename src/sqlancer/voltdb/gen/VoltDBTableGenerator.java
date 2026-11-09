@@ -76,6 +76,13 @@ public final class VoltDBTableGenerator {
         }
         List<Column> uniqueKey = Randomly.getBooleanWithRatherLowProbability()
                 ? keyColumns(columns, partitionColumn, false) : null;
+        // ASSUMEUNIQUE holds only within a partition, so rows in two partitions can share its key; an elastic resize
+        // (--resizes) that moves one of them next to the other fails with "Found duplicates while rebalancing data
+        // across partitions" and retries for good, as VoltDB documents. The key is left out then.
+        if (uniqueKey != null && globalState.getDbmsSpecificOptions().resizes && partitionColumn != null
+                && !uniqueKey.contains(partitionColumn)) {
+            uniqueKey = null;
+        }
 
         StringBuilder sb = new StringBuilder("CREATE TABLE ").append(table).append(" (");
         sb.append(columns.stream().map(c -> c.name + " " + c.type + (c.notNull ? " NOT NULL" : ""))
