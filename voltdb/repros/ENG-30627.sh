@@ -19,7 +19,7 @@ cat >"$C/d.xml" <<X
   <user name="reader" password="reader" roles="r_read"/>
 </users></deployment>
 X
-"$V/bin/voltdb" init --force -D "$C/n" -C "$C/d.xml" >"$C/init.log" 2>&1 || exit 2
+"$V/bin/voltdb" init --force ${VOLTDB_LICENSE:+--license "$VOLTDB_LICENSE"} -D "$C/n" -C "$C/d.xml" >"$C/init.log" 2>&1 || exit 2
 (nohup "$V/bin/voltdb" start -D "$C/n" -H "localhost:$((B + 2))" --client=$B --admin=$((B + 1)) --internal=$((B + 2)) \
     --zookeeper=$((B + 3)) --replication=$((B + 4)) --metrics=$((B + 5)) >"$C/start.log" 2>&1 & echo $! >"$C/pid")
 trap '"$V/bin/voltadmin" shutdown --force -H "localhost:$((B + 1))" -u admin -p admin >/dev/null 2>&1; sleep 2; kill -9 $(cat "$C/pid") 2>/dev/null' EXIT

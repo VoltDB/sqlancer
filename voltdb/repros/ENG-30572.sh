@@ -43,7 +43,7 @@ JAVA
 "${java_bin}javac" -cp "$cp" -d "$WORKDIR/src" "$WORKDIR/src/Repro.java" || exit 2
 printf '<?xml version="1.0"?>\n<deployment>\n    <cluster sitesperhost="4" kfactor="0"/>\n    <httpd enabled="false"/>\n</deployment>\n' \
     >"$WORKDIR/deployment.xml"
-"$VOLTDB_HOME/bin/voltdb" init --force -D "$WORKDIR/node" -C "$WORKDIR/deployment.xml" >"$WORKDIR/init.log" 2>&1 || exit 2
+"$VOLTDB_HOME/bin/voltdb" init --force ${VOLTDB_LICENSE:+--license "$VOLTDB_LICENSE"} -D "$WORKDIR/node" -C "$WORKDIR/deployment.xml" >"$WORKDIR/init.log" 2>&1 || exit 2
 nohup "$VOLTDB_HOME/bin/voltdb" start -D "$WORKDIR/node" -H "localhost:$(p 2)" --client="$(p 0)" --admin="$(p 1)" \
     --internal="$(p 2)" --zookeeper="$(p 3)" --replication="$(p 4)" --metrics="$(p 5)" >"$WORKDIR/start.log" 2>&1 &
 pid=$!

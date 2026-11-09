@@ -27,7 +27,7 @@ for i in 0 1 2 3 4 5; do
 done
 printf '<?xml version="1.0"?>\n<deployment>\n    <cluster sitesperhost="4" kfactor="0"/>\n    <httpd enabled="false"/>\n</deployment>\n' \
     >"$WORKDIR/deployment.xml"
-"$VOLTDB_HOME/bin/voltdb" init --force -D "$WORKDIR/node0" -C "$WORKDIR/deployment.xml" >"$WORKDIR/init.log" 2>&1 ||
+"$VOLTDB_HOME/bin/voltdb" init --force ${VOLTDB_LICENSE:+--license "$VOLTDB_LICENSE"} -D "$WORKDIR/node0" -C "$WORKDIR/deployment.xml" >"$WORKDIR/init.log" 2>&1 ||
     { echo "voltdb init failed"; exit 2; }
 (nohup "$VOLTDB_HOME/bin/voltdb" start -D "$WORKDIR/node0" -c 1 -H "localhost:$(p 2)" \
     --client="$(p 0)" --admin="$(p 1)" --internal="$(p 2)" --zookeeper="$(p 3)" --replication="$(p 4)" \

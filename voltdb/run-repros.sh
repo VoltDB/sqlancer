@@ -47,6 +47,8 @@ done
 [ -x "$voltdb_home/bin/voltdb" ] || die "no bin/voltdb in $voltdb_home"
 license_args=()
 [ -z "$license" ] || license_args=(--license "$license")
+# the kit's bin first on the PATH, as sqlcmd otherwise prints a note that its scripts are not there
+export PATH=$voltdb_home/bin:$PATH
 
 run_id=repros-$(date -u +%Y%m%dT%H%M%SZ)
 results=$results_root/$run_id
@@ -155,10 +157,15 @@ run_sql() {
         echo "$setup" | "$voltdb_home/bin/sqlcmd" --port="$(port 0 0)" --stop-on-error=false 2>&1
     } >>"$log"
     output=$(echo "$check" | "$voltdb_home/bin/sqlcmd" --port="$(port 0 0)" --stop-on-error=false 2>&1 |
-        grep -v "^Warning: voltdb database\|^  But this script\|^    /" | normalize)
-    sleep 2
+        grep -v "^Warning: voltdb database\|^  But this script\|^    /\|^The 'voltdb' database scripts\|^For ease of use" |
+        normalize)
+    # a server that crashed can take some seconds to exit (writing its crash files) after the connection is lost
     alive=true
-    cluster_alive "$nodes" || alive=false
+    for _ in $(seq 1 20); do
+        sleep 1
+        cluster_alive "$nodes" || { alive=false; break; }
+        echo "$output" | grep -q "was lost before a response was received" || break
+    done
     {
         echo "== check (normalized)"
         echo "$output"
@@ -181,7 +188,7 @@ run_sql() {
 run_sh() {
     local f=$1 log=$2 rc
     mkdir -p "$work"
-    VOLTDB_HOME=$voltdb_home PORT_BASE=$port_base WORKDIR=$work timeout_secs=1800 bash "$f" >"$log" 2>&1
+    VOLTDB_HOME=$voltdb_home VOLTDB_LICENSE=$license PORT_BASE=$port_base WORKDIR=$work timeout_secs=1800 bash "$f" >"$log" 2>&1
     rc=$?
     case $rc in
     0) verdict=BROKEN ;;
