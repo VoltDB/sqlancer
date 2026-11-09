@@ -213,6 +213,12 @@ DDL statement (CREATE, DROP, ALTER, PARTITION), for up to 15 minutes. Without it
 the shrink streams its index snapshot hangs the shrink for good (ENG-30622). With `-- --avoid-known-bugs false` the
 provider ignores the file.
 
+With `--resizes`, the provider also makes no ASSUMEUNIQUE constraint or index (a unique key on a partitioned table
+that leaves out the partitioning column). VoltDB checks ASSUMEUNIQUE within a partition only, so two partitions can
+hold rows with the same key, and a resize that moves one of them next to the other fails ("Found duplicates while
+rebalancing data across partitions") and retries for good: lab build #40 hung a shrink this way for 10 minutes, until
+SQLancer dropped the table. VoltDB documents this; it is not a bug.
+
 An elastic join, like a rejoin, makes system requests time out for a minute (ENG-30229): `@SystemInformation` and
 `@SystemCatalog`, which the JDBC driver's `getMetaData()` and `DatabaseMetaData` calls send, fail with "OPS request hit
 sixty second timeout" or "Too many pending stat requests". The connection retries them for up to 150 seconds, with or
