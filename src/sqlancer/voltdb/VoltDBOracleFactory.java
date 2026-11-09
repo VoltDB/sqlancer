@@ -12,6 +12,7 @@ import sqlancer.voltdb.oracle.VoltDBDurabilityOracle;
 import sqlancer.voltdb.oracle.VoltDBGeographyOracle;
 import sqlancer.voltdb.oracle.VoltDBLimitOracle;
 import sqlancer.voltdb.oracle.VoltDBParameterOracle;
+import sqlancer.voltdb.oracle.VoltDBPermissionOracle;
 import sqlancer.voltdb.oracle.VoltDBPivotedQuerySynthesisOracle;
 import sqlancer.voltdb.oracle.VoltDBPlanOracle;
 import sqlancer.voltdb.oracle.VoltDBSchemaChangeOracle;
@@ -134,6 +135,17 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBDurabilityOracle(globalState);
+        }
+    },
+
+    /**
+     * Permissions, with --security: the users reader (SQLREAD) and writer (SQL) may run what their roles allow and
+     * nothing else, and a refused statement changes nothing.
+     */
+    PERMS {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBPermissionOracle(globalState, expressionErrors());
         }
     },
 

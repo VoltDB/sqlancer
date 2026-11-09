@@ -46,6 +46,10 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
                      --kill-interval, --resize-interval, --crash-interval or --xdcr.
   --upgrade-java-home DIR  JAVA_HOME for the older kit's nodes (default: the environment's)
   --upgrade-at S     seconds into the run to start the upgrade (default: a third of --duration)
+  --security         enable security: SQLancer connects as the administrator "sqlancer", and the provider gets
+                     --security true, for the PERMS oracle's users "reader" (role sqlancer_read, SQLREAD) and
+                     "writer" (role sqlancer_write, SQL). Not with --kill-interval, --resize-interval,
+                     --crash-interval, --xdcr or --upgrade-from.
   --keep-cluster     leave the cluster running and its data in place after the run
   --mirror-voltdb DIR  also start one node of this other VoltDB kit (normally the last release) and run
                      the provider with --mirror: every change is repeated on it, and the DIFF oracle
@@ -86,6 +90,7 @@ keep_cluster=false
 kill_interval=0
 crash_interval=0
 xdcr=false
+security=false
 upgrade_from=
 upgrade_java_home=
 upgrade_at=
@@ -115,6 +120,7 @@ while [ $# -gt 0 ]; do
     --kill-interval) kill_interval=$2; shift 2 ;;
     --crash-interval) crash_interval=$2; shift 2 ;;
     --xdcr) xdcr=true; shift ;;
+    --security) security=true; shift ;;
     --upgrade-from) upgrade_from=$2; shift 2 ;;
     --upgrade-java-home) upgrade_java_home=$2; shift 2 ;;
     --upgrade-at) upgrade_at=$2; shift 2 ;;
@@ -167,6 +173,15 @@ if [ -n "$upgrade_from" ]; then
     # a stopped node drops the calls in flight on it, which the provider then expects (see VoltDBErrors)
     provider_args=(--upgrades true ${provider_args[@]+"${provider_args[@]}"})
 fi
+if $security; then
+    [ "$kill_interval" -eq 0 ] && [ "$resize_interval" -eq 0 ] && [ "$crash_interval" -eq 0 ] && ! $xdcr &&
+        [ -z "$upgrade_from" ] ||
+        die "--security does not mix with --kill-interval, --resize-interval, --crash-interval, --xdcr or --upgrade-from"
+    provider_args=(--security true ${provider_args[@]+"${provider_args[@]}"})
+fi
+# the administrator's credentials for voltadmin and sqlancer, with --security
+admin_creds=()
+$security && admin_creds=(-u sqlancer -p sqlancer)
 if $xdcr; then
     [ "$kill_interval" -eq 0 ] && [ "$resize_interval" -eq 0 ] && [ "$crash_interval" -eq 0 ] ||
         die "--xdcr does not mix with --kill-interval, --resize-interval or --crash-interval"
@@ -316,10 +331,10 @@ stop_cluster() {
     # by port only once this run's node 0 is known to be up, so that it cannot reach another server on that port
     # at most 120 s: on a wedged cluster (ENG-30612) the shutdown never returns, and the processes are killed below
     if grep -q "Server completed initialization" "$cluster/node0/voltdbroot/log/volt.log" 2>/dev/null; then
-        within 120 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port 0)" >>"$results/run.log" 2>&1
+        within 120 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port 0)" ${admin_creds[@]+"${admin_creds[@]}"} >>"$results/run.log" 2>&1
     fi
     if [ -n "$mirror_home" ] && grep -q "Server completed initialization" "$cluster/mirror/voltdbroot/log/volt.log" 2>/dev/null; then
-        within 120 mirror_cmd "$mirror_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $nodes)" >>"$results/run.log" 2>&1
+        within 120 mirror_cmd "$mirror_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $nodes)" ${admin_creds[@]+"${admin_creds[@]}"} >>"$results/run.log" 2>&1
     fi
     if $xdcr && grep -q "Server completed initialization" "$cluster/xdcr0/voltdbroot/log/volt.log" 2>/dev/null; then
         within 120 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $xdcr_slot)" >>"$results/run.log" 2>&1
@@ -378,6 +393,7 @@ sqlancer_dirty=$(git -C "$repo_dir" status --porcelain 2>/dev/null | grep -v '^?
     echo "kill interval:    $([ "$kill_interval" -gt 0 ] && echo "$kill_interval s" || echo never)"
     echo "xdcr:             $($xdcr && echo "a second cluster of $nodes node(s), k=$kfactor, client ports $(xdcr_hosts client)" || echo no)"
     echo "upgrade:          $([ -n "$upgrade_from" ] && echo "from $upgrade_from ($(upgrade_cmd "$upgrade_from/bin/voltdb" --version 2>&1 | tail -1)) at $upgrade_at s" || echo no)"
+    echo "security:         $($security && echo "on: users sqlancer (administrator), reader (sqlancer_read), writer (sqlancer_write)" || echo off)"
     echo "crash interval:   $([ "$crash_interval" -gt 0 ] && echo "$crash_interval s, every node killed and recovered" || echo never)"
     echo "resize interval:  $([ "$resize_interval" -gt 0 ] && echo "$resize_interval s, $added nodes added and removed by turns" || echo never)"
     echo "provider options: ${provider_args[*]:-}"
@@ -402,11 +418,22 @@ if $xdcr; then
         <connection source="'$(xdcr_hosts replication)'"/>
     </dr>'
 fi
+# with --security, three users; the provider creates the two roles (CREATE ROLE) when it first connects
+users=
+if $security; then
+    users='
+    <security enabled="true" provider="hash"/>
+    <users>
+        <user name="sqlancer" password="sqlancer" roles="administrator"/>
+        <user name="reader" password="reader" roles="sqlancer_read"/>
+        <user name="writer" password="writer" roles="sqlancer_write"/>
+    </users>'
+fi
 cat >"$cluster/deployment.xml" <<EOF
 <?xml version="1.0"?>
 <deployment>
     <cluster sitesperhost="$sites" kfactor="$kfactor"/>
-    <httpd enabled="false"/>$durability$dr
+    <httpd enabled="false"/>$durability$dr$users
 </deployment>
 EOF
 
@@ -530,7 +557,7 @@ fi
 # --- SQLancer ----------------------------------------------------------------------------------------------------
 
 sqlancer_args=(--num-threads "$threads" --num-tries "$threads" --timeout-seconds "$duration" --num-queries "$queries"
-    --random-seed "$seed" --host localhost --port "$(client_port 0)" --username "" --password ""
+    --random-seed "$seed" --host localhost --port "$(client_port 0)" --username "$($security && echo sqlancer)" --password "$($security && echo sqlancer)"
     --database-prefix db --num-statement-kind-retries 20)
 # A failed INSERT is retried with new values, up to SQLancer's default of 1000 times; once a table's key has run out of
 # values (a BOOLEAN or TINYINT primary key, say), each of a database's inserts spent 1000 constraint violations, and
@@ -1030,6 +1057,7 @@ result=PASS
     echo "FATAL lines in server logs: $fatal"
     # ENG-30602: failures that did not recur when rerun at once (VoltDBTransientCheck), counted, not failed
     grep -m1 "^PLANS compared different plans:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^PERMS checked:" "$results/sqlancer/out.log" 2>/dev/null
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
     [ "$crash_interval" -gt 0 ] && echo "crashes: $crashes crashes, $recoveries recoveries$($crash_failed && echo ", a recovery FAILED (crash.log)")"

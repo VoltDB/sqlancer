@@ -13,6 +13,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
@@ -53,6 +54,8 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
     // with --crashes, how long a connection is retried while the cluster recovers (run-sqlancer.sh gives a recovery
     // 600 s)
     private static final long CRASH_CONNECT_MILLIS = 660_000;
+
+    private static final AtomicBoolean ROLES_CREATED = new AtomicBoolean();
 
     public VoltDBProvider() {
         super(VoltDBGlobalState.class, VoltDBOptions.class);
@@ -197,6 +200,19 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
                     false);
             dropLeftovers(globalState, mirrorCon, false);
             sqlCon.setMirror(mirrorCon);
+        }
+        // the PERMS oracle's roles, once per run (a statement through sqlCon also runs on the mirror)
+        if (globalState.getDbmsSpecificOptions().security && ROLES_CREATED.compareAndSet(false, true)) {
+            for (String role : new String[] { "CREATE ROLE sqlancer_read WITH SQLREAD",
+                    "CREATE ROLE sqlancer_write WITH SQL" }) {
+                try (Statement st = sqlCon.createStatement()) {
+                    st.execute(role);
+                } catch (SQLException e) {
+                    if (!e.getMessage().contains("already exists")) {
+                        throw e;
+                    }
+                }
+            }
         }
         return sqlCon;
     }
