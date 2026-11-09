@@ -560,8 +560,8 @@ PQS's evaluator does not model these functions: a PQS query that holds one is sk
 
 ### The GEO oracle
 
-GEO (`oracle/VoltDBGeographyOracle`) checks GEOGRAPHY_POINT and GEOGRAPHY against geography computed in Java. Once
-per database it creates a table `<prefix>GEO (id, p GEOGRAPHY_POINT, g GEOGRAPHY(1024))`, replicated or partitioned
+GEO (`oracle/VoltDBGeographyOracle`) checks GEOGRAPHY_POINT and GEOGRAPHY against geography computed in Java. On one
+database in four (its first check there) it creates a table `<prefix>GEO (id, p GEOGRAPHY_POINT, g GEOGRAPHY(1024))`, replicated or partitioned
 on id, with twelve rows: a random point and a small box, written counter-clockwise (VoltDB rejects a clockwise ring as
 "not normalized"). It checks:
 
@@ -577,6 +577,10 @@ on id, with twelve rows: a random point and a small box, written counter-clockwi
 
 The table is dropped at the end, and the schema reader ignores it, so no other oracle reads its columns. A failure has
 no reproducer; its message holds the statements and the query.
+
+GEO runs on one database in four and skips the rest. Its four catalog updates (CREATE TABLE, CREATE INDEX and two
+DROPs) block the whole cluster: run on every database, as in milestone 19, they cost the other oracles about 40% of
+their queries (4,481 against 7,724 in 150 seconds on 1 node, 4 threads).
 
 ## The DIFF oracle
 
