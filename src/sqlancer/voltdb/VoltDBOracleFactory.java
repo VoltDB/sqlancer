@@ -10,6 +10,7 @@ import sqlancer.voltdb.oracle.VoltDBDerivedTableOracle;
 import sqlancer.voltdb.oracle.VoltDBLimitOracle;
 import sqlancer.voltdb.oracle.VoltDBParameterOracle;
 import sqlancer.voltdb.oracle.VoltDBPivotedQuerySynthesisOracle;
+import sqlancer.voltdb.oracle.VoltDBSchemaChangeOracle;
 import sqlancer.voltdb.oracle.VoltDBSetOperationOracle;
 import sqlancer.voltdb.oracle.VoltDBSmokeOracle;
 import sqlancer.voltdb.oracle.VoltDBSubqueryOracle;
@@ -106,6 +107,18 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBParameterOracle(globalState, expressionErrors());
+        }
+    },
+
+    /**
+     * Schema changes mid-run and the plan cache: queries over a table return the same rows from a new plan, from the
+     * cached plan, after a change to the table that does not touch what they read (an index, an added column, a wider
+     * VARCHAR), and after the change is undone. Once per database.
+     */
+    SCHEMA {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBSchemaChangeOracle(globalState, expressionErrors());
         }
     },
 

@@ -126,6 +126,12 @@ public class VoltDBParameterOracle implements TestOracle<VoltDBGlobalState> {
             verify(queries, queries::run);
             return;
         }
+        // ENG-30612: a node killed while an @UpdateCore is in flight can wedge the MPI for good, and this oracle's
+        // CREATE and DROP PROCEDURE batches are frequent catalog updates; unless --avoid-known-bugs is false it does
+        // nothing while nodes fail
+        if (state.getDbmsSpecificOptions().nodeFailures && avoidKnownBugs) {
+            throw new IgnoreMeException();
+        }
         for (int i = 0; i < QUERIES_PER_CHECK; i++) {
             try {
                 Queries queries = generate();

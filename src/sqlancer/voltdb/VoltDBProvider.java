@@ -26,6 +26,7 @@ import sqlancer.SQLConnection;
 import sqlancer.SQLGlobalState;
 import sqlancer.SQLProviderAdapter;
 import sqlancer.StatementExecutor;
+import sqlancer.common.oracle.TestOracle;
 import sqlancer.common.query.SQLQueryAdapter;
 import sqlancer.common.query.SQLQueryProvider;
 import sqlancer.voltdb.gen.VoltDBDeleteGenerator;
@@ -34,6 +35,7 @@ import sqlancer.voltdb.gen.VoltDBInsertGenerator;
 import sqlancer.voltdb.gen.VoltDBTableGenerator;
 import sqlancer.voltdb.gen.VoltDBUpdateGenerator;
 import sqlancer.voltdb.gen.VoltDBViewGenerator;
+import sqlancer.voltdb.oracle.VoltDBTransientCheck;
 
 /**
  * SQLancer provider for VoltDB, connecting through the VoltDB JDBC driver.
@@ -184,6 +186,15 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
             }
         }
         return sqlCon;
+    }
+
+    // ENG-30602: unless --avoid-known-bugs is false, a failure that does not recur when its queries are rerun at once
+    // is counted, not reported (see VoltDBTransientCheck)
+    @Override
+    protected TestOracle<VoltDBGlobalState> getTestOracle(VoltDBGlobalState globalState) throws Exception {
+        TestOracle<VoltDBGlobalState> oracle = super.getTestOracle(globalState);
+        return globalState.getDbmsSpecificOptions().avoidKnownBugs ? new VoltDBTransientCheck(oracle, globalState)
+                : oracle;
     }
 
     @Override

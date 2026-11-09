@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 17.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 18.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -19,7 +19,9 @@ SQLancer connects to every node. Since milestone 16 the SETOPS oracle checks UNI
 DERIVED oracle checks derived tables and WITH, recursive WITH included; see
 [Set operations, derived tables and WITH](#set-operations-derived-tables-and-with). Since milestone 17 the PROCEDURE
 oracle checks ad hoc queries against the same queries as stored procedures, single-partition ones included; see
-[The PROCEDURE oracle](#the-procedure-oracle).
+[The PROCEDURE oracle](#the-procedure-oracle). Since milestone 18 the SCHEMA oracle changes a table's schema in the
+middle of the run and checks that queries return the same rows from new plans, cached plans and plans made after the
+change; see [The SCHEMA oracle](#the-schema-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -100,6 +102,12 @@ A run FAILs if any of these happens:
 - A server log has a FATAL line.
 - With `--kill-interval`, a killed node does not rejoin within 600 seconds.
 
+While `--avoid-known-bugs` is true (the default), a failed check whose queries no longer fail when its reproducer
+reruns them at once is not a failure. It is printed as `ENG-30602 transient: ...` in `sqlancer/out.log`, and the
+summary counts it as "transient results skipped (ENG-30602)". ENG-30602 is a VoltDB bug in which a query, now and
+then, gets another statement's result while other connections change the schema. A failure that recurs is a failure,
+and so is one from an oracle without a reproducer (SCHEMA, GEO).
+
 The script passes SQLancer `--num-statement-kind-retries 20`: a failed INSERT is retried with new values, up to
 SQLancer's default of 1,000 times, so once a table's key had run out of values (a BOOLEAN or TINYINT primary key, say)
 each of a database's inserts spent 1,000 constraint violations, and SQLancer's "successful statements" fell below 70%.
@@ -163,7 +171,7 @@ the kit's runtime JDK and makes three runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all fourteen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all fifteen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA) | 45 minutes |
 | `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
 | `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
 
@@ -231,7 +239,7 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | `--username`, `--password` | Empty for a server without security (SQLancer's default is `sqlancer`). |
 | `--host`, `--port` | A server's client port. Defaults: localhost, 21212. |
 | `--database-prefix` | Prefix of each thread's table names. Default `database`; `db` keeps the logs short. |
-| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT`, `SUBQUERY`, `WINDOW`, `SETOPS`, `DERIVED`, `PROCEDURE` or `SMOKE`; several are comma-separated. |
+| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT`, `SUBQUERY`, `WINDOW`, `SETOPS`, `DERIVED`, `PROCEDURE`, `SCHEMA` or `SMOKE`; several are comma-separated. |
 | `--max-num-tables` | Tables per database, 1 to this (default 3). |
 | `--max-num-indexes` | CREATE INDEX statements per database, 0 to this (default 4). |
 | `--max-num-updates` | UPDATE statements per database, 0 to this (default 5). |
@@ -495,6 +503,36 @@ dropped is dropped when its database's name is next used.
 A failure reports the procedure, the call and the rows only one side returned. The reproducer creates the procedure,
 calls it and drops it again, so `--use-reducer` can reduce it.
 
+## The SCHEMA oracle
+
+SCHEMA (`oracle/VoltDBSchemaChangeOracle`) checks schema changes made in the middle of a run, and VoltDB's plan cache.
+It writes up to eight queries over one table, each a SELECT of columns or expressions with a WHERE clause half the
+time. It runs each query twice: the first run plans it, and the second runs the cached plan. Then it changes the table
+and runs the queries again; the catalog changed, so they need new plans. It undoes the change and runs them a fourth
+time. All four runs must return the same rows.
+
+The change is one of:
+
+- `CREATE INDEX` on one to three of the table's columns, undone by `DROP INDEX`. It can change every plan that reads
+  the table.
+- `ALTER TABLE t ADD COLUMN x type [DEFAULT d]`, undone by `DROP COLUMN`. It rewrites every row, so every row's new
+  value must be d, or NULL without a DEFAULT: `SELECT COUNT(*) FROM t WHERE x = d` must count every row. The types
+  include a VARCHAR(100) whose default VoltDB stores outside the tuple.
+- `ALTER TABLE t ALTER COLUMN c VARCHAR(n)` with a larger n, on a VARCHAR column outside the primary key and the
+  partitioning column. It isn't undone. It can move the column's values out of
+  the tuple when n crosses 63 bytes.
+
+Each catalog update blocks every partition, so the oracle changes the schema once per database, on its first check,
+and skips its later checks. Tables with a materialized view are left out: VoltDB refuses most changes to them. If VoltDB
+refuses a change, the check is skipped: this oracle checks query results, not which changes VoltDB allows.
+
+A failure has no reproducer: reducing the database's statements would lose the order of the queries and the change.
+The failure message holds the change, the undo and the query.
+
+While nodes fail (`--node-failures`), SCHEMA and PROCEDURE do nothing unless `--avoid-known-bugs` is false:
+ENG-30612, an MPI deadlock when a node dies during an @UpdateCore. SCHEMA's slow ALTER TABLE and PROCEDURE's frequent
+DDL batches make such a kill likely. The wedge happened twice in the lab, the second time with SCHEMA already off.
+
 ## The VIEWS oracle
 
 VIEWS (`oracle/VoltDBViewOracle`) checks VoltDB's materialized views, which it keeps up to date as their tables
@@ -754,7 +792,7 @@ avoids each one as described; set it to false to check whether a fix works.
 | ENG-30494 | BOOLEAN literals are passed to the EE as parameters of the wrong value or type: cast errors and wrong rows. | Boolean constants are written `(1 = 1)` and `(1 = 0)`. |
 | ENG-30495 | A WHERE clause that folds to a constant NULL crashes the planner (NPE). | No NULL constants; NULLs come from the data. |
 | ENG-30496 | LIKE inside CASE WHEN crashes the planner when its left operand is a constant or its pattern has no wildcard or is just `%`. | LIKE's left operand is a string column; the pattern has a wildcard and a literal character. |
-| ENG-30497 | With an outer join, a boolean expression over the inner table, such as `(t.c IS NULL) IS NOT NULL` or `(t.c IS NULL) = TRUE`, turns the join into an inner join: wrong rows. In milestone 7 the nightly lab job found it again through a later join's ON condition: `(t0.b OR t2.b) IS NOT NULL` with `t2` null-extended by an earlier join. | With an outer join, boolean operands of comparisons, IN and IS NULL are columns or constants, in WHERE clauses and in every explicit join's ON condition. |
+| ENG-30497 | With an outer join, a boolean expression over the inner table, such as `(t.c IS NULL) IS NOT NULL` or `(t.c IS NULL) = TRUE`, turns the join into an inner join: wrong rows. In milestone 7 the nightly lab job found it again through a later join's ON condition: `(t0.b OR t2.b) IS NOT NULL` with `t2` null-extended by an earlier join. In milestone 18 (lab build #35) NoREC found it through a correlated scalar subquery: `1 <> (SELECT COUNT(*) FROM r WHERE t.c > 0)` is TRUE for the null-extended row, as the COUNT is 0. | With an outer join, boolean operands of comparisons, IN and IS NULL are columns or constants, in WHERE clauses and in every explicit join's ON condition, and a scalar subquery is a MIN or MAX, not a COUNT. |
 | ENG-30499 | Comparing a DATE constant with a TIMESTAMP constant crashes the planner (ClassCastException). | Temporal constants are `CAST('...' AS TIMESTAMP)`. |
 | ENG-30500 | A boolean expression `IN (NULL, ...)` gives wrong rows. | IN list elements are constants that are not NULL. |
 | ENG-30502 | Unary minus on a NULL integer or FLOAT gives a non-NULL value. | `0 - x` instead of `-x`. |
@@ -891,6 +929,14 @@ The bugs below were found in milestone 17.
 | ENG-30610 | A join with a constant ON condition (`ON 1 = 1`) is not auto-parameterized, and with `WHERE p.c = x'..'` on a VARBINARY partitioning column it runs single-partition on the wrong partition: `SELECT VB.c0 FROM VB JOIN R ON 1 = 1 WHERE VB.c0 = x'03'` returns no row (with `ON TRUE`, or a parameter, it is right). Found by PROCEDURE's PARAMS check on 3 nodes. Wrong result. | No table is partitioned on a VARBINARY column. |
 | ENG-30608 | Intermittent node crash (SIGILL): a site thread recursed without end through `SeqScanExecutor::p_execute`, `ExecutorContext::getCommonTable` and `executeExecutors` while the DERIVED oracle's `WITH RECURSIVE` query ran, beside other threads' catalog updates: twice in three 20-minute 1-node trials with PROCEDURE, never in the lab without it, and not reproducible on demand. | DERIVED's RECURSIVE mode is off. |
 | ENG-30609 | `SELECT COUNT(*) FROM rc`, rc a recursive common table, fails to plan: "TableCountPlanNode cannot be cast to SeqScanPlanNode". Found reducing ENG-30608. | DERIVED selects the common table's column, not `COUNT(*)`. |
+
+The bugs below were found in milestone 18.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30612 | A node killed while an ad hoc DDL's @UpdateCore is in flight: a surviving host reclaims the dead host's catalog-update blocker before the interrupted @UpdateCore is resolved on the leaders, the next @UpdateCore queues behind it on five leaders, and the MPI deadlocks; every later DDL is "in progress on host 2" and the node's rejoin times out after 600 s. Found by the nightly run with node failures (lab builds #32 and #33). Critical. | SCHEMA and PROCEDURE do nothing while nodes fail. |
+| ENG-30614 | An outer join whose ON condition is, or folds to, FALSE returns no rows at all, not the preserved rows null-extended: `A LEFT JOIN B ON 1 = 0` returns nothing (the plan's `filter by false` is applied to the join's output). Also on 16.0.0. Found by PARAMS on 1 node (lab build #34), where the literal form of the ON condition folded to FALSE and the parameterized one did not. Wrong result. | No AND, OR or NOT in an ON condition has a column-free operand, so nothing in it folds to a constant. |
+| ENG-30602 (seen again) | Three times in lab builds #31 and #32, 1 node: a SUBQUERY EXISTS query returned one row holding 0, another returned no rows where 4 were right, and a two-column query read a one-column result. Rerunning the same statements returned the right rows each time. The rate rises with the schema changes of PROCEDURE and SCHEMA. | A failure that does not recur when rerun at once is counted, not failed (`VoltDBTransientCheck`). |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
