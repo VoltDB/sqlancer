@@ -31,6 +31,12 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
   --kill-interval S  every S seconds, kill a random node, node 0 included, with kill -9 and restart it,
                      which rejoins it to the cluster (default 0: never). Needs --kfactor 1 or more.
   --keep-cluster     leave the cluster running and its data in place after the run
+  --mirror-voltdb DIR  also start one node of this other VoltDB kit (normally the last release) and run
+                     the provider with --mirror: every change is repeated on it, and the DIFF oracle
+                     compares the two clusters' rows
+  --mirror-license FILE  license for the mirror's voltdb init (default: --license)
+  --mirror-java-home DIR  JAVA_HOME for the mirror (default: the environment's); an older release may
+                     not run on the newer JDK the cluster uses (16.0.0 needs Java 17 or 21)
   -h, --help         this help
 
 Options after -- go to the provider, after "voltdb --oracle ...", e.g. -- --avoid-known-bugs false.
@@ -62,6 +68,9 @@ results_root=$PWD/sqlancer-results
 use_reducer=false
 keep_cluster=false
 kill_interval=0
+mirror_home=
+mirror_license=
+mirror_java_home=
 provider_args=()
 command_line="$0 $*"
 
@@ -82,6 +91,9 @@ while [ $# -gt 0 ]; do
     --use-reducer) use_reducer=true; shift ;;
     --keep-cluster) keep_cluster=true; shift ;;
     --kill-interval) kill_interval=$2; shift 2 ;;
+    --mirror-voltdb) mirror_home=$2; shift 2 ;;
+    --mirror-license) mirror_license=$2; shift 2 ;;
+    --mirror-java-home) mirror_java_home=$2; shift 2 ;;
     -h | --help) usage; exit 0 ;;
     --) shift; provider_args=("$@"); break ;;
     *) usage >&2; die "unknown option: $1" ;;
@@ -94,6 +106,16 @@ license_args=()
 if [ -n "$license" ]; then
     [ -r "$license" ] || die "cannot read the license $license"
     license_args=(--license "$license")
+fi
+mirror_license_args=()
+if [ -n "$mirror_home" ]; then
+    [ -x "$mirror_home/bin/voltdb" ] || die "no bin/voltdb in $mirror_home"
+    [ -z "$mirror_java_home" ] || [ -x "$mirror_java_home/bin/java" ] || die "no bin/java in $mirror_java_home"
+    mirror_license=${mirror_license:-$license}
+    if [ -n "$mirror_license" ]; then
+        [ -r "$mirror_license" ] || die "cannot read the license $mirror_license"
+        mirror_license_args=(--license "$mirror_license")
+    fi
 fi
 for n in "$nodes" "$sites" "$duration" "$threads" "$queries" "$port_base" "$kill_interval"; do
     case $n in '' | *[!0-9]*) die "not a number: '$n'" ;; esac
@@ -142,7 +164,9 @@ internal_port() { port "$1" 2; }
 
 port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
-for ((i = 0; i < nodes; i++)); do
+# the mirror, if any, takes the port slot after the last node's
+for ((i = 0; i < nodes + 1; i++)); do
+    [ "$i" -eq "$nodes" ] && [ -z "$mirror_home" ] && break
     for j in 0 1 2 3 4 5; do
         p=$(port $i $j)
         port_in_use "$p" && die "port $p is in use; pick another --port-base"
@@ -162,6 +186,15 @@ cluster_started=false
 sqlancer_pid=
 
 # within SECS COMMAND...: runs COMMAND, killing it after SECS seconds (macOS has no timeout(1))
+# runs a command of the mirror's kit with the mirror's JAVA_HOME, if any
+mirror_cmd() {
+    if [ -n "$mirror_java_home" ]; then
+        JAVA_HOME=$mirror_java_home PATH=$mirror_java_home/bin:$PATH "$@"
+    else
+        "$@"
+    fi
+}
+
 within() {
     local secs=$1
     shift
@@ -189,13 +222,16 @@ stop_cluster() {
     if grep -q "Server completed initialization" "$cluster/node0/voltdbroot/log/volt.log" 2>/dev/null; then
         within 120 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port 0)" >>"$results/run.log" 2>&1
     fi
+    if [ -n "$mirror_home" ] && grep -q "Server completed initialization" "$cluster/mirror/voltdbroot/log/volt.log" 2>/dev/null; then
+        within 120 mirror_cmd "$mirror_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $nodes)" >>"$results/run.log" 2>&1
+    fi
     # only processes started for this run carry its directory on their command line, and their PIDs are recorded
     for _ in $(seq 1 30); do
         pgrep -f "$cluster/" >/dev/null || break
         sleep 1
     done
     pkill -f "$cluster/" 2>/dev/null
-    for f in "$cluster"/node*.pid; do
+    for f in "$cluster"/node*.pid "$cluster"/mirror.pid; do
         [ -e "$f" ] && is_server "$(cat "$f")" && kill -9 "$(cat "$f")" 2>/dev/null
     done
 }
@@ -228,6 +264,7 @@ sqlancer_dirty=$(git -C "$repo_dir" status --porcelain 2>/dev/null | grep -v '^?
     echo "voltdb:           $voltdb_home"
     echo "voltdb version:   $("$voltdb_home/bin/voltdb" --version 2>&1 | tail -1)"
     echo "license:          ${license:-none}"
+    [ -n "$mirror_home" ] && echo "mirror:           $mirror_home ($(mirror_cmd "$mirror_home/bin/voltdb" --version 2>&1 | tail -1)), 1 node, client port $(client_port $nodes)$([ -z "$mirror_java_home" ] || echo ", java $(mirror_cmd java -version 2>&1 | head -1)")"
     echo "java:             $("$java" -version 2>&1 | head -1)"
     echo "nodes:            $nodes"
     echo "kfactor:          $kfactor"
@@ -298,6 +335,33 @@ if [ "$ready" -ne "$nodes" ]; then
     exit 2
 fi
 log "Cluster ready: $(grep -h -m1 "^Build:" "$cluster/init0.log" 2>/dev/null)"
+
+# --- mirror (DIFF) -----------------------------------------------------------------------------------------------
+
+# one node of the other kit, k=0, the same sites per host, on the port slot after the last node's
+if [ -n "$mirror_home" ]; then
+    m=$nodes
+    sed "s/kfactor=\"$kfactor\"/kfactor=\"0\"/" "$cluster/deployment.xml" >"$cluster/deployment-mirror.xml"
+    mirror_cmd "$mirror_home/bin/voltdb" init --force -D "$cluster/mirror" -C "$cluster/deployment-mirror.xml" \
+        ${mirror_license_args[@]+"${mirror_license_args[@]}"} >"$cluster/init-mirror.log" 2>&1 ||
+        die "voltdb init failed for the mirror; see $cluster/init-mirror.log"
+    (if [ -n "$mirror_java_home" ]; then export JAVA_HOME=$mirror_java_home PATH=$mirror_java_home/bin:$PATH; fi
+        nohup "$mirror_home/bin/voltdb" start -D "$cluster/mirror" -c 1 -H "localhost:$(internal_port $m)" \
+        --client="$(client_port $m)" --admin="$(admin_port $m)" --internal="$(internal_port $m)" \
+        --zookeeper="$(port $m 3)" --replication="$(port $m 4)" --metrics="$(port $m 5)" \
+        >"$cluster/start-mirror.log" 2>&1 &
+        echo $! >"$cluster/mirror.pid")
+    for _ in $(seq 1 300); do
+        grep -q "Server completed initialization" "$cluster/mirror/voltdbroot/log/volt.log" 2>/dev/null && break
+        # a mirror that exited (a JDK it refuses, say) will not start: stop waiting
+        kill -0 "$(cat "$cluster/mirror.pid")" 2>/dev/null || break
+        sleep 1
+    done
+    grep -q "Server completed initialization" "$cluster/mirror/voltdbroot/log/volt.log" 2>/dev/null ||
+        die "the mirror did not start; see $cluster/start-mirror.log: $(tail -1 "$cluster/start-mirror.log" 2>/dev/null)"
+    log "Mirror ready: $(grep -h -m1 "^Build:" "$cluster/init-mirror.log" 2>/dev/null), client port $(client_port $m)"
+    provider_args+=(--mirror "localhost:$(client_port $m)")
+fi
 
 # --- SQLancer ----------------------------------------------------------------------------------------------------
 
@@ -411,6 +475,11 @@ for ((i = 0; i < nodes; i++)); do
     cp "$cluster/start$i.log" "$cluster/init$i.log" "$cluster"/restart$i-*.log "$results/servers/node$i/" 2>/dev/null
     cp -R "$cluster/node$i/voltdbroot/log/." "$results/servers/node$i/" 2>/dev/null
 done
+if [ -n "$mirror_home" ]; then
+    mkdir -p "$results/servers/mirror"
+    cp "$cluster/start-mirror.log" "$cluster/init-mirror.log" "$results/servers/mirror/" 2>/dev/null
+    cp -R "$cluster/mirror/voltdbroot/log/." "$results/servers/mirror/" 2>/dev/null
+fi
 cp "$cluster/deployment.xml" "$results/"
 $keep_cluster || rm -rf "$cluster"
 

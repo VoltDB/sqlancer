@@ -41,6 +41,9 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--node-failures", description = "Nodes are killed and rejoined during the run (run-sqlancer.sh --kill-interval): expect and retry the errors that causes", arity = 1)
     public boolean nodeFailures;
 
+    @Parameter(names = "--mirror", description = "Comma-separated host:port client addresses of a second cluster, normally running another VoltDB version: every statement that changes the database is repeated on it, and the DIFF oracle compares the two clusters' rows for the same query")
+    public String mirror;
+
     @Parameter(names = "--servers", description = "Comma-separated host:port client addresses of every node; SQLancer connects to all of them, so it keeps working while any one node is down (used instead of --host and --port)")
     public String servers;
 

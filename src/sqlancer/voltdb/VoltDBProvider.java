@@ -153,39 +153,55 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
         String servers = globalState.getDbmsSpecificOptions().servers;
         String url = servers == null || servers.isBlank() ? String.format("jdbc:voltdb://%s:%d", host, port)
                 : "jdbc:voltdb://" + servers.trim() + "?topologychangeaware=true";
+        VoltDBConnection sqlCon = connect(globalState, url, globalState.getDbmsSpecificOptions().nodeFailures);
+        dropLeftovers(globalState, sqlCon, true);
+        // DIFF (milestone 20): a second cluster, normally the last release, that every change is repeated on
+        String mirror = globalState.getDbmsSpecificOptions().mirror;
+        if (mirror != null && !mirror.isBlank()) {
+            VoltDBConnection mirrorCon = connect(globalState,
+                    "jdbc:voltdb://" + mirror.trim() + (mirror.contains(",") ? "?topologychangeaware=true" : ""),
+                    false);
+            dropLeftovers(globalState, mirrorCon, false);
+            sqlCon.setMirror(mirrorCon);
+        }
+        return sqlCon;
+    }
+
+    private static VoltDBConnection connect(VoltDBGlobalState globalState, String url, boolean nodeFailures)
+            throws SQLException {
         Connection con = DriverManager.getConnection(url, globalState.getOptions().getUserName(),
                 globalState.getOptions().getPassword());
-        SQLConnection sqlCon = new VoltDBConnection(con, globalState.getDbmsSpecificOptions().retrySeconds,
-                globalState.getDbmsSpecificOptions().nodeFailures);
-        DatabaseMetaData md = ((VoltDBConnection) sqlCon).getMetaData();
+        return new VoltDBConnection(con, globalState.getDbmsSpecificOptions().retrySeconds, nodeFailures);
+    }
+
+    // drops the database's procedures and tables left by an earlier use of its name; logged only for the main cluster,
+    // whose statements a reproduction replays
+    private static void dropLeftovers(VoltDBGlobalState globalState, VoltDBConnection sqlCon, boolean log)
+            throws SQLException {
+        DatabaseMetaData md = sqlCon.getMetaData();
         // a procedure the PROCEDURE oracle created and a node failure kept it from dropping; it reads the tables below
+        List<String> drops = new ArrayList<>();
         try (ResultSet rs = md.getProcedures(null, null, null)) {
-            List<String> procedures = new ArrayList<>();
             while (rs.next()) {
                 String name = rs.getString("PROCEDURE_NAME");
                 // the PROCEDURE oracle's names are the prefix, P and a number; the tables' default procedures, such as
                 // DB0_T0.insert, go with their tables
                 if (name.matches(Pattern.quote(prefix(globalState.getDatabaseName())) + "P[0-9]+")) {
-                    procedures.add(name);
-                }
-            }
-            for (String p : procedures) {
-                String drop = "DROP PROCEDURE " + p + " IF EXISTS";
-                globalState.getState().logStatement(drop);
-                try (Statement s = sqlCon.createStatement()) {
-                    s.execute(drop);
+                    drops.add("DROP PROCEDURE " + name + " IF EXISTS");
                 }
             }
         }
-        List<String[]> leftover = VoltDBSchema.getTables(md, prefix(globalState.getDatabaseName()));
-        for (String[] t : leftover) {
-            String drop = "DROP TABLE " + t[0] + " IF EXISTS CASCADE";
-            globalState.getState().logStatement(drop);
+        for (String[] t : VoltDBSchema.getTables(md, prefix(globalState.getDatabaseName()))) {
+            drops.add("DROP TABLE " + t[0] + " IF EXISTS CASCADE");
+        }
+        for (String drop : drops) {
+            if (log) {
+                globalState.getState().logStatement(drop);
+            }
             try (Statement s = sqlCon.createStatement()) {
                 s.execute(drop);
             }
         }
-        return sqlCon;
     }
 
     // ENG-30602: unless --avoid-known-bugs is false, a failure that does not recur when its queries are rerun at once

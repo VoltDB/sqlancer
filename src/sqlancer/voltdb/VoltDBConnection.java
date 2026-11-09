@@ -43,6 +43,11 @@ public class VoltDBConnection extends SQLConnection {
     private final long retryMillis;
     private final boolean nodeFailures;
     private boolean closed;
+    // the DIFF oracle's second cluster, running another VoltDB version (--mirror), or null; every statement that
+    // changes
+    // the database is repeated on it, and the database is marked diverged when the two disagree on whether it succeeded
+    private VoltDBConnection mirror;
+    private volatile boolean diverged;
 
     public VoltDBConnection(Connection connection, int retrySeconds, boolean nodeFailures) {
         super(connection);
@@ -71,6 +76,46 @@ public class VoltDBConnection extends SQLConnection {
         if (!closed) {
             closed = true;
             super.close();
+            if (mirror != null) {
+                mirror.close();
+            }
+        }
+    }
+
+    public void setMirror(VoltDBConnection mirror) {
+        this.mirror = mirror;
+    }
+
+    public VoltDBConnection getMirror() {
+        return mirror;
+    }
+
+    // whether a statement that changes the database succeeded on one cluster and failed on the other, after which the
+    // two databases may hold different rows
+    public boolean isDiverged() {
+        return diverged;
+    }
+
+    // repeats a statement that changes the database on the mirror, and records whether the two disagreed
+    private void mirrorWrite(Method method, Object[] args, boolean succeeded) {
+        if (mirror == null || args == null || args.length != 1 || !(args[0] instanceof String)
+                || !method.getName().equals("execute") && !method.getName().equals("executeUpdate")) {
+            return;
+        }
+        String sql = (String) args[0];
+        if (SELECT_PREAMBLE.matcher(sql).matches() || sql.trim().startsWith("(")
+                || sql.trim().regionMatches(true, 0, "WITH", 0, 4)) {
+            return;
+        }
+        boolean mirrored;
+        try (Statement st = mirror.createStatement()) {
+            st.execute(sql);
+            mirrored = true;
+        } catch (SQLException | IgnoreMeException e) {
+            mirrored = false;
+        }
+        if (mirrored != succeeded) {
+            diverged = true;
         }
     }
 
@@ -115,6 +160,7 @@ public class VoltDBConnection extends SQLConnection {
                         try {
                             Object result = isNonSelectQuery(method, args) ? adHocQuery((String) args[0])
                                     : method.invoke(statement, args);
+                            mirrorWrite(method, args, true);
                             return result instanceof ResultSet ? nullReading((ResultSet) result) : result;
                         } catch (InvocationTargetException e) {
                             Throwable cause = e.getCause();
@@ -124,7 +170,14 @@ public class VoltDBConnection extends SQLConnection {
                                 Thread.sleep(ThreadLocalRandom.current().nextLong(20, 100));
                                 continue;
                             }
-                            throw skippedIfNodeFailure(cause);
+                            Throwable thrown = skippedIfNodeFailure(cause);
+                            if (thrown instanceof IgnoreMeException) {
+                                // a node failure: the statement may or may not have committed
+                                diverged = mirror != null || diverged;
+                            } else {
+                                mirrorWrite(method, args, false);
+                            }
+                            throw thrown;
                         }
                     }
                 }));

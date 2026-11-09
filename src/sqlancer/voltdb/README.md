@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 19.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 20.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -23,7 +23,9 @@ oracle checks ad hoc queries against the same queries as stored procedures, sing
 middle of the run and checks that queries return the same rows from new plans, cached plans and plans made after the
 change; see [The SCHEMA oracle](#the-schema-oracle). Since milestone 19 expressions also use FLOAT math, date and time
 functions and JSON functions, and the GEO oracle checks GEOGRAPHY_POINT and GEOGRAPHY; see
-[Date, JSON, FLOAT math and geography](#date-json-float-math-and-geography).
+[Date, JSON, FLOAT math and geography](#date-json-float-math-and-geography). Since milestone 20 the DIFF oracle
+compares this VoltDB with another version, normally the last release, on the same data; see
+[The DIFF oracle](#the-diff-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -241,7 +243,7 @@ SQLancer's options come before `voltdb`, the provider's after it.
 | `--username`, `--password` | Empty for a server without security (SQLancer's default is `sqlancer`). |
 | `--host`, `--port` | A server's client port. Defaults: localhost, 21212. |
 | `--database-prefix` | Prefix of each thread's table names. Default `database`; `db` keeps the logs short. |
-| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT`, `SUBQUERY`, `WINDOW`, `SETOPS`, `DERIVED`, `PROCEDURE`, `SCHEMA`, `GEO` or `SMOKE`; several are comma-separated. |
+| `--oracle` | `NOREC` (the default), `TLP_WHERE`, `TLP_DISTINCT`, `TLP_HAVING`, `TLP_AGGREGATE`, `PQS`, `PARAMS`, `VIEWS`, `LIMIT`, `SUBQUERY`, `WINDOW`, `SETOPS`, `DERIVED`, `PROCEDURE`, `SCHEMA`, `GEO`, `DIFF` or `SMOKE`; several are comma-separated. |
 | `--max-num-tables` | Tables per database, 1 to this (default 3). |
 | `--max-num-indexes` | CREATE INDEX statements per database, 0 to this (default 4). |
 | `--max-num-updates` | UPDATE statements per database, 0 to this (default 5). |
@@ -558,8 +560,8 @@ PQS's evaluator does not model these functions: a PQS query that holds one is sk
 
 ### The GEO oracle
 
-GEO (`oracle/VoltDBGeographyOracle`) checks GEOGRAPHY_POINT and GEOGRAPHY against geography computed in Java. Once
-per database it creates a table `<prefix>GEO (id, p GEOGRAPHY_POINT, g GEOGRAPHY(1024))`, replicated or partitioned
+GEO (`oracle/VoltDBGeographyOracle`) checks GEOGRAPHY_POINT and GEOGRAPHY against geography computed in Java. On one
+database in four (its first check there) it creates a table `<prefix>GEO (id, p GEOGRAPHY_POINT, g GEOGRAPHY(1024))`, replicated or partitioned
 on id, with twelve rows: a random point and a small box, written counter-clockwise (VoltDB rejects a clockwise ring as
 "not normalized"). It checks:
 
@@ -575,6 +577,40 @@ on id, with twelve rows: a random point and a small box, written counter-clockwi
 
 The table is dropped at the end, and the schema reader ignores it, so no other oracle reads its columns. A failure has
 no reproducer; its message holds the statements and the query.
+
+GEO runs on one database in four and skips the rest. Its four catalog updates (CREATE TABLE, CREATE INDEX and two
+DROPs) block the whole cluster: run on every database, as in milestone 19, they cost the other oracles about 40% of
+their queries (4,481 against 7,724 in 150 seconds on 1 node, 4 threads).
+
+## The DIFF oracle
+
+DIFF (`oracle/VoltDBDifferentialOracle`) is differential testing against another VoltDB version. Give the provider
+`--mirror host:port[,host:port...]`, the client addresses of a second cluster, normally the last release. Every
+statement that changes the database (DDL, INSERT, UPDATE, UPSERT, DELETE, the oracles' own CREATE PROCEDURE and ALTER
+TABLE) then also runs on the mirror (`VoltDBConnection`), so the two clusters hold the same rows. DIFF runs the same
+generated query on both and compares the rows as multisets. The query is a SELECT of columns and expressions with a
+WHERE clause, or a GROUP BY query with aggregates and maybe WHERE and HAVING clauses, over the FROM clauses and joins
+the other oracles use.
+
+- FLOATs compare to 12 significant digits, as a SUM of FLOATs may add them in another order on each cluster. Exact
+  numbers compare by value.
+- A query with an expected error on either cluster is skipped.
+- A change that succeeds on one cluster and fails on the other marks the database diverged, and DIFF skips its later
+  checks. So does a statement a node failure interrupted, as it may have committed on one side only.
+- A difference is a change between the versions: a bug fixed, a bug introduced, or a deliberate change in behavior.
+  `--avoid-known-bugs` avoids the bugs filed against the newer version, which the older one may share.
+- While `--avoid-known-bugs` is true, DIFF doesn't group by a DECIMAL column. ENG-30255, fixed after 16.0.0: a
+  GROUP BY on a DECIMAL that is NULL aborts a 16.0.0 server (`NValue::hashCombine` throws in the hash aggregate).
+  DIFF found it in its first trial against 16.0.0.
+
+`run-sqlancer.sh --mirror-voltdb DIR [--mirror-license FILE] [--mirror-java-home DIR]` starts one node of the kit
+in DIR beside the cluster, on the port slot after the last node's, k=0 with the same sites per host. It passes
+`--mirror` to the provider, records the mirror's version in the manifest, and saves its server log under
+`servers/mirror`. Without `--mirror`, DIFF skips every check.
+
+`--mirror-java-home DIR` gives the mirror its own JAVA_HOME. An older release may refuse the newer JDK the cluster
+runs on: 16.0.0 needs Java 17 or 21 and exits at once on Java 25 ("Unsupported openjdk version"), so the lab job
+passes `/opt/oracle_java21`. A mirror that exits stops the run at once, with the last line of its start log.
 
 ## The VIEWS oracle
 

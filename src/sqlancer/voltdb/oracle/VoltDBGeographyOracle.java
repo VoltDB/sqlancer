@@ -15,10 +15,9 @@ import sqlancer.common.query.ExpectedErrors;
 import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 
 /**
- * GEOGRAPHY_POINT and GEOGRAPHY against geography computed in Java. Once per database (its first check), the oracle
- * creates a table {@code <prefix>GEO (id, p GEOGRAPHY_POINT, g GEOGRAPHY)}, replicated or partitioned on id, fills it
- * with random points and small counter-clockwise boxes (VoltDB rejects a clockwise ring as "not normalized"), and
- * checks:
+ * GEOGRAPHY_POINT and GEOGRAPHY against geography computed in Java. On a database's first check, the oracle creates a
+ * table {@code <prefix>GEO (id, p GEOGRAPHY_POINT, g GEOGRAPHY)}, replicated or partitioned on id, fills it with random
+ * points and small counter-clockwise boxes (VoltDB rejects a clockwise ring as "not normalized"), and checks:
  * <ul>
  * <li>{@code LATITUDE(p)} and {@code LONGITUDE(p)} return the inserted coordinates, also after
  * {@code POINTFROMTEXT(ASTEXT(p))};</li>
@@ -28,8 +27,9 @@ import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
  * circle arcs, not lines of latitude, so points are drawn away from every box's border (a fifth of its size); the check
  * runs before and after {@code CREATE INDEX} on g, which VoltDB uses for CONTAINS.</li>
  * </ul>
- * The table is dropped at the end. The schema reader ignores it, so other oracles never see its columns. A failure has
- * no reproducer; its message holds the rows and the query.
+ * It runs on one database in four, as its catalog updates block the whole cluster. The table is dropped at the end. The
+ * schema reader ignores it, so other oracles never see its columns. A failure has no reproducer; its message holds the
+ * rows and the query.
  */
 public class VoltDBGeographyOracle implements TestOracle<VoltDBGlobalState> {
 
@@ -37,6 +37,7 @@ public class VoltDBGeographyOracle implements TestOracle<VoltDBGlobalState> {
     static final double RADIUS = 111195.0802335329 * 180 / Math.PI;
 
     private static final int ROWS = 12;
+    private static final int SAMPLE = 4;
 
     private final VoltDBGlobalState state;
     private final ExpectedErrors errors;
@@ -100,6 +101,11 @@ public class VoltDBGeographyOracle implements TestOracle<VoltDBGlobalState> {
             throw new IgnoreMeException();
         }
         done = true;
+        // its four catalog updates (CREATE TABLE, CREATE INDEX, two DROPs) block the whole cluster, which cost the
+        // other oracles about 40% of their queries when GEO ran on every database; it runs on one database in SAMPLE
+        if (Randomly.getNotCachedInteger(0, SAMPLE) != 0) {
+            throw new IgnoreMeException();
+        }
         statements.clear();
         Randomly r = state.getRandomly();
         String table = state.getPrefix() + "GEO";
