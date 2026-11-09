@@ -396,7 +396,12 @@ The shapes differ in what the planner and the execution engine do. With one node
 gathers 8 partitions' results in one process. With 3 nodes, k=1, the partitions' leaders are spread over the nodes and
 each has one replica, and node failures move them; elastic resizes add a partition group and move data to it and
 back; crashes replay the command log. With k=2 and 2 sites per host, every node holds every partition, so
-there are only 2 partitions and every write is replicated twice. The whole job takes about 5 hours 40 minutes.
+there are only 2 partitions and every write is replicated twice. The whole job takes about 5 hours 50 minutes.
+
+Before the runs, the job reruns the bug reproductions against the kit, as the triagedb row `sqlancer-repros` (see
+[Bug reproductions](#bug-reproductions)): about 10 minutes on 1 node. It fails when a reproduction changes or cannot
+run; the bugs that no longer reproduce are listed in the build log ("no longer reproduces: ..."). `SQLANCER_REPROS=no`
+skips it.
 
 Every run uses `--use-reducer`. The first run's seed is the UTC time as `yyyymmddHHMM`, and each next run's is one
 more.
