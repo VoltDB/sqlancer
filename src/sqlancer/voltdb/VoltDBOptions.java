@@ -47,6 +47,9 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--xdcr", description = "Comma-separated host:port client addresses of a second cluster linked to the first by XDCR (run-sqlancer.sh --xdcr): each database writes through one of the two, chosen at random, its DDL runs on both with DR TABLE for each table, and the XDCR oracle compares their rows")
     public String xdcr;
 
+    @Parameter(names = "--upgrades", description = "The cluster is upgraded in service during the run, one node at a time (run-sqlancer.sh --upgrade-from): expect the errors that a stopped node causes, as for --node-failures", arity = 1)
+    public boolean upgrades;
+
     @Parameter(names = "--crashes", description = "Every node is killed at once and the cluster recovered from its command log during the run (run-sqlancer.sh --crash-interval): expect the errors that causes, as for --node-failures, and wait for the cluster to come back before connecting", arity = 1)
     public boolean crashes;
 

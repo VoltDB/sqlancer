@@ -41,8 +41,17 @@ public final class VoltDBTableGenerator {
         String table = globalState.getFreeTableName();
         List<Column> columns = new ArrayList<>();
         int nrColumns = (int) Randomly.getNotCachedInteger(1, 7);
+        // ENG-30255 (fixed after 16.0.0): grouping, DISTINCT or a set operation over a DECIMAL that is NULL aborts a
+        // 16.0.0 server (NValue::hashCombine). During an in-service upgrade from 16.0.0 (--upgrades) the cluster runs
+        // 16.0.0 nodes for a while, so its tables have no DECIMAL columns
+        boolean noDecimal = globalState.getDbmsSpecificOptions().upgrades
+                && globalState.getDbmsSpecificOptions().avoidKnownBugs;
         for (int i = 0; i < nrColumns; i++) {
-            columns.add(new Column("c" + i, VoltDBCompositeDataType.getRandom(VoltDBDataType.getRandom()),
+            VoltDBDataType type;
+            do {
+                type = VoltDBDataType.getRandom();
+            } while (noDecimal && type == VoltDBDataType.DECIMAL);
+            columns.add(new Column("c" + i, VoltDBCompositeDataType.getRandom(type),
                     Randomly.getBooleanWithRatherLowProbability()));
         }
 

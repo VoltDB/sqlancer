@@ -30,6 +30,8 @@ elastically while SQLancer runs (`--resize-interval`); see [Elastic resizes](#el
 can also crash the whole cluster and recover it from its command log (`--crash-interval`), and the DURABLE oracle
 checks that no acknowledged change was lost; see [Whole-cluster crashes](#whole-cluster-crashes). Since milestone 23
 it can run two clusters linked by XDCR (`--xdcr`), and the XDCR oracle checks that they converge; see [XDCR](#xdcr).
+Since milestone 24 it can start the cluster on the last release and upgrade it in service, one node at a time, while
+SQLancer runs (`--upgrade-from`); see [In-service upgrades](#in-service-upgrades).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -90,6 +92,9 @@ voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 -
 | `--resize-interval SECS` | 0 (never) | Every SECS seconds, add k+1 nodes with `voltdb start --add`, or remove them again with `voltadmin resize`, by turns (see [Elastic resizes](#elastic-resizes)). Does not mix with `--kill-interval`. |
 | `--crash-interval SECS` | 0 (never) | Every SECS seconds, kill every node at once with `kill -9` and restart them all, which recovers the database from its snapshots and synchronous command log (see [Whole-cluster crashes](#whole-cluster-crashes)). Does not mix with `--kill-interval` or `--resize-interval`. |
 | `--xdcr` | off | Also start a second cluster of the same shape, linked to the first by XDCR (see [XDCR](#xdcr)). Does not mix with `--kill-interval`, `--resize-interval` or `--crash-interval`. |
+| `--upgrade-from DIR` | none | Start the cluster on this older kit, normally the last release, and upgrade it in service to `--voltdb`, one node at a time (see [In-service upgrades](#in-service-upgrades)). Needs k-safety 1 or more. Does not mix with `--kill-interval`, `--resize-interval`, `--crash-interval` or `--xdcr`. |
+| `--upgrade-java-home DIR` | the environment's | JAVA_HOME for the older kit's nodes (16.0.0 needs Java 17 or 21). |
+| `--upgrade-at SECS` | a third of `--duration` | When the upgrade starts. |
 | `--keep-cluster` | off | Leave the cluster running, with its data, after the run. |
 | `-- ...` | | Everything after `--` goes to the provider, for example `-- --avoid-known-bugs false`. |
 
@@ -108,6 +113,7 @@ that did not start). Each run writes `<results>/sqlancer-<UTC time>-seed<N>/`:
 | `crash.log` | With `--crash-interval`: each crash and recovery, with its time and how long the recovery took. `servers/node<i>/recover<i>-<n>.log` is node i's output from recovery n. |
 | `servers/xdcr<i>/` | With `--xdcr`: the logs of the second cluster's node i, like `servers/node<i>/`. |
 | `xdcr_conflicts/` | With `--xdcr`: every conflict XDCR logged (there should be none). |
+| `upgrade.log` | With `--upgrade-from`: each node's stop and rejoin on the new kit, with its time. `servers/node<i>/upgrade<i>.log` is node i's output on the new kit. |
 | `resize.log` | With `--resize-interval`: each grow and shrink, with its time, the planned removal and how long it took. |
 | `servers/add<n>-<j>/` | With `--resize-interval`: the logs of node j added by grow n, like `servers/node<i>/`. A join VoltDB refused is kept as `add<n>-<j>-rejected<a>`. |
 | `reproductions/` | The log of each database whose thread failed: the statements that set it up, then the failing queries. With `--use-reducer`, these are reduced, and `<db>-reduce.log` shows the steps. |
@@ -120,6 +126,8 @@ A run FAILs if any of these happens:
 - With `--resize-interval`, a grow or a shrink does not complete within 600 seconds.
 - With `--crash-interval`, the cluster does not recover within 600 seconds of a crash.
 - With `--xdcr`, either cluster has a node down at the end, or XDCR logged a conflict.
+- With `--upgrade-from`, a node cannot be stopped or does not rejoin on the new kit within 600 seconds, or the upgrade
+  has not finished when SQLancer stops.
 
 While `--avoid-known-bugs` is true (the default), a failed check whose queries no longer fail when its reproducer
 reruns them at once is not a failure. It is printed as `ENG-30602 transient: ...` in `sqlancer/out.log`, and the
@@ -281,6 +289,30 @@ replication.
 A control run showed XDCR catches a broken link: with the second cluster's DR source pointed at a closed port, every
 database written on the first cluster failed within 4 minutes ("DB0_T0: 19 rows here, 0 on the other cluster").
 
+## In-service upgrades
+
+With `--upgrade-from DIR`, the script initializes and starts every node with the older kit in DIR, on
+`--upgrade-java-home` if given, and SQLancer runs against it. At `--upgrade-at` seconds it upgrades the cluster in
+service, from the last node to node 0:
+
+1. It stops the node with `voltadmin stop`, naming it by the address VoltDB reports for it (`@SystemInformation`
+   IPADDRESS and INTERNALPORT), which need not be localhost. VoltDB refuses to stop a node for some seconds after
+   another one has rejoined ("You may shut down the node with the voltadmin stop --force command"); a refusal is retried
+   every 10 seconds, up to 20 times.
+2. Once the node's server has exited, it starts it with the same `voltdb start` command on `--voltdb`, which rejoins it
+   to the cluster, and waits for "Server completed initialization", up to 600 seconds.
+
+Each step is a line of `upgrade.log`, and the summary counts the nodes upgraded. Locally, 3 nodes went from 16.0.0 to
+16.1.0-SNAPSHOT in under 2 minutes, 10 to 54 seconds each. The oracles check query results throughout: on the old
+version, on the mixed cluster while nodes of both versions run fragments of the same queries, and on the new version.
+With `--mirror-voltdb` on the same older kit, DIFF compares the upgraded cluster with the release it came from.
+
+The script passes the provider `--upgrades true`: a stopped node drops the calls in flight on it, which the provider
+expects as for a killed node (see [Node failures](#node-failures)). While `--avoid-known-bugs` is true, tables have no
+DECIMAL columns, as the 16.0.0 nodes abort on grouping, DISTINCT or a set operation over a NULL DECIMAL (ENG-30255,
+fixed after 16.0.0), which the first trials on 16.0.0 hit within two minutes. DDL during the upgrade can be refused with "Can
+not update catalog while catalog update is in progress" before it runs; the connection retries it.
+
 ## The nightly lab job
 
 `matrix-systemtest-apprunner-sqlancer` on jenkins-st runs this script against master's kit as part of the nightly
@@ -291,7 +323,7 @@ system test (`matrix-systemtest/master`, on the nights the rotation in `internal
 
 The job fetches this repository at the commit in its `SQLANCER_REF` parameter. That commit is pinned in the Jenkinsfile,
 so a change here reaches the nightly run only when the Jenkinsfile is changed to name it. It then builds SQLancer with
-the kit's runtime JDK and makes six runs, one after the other, every node on the agent:
+the kit's runtime JDK and makes seven runs, one after the other, every node on the agent:
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
@@ -300,13 +332,14 @@ the kit's runtime JDK and makes six runs, one after the other, every node on the
 | `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
 | `sqlancer-3n-k1-xdcr-s4` | Two clusters of 3 nodes, k=1, 4 sites per host, linked by XDCR (see [XDCR](#xdcr)) | the same | 45 minutes |
+| `sqlancer-3n-k1-upgrade` | 3 nodes, k=1, 8 sites per host, started on 16.0.0 and upgraded in service to the kit a third of the way in (see [In-service upgrades](#in-service-upgrades)) | the same | 45 minutes |
 | `sqlancer-3n-k1-crash600` | 3 nodes, k=1, 8 sites per host, a synchronous command log; every 10 minutes every node is killed and the cluster recovered (see [Whole-cluster crashes](#whole-cluster-crashes)) | the same | 45 minutes |
 
 The shapes differ in what the planner and the execution engine do. With one node and 8 sites, a multi-partition query
 gathers 8 partitions' results in one process. With 3 nodes, k=1, the partitions' leaders are spread over the nodes and
 each has one replica, and node failures move them; elastic resizes add a partition group and move data to it and
 back; crashes replay the command log. With k=2 and 2 sites per host, every node holds every partition, so
-there are only 2 partitions and every write is replicated twice. The whole job takes about 4 hours 50 minutes.
+there are only 2 partitions and every write is replicated twice. The whole job takes about 5 hours 40 minutes.
 
 Every run uses `--use-reducer`. The first run's seed is the UTC time as `yyyymmddHHMM`, and each next run's is one
 more.
@@ -323,7 +356,8 @@ server.
 
 The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor[:chaos[:sites]]`, where chaos is the
 seconds between node failures, `r` and the seconds between elastic resizes, `c` and the seconds between crashes, or
-`x` for an XDCR pair, and sites the sites per host, default `3:1:300 1:0 3:2:0:2 3:1:r120 3:1:x:4 3:1:c600`), `DURATION` (seconds
+`x` for an XDCR pair, or `u` for an in-service upgrade from `MIRROR_VERSION`, and sites the sites per host, default
+`3:1:300 1:0 3:2:0:2 3:1:r120 3:1:x:4 3:1:u 3:1:c600`), `DURATION` (seconds
 per run, default 2700), `ORACLES`, `SEED`, `EXTRA_ARGS` (provider options) and `SQLANCER_REF`. A run of the job alone
 needs a kit: give `releasedir`, for example `releases/one-offs/16.1.0-SNAPSHOT-master/<kit build>`.
 

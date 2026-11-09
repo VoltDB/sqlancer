@@ -40,6 +40,12 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
                      DR), and run the provider with --xdcr: each database writes through one of the two, its DDL
                      runs on both, and the XDCR oracle compares their rows. Not with --kill-interval,
                      --resize-interval or --crash-interval.
+  --upgrade-from DIR start the cluster on this older VoltDB kit (normally the last release) and, at
+                     --upgrade-at, upgrade it in service to --voltdb: one node at a time, voltadmin stop, then
+                     voltdb start on the new kit, which rejoins. Needs --kfactor 1 or more. Not with
+                     --kill-interval, --resize-interval, --crash-interval or --xdcr.
+  --upgrade-java-home DIR  JAVA_HOME for the older kit's nodes (default: the environment's)
+  --upgrade-at S     seconds into the run to start the upgrade (default: a third of --duration)
   --keep-cluster     leave the cluster running and its data in place after the run
   --mirror-voltdb DIR  also start one node of this other VoltDB kit (normally the last release) and run
                      the provider with --mirror: every change is repeated on it, and the DIFF oracle
@@ -80,6 +86,9 @@ keep_cluster=false
 kill_interval=0
 crash_interval=0
 xdcr=false
+upgrade_from=
+upgrade_java_home=
+upgrade_at=
 resize_interval=0
 mirror_home=
 mirror_license=
@@ -106,6 +115,9 @@ while [ $# -gt 0 ]; do
     --kill-interval) kill_interval=$2; shift 2 ;;
     --crash-interval) crash_interval=$2; shift 2 ;;
     --xdcr) xdcr=true; shift ;;
+    --upgrade-from) upgrade_from=$2; shift 2 ;;
+    --upgrade-java-home) upgrade_java_home=$2; shift 2 ;;
+    --upgrade-at) upgrade_at=$2; shift 2 ;;
     --resize-interval) resize_interval=$2; shift 2 ;;
     --mirror-voltdb) mirror_home=$2; shift 2 ;;
     --mirror-license) mirror_license=$2; shift 2 ;;
@@ -145,6 +157,16 @@ fi
 [ "$kill_interval" -eq 0 ] || [ "$resize_interval" -eq 0 ] || die "--kill-interval and --resize-interval do not mix"
 [ "$crash_interval" -eq 0 ] || { [ "$kill_interval" -eq 0 ] && [ "$resize_interval" -eq 0 ]; } ||
     die "--crash-interval does not mix with --kill-interval or --resize-interval"
+if [ -n "$upgrade_from" ]; then
+    [ -x "$upgrade_from/bin/voltdb" ] || die "no bin/voltdb in $upgrade_from"
+    [ "$kfactor" -ge 1 ] || die "--upgrade-from needs --kfactor 1 or more"
+    [ "$kill_interval" -eq 0 ] && [ "$resize_interval" -eq 0 ] && [ "$crash_interval" -eq 0 ] && ! $xdcr ||
+        die "--upgrade-from does not mix with --kill-interval, --resize-interval, --crash-interval or --xdcr"
+    [ -n "$upgrade_at" ] || upgrade_at=$((duration / 3))
+    case $upgrade_at in '' | *[!0-9]*) die "not a number: '$upgrade_at'" ;; esac
+    # a stopped node drops the calls in flight on it, which the provider then expects (see VoltDBErrors)
+    provider_args=(--upgrades true ${provider_args[@]+"${provider_args[@]}"})
+fi
 if $xdcr; then
     [ "$kill_interval" -eq 0 ] && [ "$resize_interval" -eq 0 ] && [ "$crash_interval" -eq 0 ] ||
         die "--xdcr does not mix with --kill-interval, --resize-interval or --crash-interval"
@@ -253,6 +275,14 @@ sqlancer_pid=
 
 # within SECS COMMAND...: runs COMMAND, killing it after SECS seconds (macOS has no timeout(1))
 # runs a command of the mirror's kit with the mirror's JAVA_HOME, if any
+# upgrade_cmd CMD...: runs a command of the older kit with its JAVA_HOME (--upgrade-java-home), if any
+upgrade_cmd() {
+    if [ -n "$upgrade_from" ] && [ -n "$upgrade_java_home" ]; then
+        (export JAVA_HOME=$upgrade_java_home PATH=$upgrade_java_home/bin:$PATH && exec "$@")
+    else
+        "$@"
+    fi
+}
 mirror_cmd() {
     if [ -n "$mirror_java_home" ]; then
         JAVA_HOME=$mirror_java_home PATH=$mirror_java_home/bin:$PATH "$@"
@@ -347,6 +377,7 @@ sqlancer_dirty=$(git -C "$repo_dir" status --porcelain 2>/dev/null | grep -v '^?
     echo "use reducer:      $use_reducer"
     echo "kill interval:    $([ "$kill_interval" -gt 0 ] && echo "$kill_interval s" || echo never)"
     echo "xdcr:             $($xdcr && echo "a second cluster of $nodes node(s), k=$kfactor, client ports $(xdcr_hosts client)" || echo no)"
+    echo "upgrade:          $([ -n "$upgrade_from" ] && echo "from $upgrade_from ($(upgrade_cmd "$upgrade_from/bin/voltdb" --version 2>&1 | tail -1)) at $upgrade_at s" || echo no)"
     echo "crash interval:   $([ "$crash_interval" -gt 0 ] && echo "$crash_interval s, every node killed and recovered" || echo never)"
     echo "resize interval:  $([ "$resize_interval" -gt 0 ] && echo "$resize_interval s, $added nodes added and removed by turns" || echo never)"
     echo "provider options: ${provider_args[*]:-}"
@@ -382,17 +413,26 @@ EOF
 log "Starting $nodes node(s), k=$kfactor, $sites sites per host"
 for ((i = 0; i < nodes; i++)); do
     node=$cluster/node$i
-    "$voltdb_home/bin/voltdb" init --force -D "$node" -C "$cluster/deployment.xml" ${license_args[@]+"${license_args[@]}"} >"$cluster/init$i.log" 2>&1 ||
+    upgrade_cmd "${upgrade_from:-$voltdb_home}/bin/voltdb" init --force -D "$node" -C "$cluster/deployment.xml" ${license_args[@]+"${license_args[@]}"} >"$cluster/init$i.log" 2>&1 ||
         die "voltdb init failed for node $i; see $cluster/init$i.log"
 done
 cluster_started=true
+# the kit node i runs, and its JAVA_HOME (empty: the environment's); with --upgrade-from every node starts on the
+# older kit and moves to --voltdb when it is upgraded
+node_home=()
+node_java=()
+for ((i = 0; i < nodes; i++)); do
+    node_home[i]=${upgrade_from:-$voltdb_home}
+    node_java[i]=$([ -n "$upgrade_from" ] && echo "$upgrade_java_home")
+done
 # start_node I LOG: starts node I, or restarts it after a failure, which rejoins it to the running cluster
 start_node() {
     # in the foreground under nohup: "voltdb start --background" allows one server per user (a shared PID file).
     # In a subshell, so that the server is not one of this script's jobs and its kill -9 is not reported. The
     # launcher execs the server's JVM, so the PID it starts with is the server's, which node<i>.pid records.
     # Every node gets the whole host list, so that a restarted node, node 0 included, finds a live one to rejoin through
-    (nohup "$voltdb_home/bin/voltdb" start -D "$cluster/node$1" -c "$nodes" -H "$(hosts internal)" \
+    (if [ -n "${node_java[$1]}" ]; then export JAVA_HOME=${node_java[$1]} PATH=${node_java[$1]}/bin:$PATH; fi
+        nohup "${node_home[$1]}/bin/voltdb" start -D "$cluster/node$1" -c "$nodes" -H "$(hosts internal)" \
         --client="$(client_port $1)" --admin="$(admin_port $1)" --internal="$(internal_port $1)" \
         --zookeeper="$(port $1 3)" --replication="$(port $1 4)" --metrics="$(port $1 5)" \
         >"$2" 2>&1 &
@@ -639,6 +679,73 @@ if [ "$crash_interval" -gt 0 ]; then
     log "Killing every node and recovering the cluster every $crash_interval s (crash.log)"
 fi
 
+# --upgrade-from: upgrade_at seconds into the run, upgrade the nodes one at a time, from the last to node 0: stop the
+# node with "voltadmin stop" (which VoltDB refuses for a few seconds after a rejoin, and so is retried), wait until it
+# has exited, start it on --voltdb, which rejoins it, and wait until it has, up to 600 s. Each event is a line of
+# upgrade.log; a node that cannot be stopped or does not rejoin ends the loop and fails the run.
+upgrade_loop() {
+    local i j other info hid ip out pid t0 up
+    for _ in $(seq 1 "$upgrade_at"); do
+        [ -e "$results/upgrade.stop" ] && return 0
+        sleep 1
+    done
+    echo "$(date '+%H:%M:%S') upgrade: from $(upgrade_cmd "$upgrade_from/bin/voltdb" --version 2>&1 | tail -1) to $("$voltdb_home/bin/voltdb" --version 2>&1 | tail -1)" >>"$results/upgrade.log"
+    for ((i = nodes - 1; i >= 0; i--)); do
+        t0=$(date +%s)
+        other=$(((i + 1) % nodes))
+        # voltadmin stop names the node by the address VoltDB reports for it, which need not be localhost
+        info=$(echo "exec @SystemInformation OVERVIEW;" | "$voltdb_home/bin/sqlcmd" --port="$(client_port $other)" 2>/dev/null)
+        hid=$(echo "$info" | awk -v p="$(internal_port $i)" '$2 == "INTERNALPORT" && $3 == p { print $1 }')
+        ip=$(echo "$info" | awk -v h="$hid" '$1 == h && $2 == "IPADDRESS" { print $3 }')
+        if [ -z "$ip" ]; then
+            echo "$(date '+%H:%M:%S') upgrade: node$i not found in @SystemInformation" >>"$results/upgrade.log"
+            return 1
+        fi
+        pid=$(cat "$cluster/node$i.pid" 2>/dev/null)
+        # done once the node's server has exited; a refusal leaves it running, and is retried
+        for j in $(seq 1 20); do
+            out=$("$voltdb_home/bin/voltadmin" stop -H "localhost:$(admin_port $other)" "$ip:$(internal_port $i)" 2>&1 |
+                grep -v '^ *$' | tail -1)
+            for _ in $(seq 1 30); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 1
+            done
+            kill -0 "$pid" 2>/dev/null || break
+            echo "$(date '+%H:%M:%S') upgrade: stopping node$i refused (attempt $j): $out" >>"$results/upgrade.log"
+            sleep 10
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "$(date '+%H:%M:%S') upgrade: node$i did not stop" >>"$results/upgrade.log"
+            return 1
+        fi
+        echo "$(date '+%H:%M:%S') upgrade: node$i stopped" >>"$results/upgrade.log"
+        node_home[i]=$voltdb_home
+        node_java[i]=
+        start_node $i "$cluster/upgrade$i.log"
+        up=false
+        for _ in $(seq 1 600); do
+            grep -q "Server completed initialization" "$cluster/upgrade$i.log" 2>/dev/null && { up=true; break; }
+            # kill -0, not is_server: the launcher runs as a script for a moment before it execs the server
+            kill -0 "$(cat "$cluster/node$i.pid")" 2>/dev/null || break
+            sleep 1
+        done
+        if ! $up; then
+            echo "$(date '+%H:%M:%S') upgrade: node$i did not rejoin on the new kit" >>"$results/upgrade.log"
+            return 1
+        fi
+        echo "$(date '+%H:%M:%S') upgrade: node$i upgraded, $(($(date +%s) - t0)) s" >>"$results/upgrade.log"
+    done
+    echo "$(date '+%H:%M:%S') upgrade: done" >>"$results/upgrade.log"
+}
+
+upgrade_pid=
+if [ -n "$upgrade_from" ]; then
+    : >"$results/upgrade.log"
+    upgrade_loop &
+    upgrade_pid=$!
+    log "Upgrading the cluster in service, one node at a time, $upgrade_at s into the run (upgrade.log)"
+fi
+
 # Every resize_interval seconds, by turns: grow the cluster by k+1 nodes, then shrink it by the same nodes. A grow
 # starts them with "voltdb start --add" in their own directories ($cluster/add<N>-<j>, kept for their logs) and waits
 # until they have joined and until "voltadmin resize --test" would remove them: VoltDB publishes the new topology some
@@ -804,6 +911,16 @@ if [ -n "$chaos_pid" ]; then
     rejoins=$(grep -c " rejoin [0-9]*: node[0-9]*, " "$results/chaos.log")
     log "Node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", the last one FAILED")"
 fi
+upgrade_failed=false
+upgraded=0
+if [ -n "$upgrade_pid" ]; then
+    touch "$results/upgrade.stop"
+    wait "$upgrade_pid" || upgrade_failed=true
+    upgraded=$(grep -c " upgrade: node[0-9]* upgraded" "$results/upgrade.log")
+    # an upgrade that never started (a run shorter than --upgrade-at) fails too: the run did not do what it says
+    grep -q " upgrade: done" "$results/upgrade.log" || upgrade_failed=true
+    log "Upgrade: $upgraded of $nodes nodes upgraded$($upgrade_failed && echo ", FAILED")"
+fi
 crash_failed=false
 crashes=0
 recoveries=0
@@ -833,7 +950,7 @@ done
 stop_cluster
 for ((i = 0; i < nodes; i++)); do
     mkdir -p "$results/servers/node$i"
-    cp "$cluster/start$i.log" "$cluster/init$i.log" "$cluster"/restart$i-*.log "$cluster"/recover$i-*.log "$results/servers/node$i/" 2>/dev/null
+    cp "$cluster/start$i.log" "$cluster/init$i.log" "$cluster"/restart$i-*.log "$cluster"/recover$i-*.log "$cluster/upgrade$i.log" "$results/servers/node$i/" 2>/dev/null
     cp -R "$cluster/node$i/voltdbroot/log/." "$results/servers/node$i/" 2>/dev/null
 done
 for d in "$cluster"/add*-*; do
@@ -902,7 +1019,7 @@ done
 
 result=PASS
 [ "$sqlancer_exit" -eq 0 ] && [ ${#failures[@]} -eq 0 ] && [ ${#down[@]} -eq 0 ] && [ "$fatal" -eq 0 ] &&
-    ! $chaos_failed && ! $resize_failed && ! $crash_failed && [ "$conflicts" -eq 0 ] || result=FAIL
+    ! $chaos_failed && ! $resize_failed && ! $crash_failed && ! $upgrade_failed && [ "$conflicts" -eq 0 ] || result=FAIL
 {
     echo "RESULT: $result"
     echo "run: $run_id"
@@ -915,6 +1032,7 @@ result=PASS
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
     [ "$crash_interval" -gt 0 ] && echo "crashes: $crashes crashes, $recoveries recoveries$($crash_failed && echo ", a recovery FAILED (crash.log)")"
+    [ -n "$upgrade_from" ] && echo "upgrade: $upgraded of $nodes nodes upgraded$($upgrade_failed && echo ", FAILED (upgrade.log)")"
     $xdcr && echo "XDCR conflicts logged: $conflicts$([ "$conflicts" -eq 0 ] || echo " (xdcr_conflicts/)")"
     $xdcr && echo "databases XDCR compared after convergence: $(grep -c "^XDCR converged:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$crash_interval" -gt 0 ] && echo "databases DURABLE compared across a crash: $(grep -c "^DURABLE across a crash:" "$results/sqlancer/out.log" 2>/dev/null || true)"
