@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 20.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 30.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -37,7 +37,9 @@ which are fixed; see [Bug reproductions](#bug-reproductions). Since milestone 26
 same query planned two ways returns the same rows; see [The PLANS oracle](#the-plans-oracle). Since milestone 28 the
 run script can enable security (`--security`), and the PERMS oracle checks what users may and may not do; see
 [The PERMS oracle](#the-perms-oracle). Since milestone 29 the STREAMS oracle checks export streams and their views, and
-`--export` checks that every row a stream got was exported; see [The STREAMS oracle](#the-streams-oracle).
+`--export` checks that every row a stream got was exported; see [The STREAMS oracle](#the-streams-oracle). Since
+milestone 30 `voltdb/run-coverage.sh` measures the Java and C++ code the runs exercise; see
+[Code coverage](#code-coverage).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -386,6 +388,44 @@ deadlock after a node dies mid-@UpdateCore) depends on when the kill lands. ENG-
 cycles in some runs only, so it is marked `-- manual:` and runs only when `--only` names it. ENG-30551 (a subnormal
 FLOAT constant in a plan) reproduces on macOS (arm64) only; the lab's x86_64 Linux agents plan the constant, so it is
 marked `-- platforms: Darwin`.
+
+## Code coverage
+
+`voltdb/run-coverage.sh` measures how much of VoltDB the provider's runs exercise. It makes the nightly job's runs
+(security, kill, export, resize, xdcr, crash, then the reproductions) against a VoltDB build whose execution engine
+was built with clang's source-based coverage, with the JaCoCo agent on every server JVM, and reports line and branch
+coverage per Java package, per engine directory and file, and per area (planner, executors, DR, export, rejoin and
+so on).
+
+Build the engine with coverage in a clean checkout of VoltDB (macOS; Linux with clang works the same way):
+
+```
+export CFLAGS="-fprofile-instr-generate -fcoverage-mapping" CXXFLAGS="$CFLAGS" LDFLAGS=-fprofile-instr-generate
+export MAVEN_OPTS=-Dmaven.gitcommitid.skip=true   # in a git worktree, where the plugin cannot read HEAD
+ant -Djmemcheck=NO_MEMCHECK
+```
+
+VoltDB's own `--coverage` build option adds the gcov flags to the link only, so it measures nothing. Then:
+
+```
+voltdb/run-coverage.sh --voltdb ~/voltdb-cov --license ~/license.xml --results cov-sqlancer --duration 1200
+voltdb/run-coverage.sh --voltdb ~/voltdb-cov --results cov-sqlcoverage --runs sqlcoverage
+voltdb/run-coverage.sh --voltdb ~/voltdb-cov --results cov-sqlancer --report-only --compare-with cov-sqlcoverage
+```
+
+The second command measures VoltDB's own randomized SQL suite (`ant sqlcoverage`, against HSQL) the same way, and the
+third compares the two: `cov-sqlancer/report/compare.txt` lists the lines each covers that the other does not.
+sqlcoverage's server always uses VoltDB's default ports (21212, 21211, 3021), so the script refuses to run it while
+anything is listening on them: a VoltDB server already running there would be asked to take it into its cluster.
+
+- **Nodes killed with kill -9 keep their counts.** The engine's profiles are written continuously (`%c` in
+  `LLVM_PROFILE_FILE`), and each JVM's JaCoCo agent connects to a collector (`coverage/CoverageServer.java`) that
+  asks it for its counts every 10 s; a killed node loses at most its last 10 s of Java counts.
+- **What is not counted.** The 16.0.0 mirror (DIFF) and the in-service upgrade, whose older kit is not the build
+  under test, are left out. The Java totals include the client classes that the harness's own `voltadmin` and
+  `sqlcmd` JVMs run; the areas leave those packages out.
+- **Versions.** JaCoCo 0.8.12 (agent, core and report) and ASM 9.7, from `~/.m2` by default (`--jacoco-agent`,
+  `--jacoco-lib`). VoltDB's own `third_party/java/jars/jacocoagent.jar` is 0.7.9, too old for Java 17 class files.
 
 ## The nightly lab job
 
