@@ -31,7 +31,9 @@ can also crash the whole cluster and recover it from its command log (`--crash-i
 checks that no acknowledged change was lost; see [Whole-cluster crashes](#whole-cluster-crashes). Since milestone 23
 it can run two clusters linked by XDCR (`--xdcr`), and the XDCR oracle checks that they converge; see [XDCR](#xdcr).
 Since milestone 24 it can start the cluster on the last release and upgrade it in service, one node at a time, while
-SQLancer runs (`--upgrade-from`); see [In-service upgrades](#in-service-upgrades).
+SQLancer runs (`--upgrade-from`); see [In-service upgrades](#in-service-upgrades). Since milestone 25,
+`voltdb/run-repros.sh` reruns the minimal reproduction of every bug the provider found, and the nightly job reports
+which are fixed; see [Bug reproductions](#bug-reproductions).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -319,6 +321,55 @@ DECIMAL columns, as the 16.0.0 nodes abort on grouping, DISTINCT or a set operat
 fixed after 16.0.0), which the first trials on 16.0.0 hit within two minutes. DDL during the upgrade can be refused with "Can
 not update catalog while catalog update is in progress" before it runs; the connection retries it.
 
+## Bug reproductions
+
+`voltdb/repros/` holds the minimal reproduction of each VoltDB bug the provider found, one file per ticket, and
+`voltdb/run-repros.sh --voltdb DIR` runs them all against a kit, each on a fresh server, and says which still
+reproduce:
+
+```
+voltdb/run-repros.sh --voltdb ~/voltdb [--port-base 31000] [--results DIR] [--only ENG-30614,ENG-30611]
+```
+
+| Verdict | Meaning |
+| --- | --- |
+| `BROKEN` | The bug still reproduces: the check gave the bug's result. |
+| `FIXED` | The check gave the right result: the workaround in the provider can go, and the ticket can be checked. |
+| `CHANGED` | Neither: the result changed in another way, or the server crashed where the bug is not a crash. |
+| `ERROR` | The reproduction could not run (the server did not start, a script failed). |
+
+The run fails on CHANGED or ERROR; FIXED does not fail it. `<results>/repros-<time>/summary.txt` has the counts and a
+line per ticket, and `<ticket>.log` the setup's output and the check's.
+
+A `.sql` reproduction has header lines, setup statements, a line `-- check`, and the statements whose output is
+compared:
+
+```
+-- ticket: ENG-30614
+-- summary: An outer join whose ON condition folds to FALSE returns no rows, not the preserved rows null-extended
+-- bug: contains: (0 rows)
+-- fixed: contains: (1 rows)
+CREATE TABLE A (c0 TINYINT NOT NULL, c4 TIMESTAMP);
+CREATE TABLE B (c1 SMALLINT NOT NULL);
+INSERT INTO A VALUES (33, '4808-01-13 02:26:25');
+-- check
+SELECT B.c1, A.c4 FROM A LEFT JOIN B ON 1 = 0;
+```
+
+`-- nodes:`, `-- kfactor:` and `-- sites:` give the cluster (1 node, k=0, 4 sites per host by default). An expectation
+is `contains: TEXT` (a line of the check's output holds TEXT), `crash` (the server exits; for the bug only), or the
+exact output, one header line per line. sqlcmd's output is normalized first: "(Returned 1 rows in 0.01s)" becomes
+"(1 rows)", the dashes under the column names go, and runs of spaces become one. A bug that sqlcmd cannot show (the
+JDBC driver's, a resize hang) is a `.sh` script instead, run with `VOLTDB_HOME`, `PORT_BASE` and `WORKDIR` set; it
+starts its own servers (always with `-H`), and exits 0 while the bug reproduces, 1 once it is fixed, anything else on
+an error. A `-- manual: reason` header marks a reproduction that does not reproduce every time: the runner skips it,
+and lists it in the summary, unless `--only` names it.
+
+Not every bug has a reproduction: ENG-30602 (a query now and then gets another statement's result) and ENG-30608 (a
+SIGILL in a recursive common table, beside other threads' DDL) never reproduced on demand, and ENG-30612 (an MPI
+deadlock after a node dies mid-@UpdateCore) depends on when the kill lands. ENG-30622's script reproduces in a few
+cycles in some runs only, so it is marked `-- manual:` and runs only when `--only` names it.
+
 ## The nightly lab job
 
 `matrix-systemtest-apprunner-sqlancer` on jenkins-st runs this script against master's kit as part of the nightly
@@ -345,7 +396,12 @@ The shapes differ in what the planner and the execution engine do. With one node
 gathers 8 partitions' results in one process. With 3 nodes, k=1, the partitions' leaders are spread over the nodes and
 each has one replica, and node failures move them; elastic resizes add a partition group and move data to it and
 back; crashes replay the command log. With k=2 and 2 sites per host, every node holds every partition, so
-there are only 2 partitions and every write is replicated twice. The whole job takes about 5 hours 40 minutes.
+there are only 2 partitions and every write is replicated twice. The whole job takes about 5 hours 50 minutes.
+
+Before the runs, the job reruns the bug reproductions against the kit, as the triagedb row `sqlancer-repros` (see
+[Bug reproductions](#bug-reproductions)): about 10 minutes on 1 node. It fails when a reproduction changes or cannot
+run; the bugs that no longer reproduce are listed in the build log ("no longer reproduces: ..."). `SQLANCER_REPROS=no`
+skips it.
 
 Every run uses `--use-reducer`. The first run's seed is the UTC time as `yyyymmddHHMM`, and each next run's is one
 more.
