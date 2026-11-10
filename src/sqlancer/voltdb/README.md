@@ -115,7 +115,7 @@ that did not start). Each run writes `<results>/sqlancer-<UTC time>-seed<N>/`:
 | `manifest.txt` | Run id, host, command line, SQLancer commit, VoltDB version, Java version, cluster shape and ports, oracles, duration, seed and threads. |
 | `run.log` | The script's own steps. |
 | `deployment.xml` | The cluster's configuration. |
-| `servers/node<i>/` | Each node's `volt.log` and its `voltdb init` and `voltdb start` output. |
+| `servers/node<i>/` | Each node's `volt.log` and its `voltdb init` and `voltdb start` output. A log over 256 MB keeps its first and last 64 MB and the FATAL lines between, and fails the run: a server logging without end would fill the agent's disk (ENG-30629). |
 | `sqlancer/` | SQLancer's output (`out.log`) and its `logs/voltdb/` directory (see [Reading the results](#reading-the-results)). |
 | `chaos.log` | With `--kill-interval`: each kill and rejoin, with its time. |
 | `crash.log` | With `--crash-interval`: each crash and recovery, with its time and how long the recovery took. `servers/node<i>/recover<i>-<n>.log` is node i's output from recovery n. |
@@ -907,14 +907,23 @@ with `XS_`, outside the database's own names, so no generator or other oracle to
 a later database of the same name goes on with them, and no stream is dropped with rows still to export.
 
 With `--export`, the deployment adds a file export target, and the provider gets `--export-target sqlancer`, so the
-streams export to it. When SQLancer stops, the script runs `@Quiesce`, shuts the cluster down gracefully, which closes
+streams export to it. Its `outdir` is relative, so each node writes into its own `voltdbroot/sqlancer_export`, as on
+separate hosts: in one shared directory two nodes exporting the same stream in the same second name the same file, and
+the second loops on it for good (ENG-30629). When SQLancer stops, the script runs `@Quiesce`, shuts the cluster down gracefully, which closes
 the export files (the file target writes some rows only when it rolls or closes a file, minutes after `@Quiesce`
 returns while many catalog updates run), and counts the distinct rows in them. That must equal the rows STREAMS
 inserted, which it prints at exit. Export is at least once: an identical line (the same transaction id and sequence
 number) counts once, and the summary reports how many were exported twice. A missing row fails the run.
 
 In a 5-minute trial on 3 nodes with k=2 and 2 sites per host, beside VIEWS, NoREC, TLP WHERE, DIFF and SCHEMA, STREAMS
-compared 1,548 views and all 15,695 rows were exported.
+compared 1,548 views and all 15,695 rows were exported. That trial used one shared `outdir` and got by; lab build #43
+did not, as below.
+
+The bug below was found in milestone 29.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30629 | When the file export target's output file name is taken, it logs "Output file for next period already exists ... ExportToFileClient will stop to prevent data loss" but does not stop: it retries the block at once, for good, with a stack trace each time (about 15,000 a second), and the block's rows are never exported. Two nodes on one host sharing an `outdir` take each other's names. Also on 16.0.0. Found by lab build #43, whose three nodes wrote 48 to 68 GB of `volt.log` each in 45 minutes, until the disk was full, and exported 26,955 of 28,240 rows. Critical. | Each node exports into its own voltdbroot; server logs over 256 MB are cut and fail the run. |
 
 ## The VIEWS oracle
 

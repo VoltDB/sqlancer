@@ -50,8 +50,8 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
                      --security true, for the PERMS oracle's users "reader" (role sqlancer_read, SQLREAD) and
                      "writer" (role sqlancer_write, SQL). Not with --kill-interval, --resize-interval,
                      --crash-interval, --xdcr or --upgrade-from.
-  --export           add a file export target ("sqlancer", CSV into the cluster directory) for the STREAMS oracle's
-                     streams, and check at the end, after @Quiesce, that it wrote every row they got
+  --export           add a file export target ("sqlancer", CSV into each node's voltdbroot/sqlancer_export) for the
+                     STREAMS oracle's streams, and check at the end, after @Quiesce, that it wrote every row they got
   --keep-cluster     leave the cluster running and its data in place after the run
   --mirror-voltdb DIR  also start one node of this other VoltDB kit (normally the last release) and run
                      the provider with --mirror: every change is repeated on it, and the DIFF oracle
@@ -440,7 +440,10 @@ if $security; then
         <user name="writer" password="writer" roles="sqlancer_write"/>
     </users>'
 fi
-# with --export, a file target for the STREAMS oracle's streams, one CSV line per row
+# with --export, a file target for the STREAMS oracle's streams, one CSV line per row. The outdir is relative, so each
+# node writes into its own voltdbroot, as on separate hosts: in one shared directory two nodes exporting the same
+# stream in the same second name the same file, and the target refuses it and retries the block for good, logging a
+# stack trace each time (lab build #43: 60 GB of volt.log per node in 45 minutes, and the rows it held never written)
 exporting=
 if $export; then
     exporting='
@@ -448,7 +451,7 @@ if $export; then
         <configuration target="sqlancer" enabled="true" type="file">
             <property name="type">csv</property>
             <property name="nonce">sqlancer</property>
-            <property name="outdir">'$cluster/export'</property>
+            <property name="outdir">sqlancer_export</property>
             <property name="period">1</property>
         </configuration>
     </export>'
@@ -1015,38 +1018,63 @@ for ((i = 0; i < nodes; i++)); do
     $xdcr && { port_in_use "$(client_port $((xdcr_slot + i)))" || down+=("xdcr$i"); }
 done
 stop_cluster
+# save_logs DIR FILE|DIR...: copies the logs into DIR. A log over 256 MB is a server logging something without end, and
+# would fill the agent's disk (lab build #43); its copy keeps the first and last 64 MB and the FATAL lines between, and
+# it fails the run
+oversized=()
+save_logs() {
+    local dest=$1 f size keep=$((64 * 1024 * 1024))
+    shift
+    mkdir -p "$dest"
+    for f in "$@"; do
+        if [ -d "$f" ]; then
+            save_logs "$dest" "$f"/*
+            continue
+        fi
+        [ -f "$f" ] || continue
+        size=$(wc -c <"$f" | tr -d ' ')
+        if [ "$size" -le $((256 * 1024 * 1024)) ]; then
+            cp "$f" "$dest/"
+            continue
+        fi
+        oversized+=("${dest#"$results"/servers/}/$(basename "$f") ($size bytes)")
+        {
+            head -c "$keep" "$f"
+            printf '\n[run-sqlancer: %s was %s bytes; its middle is cut but for its FATAL-level lines]\n' "$f" "$size"
+            tail -c +$((keep + 1)) "$f" | head -c $((size - 2 * keep)) | grep -a " FATAL "
+            printf '[run-sqlancer: its last %s bytes]\n' "$keep"
+            tail -c "$keep" "$f"
+        } >"$dest/$(basename "$f")"
+    done
+}
 for ((i = 0; i < nodes; i++)); do
-    mkdir -p "$results/servers/node$i"
-    cp "$cluster/start$i.log" "$cluster/init$i.log" "$cluster"/restart$i-*.log "$cluster"/recover$i-*.log "$cluster/upgrade$i.log" "$results/servers/node$i/" 2>/dev/null
-    cp -R "$cluster/node$i/voltdbroot/log/." "$results/servers/node$i/" 2>/dev/null
+    save_logs "$results/servers/node$i" "$cluster/start$i.log" "$cluster/init$i.log" "$cluster"/restart$i-*.log \
+        "$cluster"/recover$i-*.log "$cluster/upgrade$i.log" "$cluster/node$i/voltdbroot/log"
 done
 for d in "$cluster"/add*-*; do
     [ -d "$d" ] || continue
-    a=$(basename "$d")
-    mkdir -p "$results/servers/$a"
-    cp "$d.init.log" "$d.start.log" "$results/servers/$a/" 2>/dev/null
-    cp -R "$d/voltdbroot/log/." "$results/servers/$a/" 2>/dev/null
+    save_logs "$results/servers/$(basename "$d")" "$d.init.log" "$d.start.log" "$d/voltdbroot/log"
 done
 if $xdcr; then
     for ((i = 0; i < nodes; i++)); do
-        mkdir -p "$results/servers/xdcr$i"
-        cp "$cluster/start-xdcr$i.log" "$cluster/init-xdcr$i.log" "$results/servers/xdcr$i/" 2>/dev/null
-        cp -R "$cluster/xdcr$i/voltdbroot/log/." "$results/servers/xdcr$i/" 2>/dev/null
+        save_logs "$results/servers/xdcr$i" "$cluster/start-xdcr$i.log" "$cluster/init-xdcr$i.log" \
+            "$cluster/xdcr$i/voltdbroot/log"
     done
 fi
 if [ -n "$mirror_home" ]; then
-    mkdir -p "$results/servers/mirror"
-    cp "$cluster/start-mirror.log" "$cluster/init-mirror.log" "$results/servers/mirror/" 2>/dev/null
-    cp -R "$cluster/mirror/voltdbroot/log/." "$results/servers/mirror/" 2>/dev/null
+    save_logs "$results/servers/mirror" "$cluster/start-mirror.log" "$cluster/init-mirror.log" \
+        "$cluster/mirror/voltdbroot/log"
 fi
 cp "$cluster/deployment.xml" "$results/"
 # every row the STREAMS oracle inserted must have been exported; export is at least once, so a row exported twice (an
 # identical line, with the same transaction id and sequence number) counts once, and the duplicates are reported
 if $export; then
-    mkdir -p "$results/export"
-    cp "$cluster"/export/*.csv "$results/export/" 2>/dev/null
-    total=$(cat "$cluster"/export/*.csv 2>/dev/null | wc -l | tr -d ' ')
-    exported=$(cat "$cluster"/export/*.csv 2>/dev/null | sort -u | wc -l | tr -d ' ')
+    for ((i = 0; i < nodes; i++)); do
+        mkdir -p "$results/export/node$i"
+        cp "$cluster/node$i/voltdbroot/sqlancer_export"/*.csv "$results/export/node$i/" 2>/dev/null
+    done
+    total=$(cat "$cluster"/node*/voltdbroot/sqlancer_export/*.csv 2>/dev/null | wc -l | tr -d ' ')
+    exported=$(cat "$cluster"/node*/voltdbroot/sqlancer_export/*.csv 2>/dev/null | sort -u | wc -l | tr -d ' ')
     duplicates=$((total - exported))
     [ "$exported" -eq "$inserted" ] || export_failed=true
     log "Export: $exported rows exported ($duplicates exported twice), $inserted inserted into the streams$($export_failed && echo ", MISMATCH")"
@@ -1098,7 +1126,7 @@ done
 result=PASS
 [ "$sqlancer_exit" -eq 0 ] && [ ${#failures[@]} -eq 0 ] && [ ${#down[@]} -eq 0 ] && [ "$fatal" -eq 0 ] &&
     ! $chaos_failed && ! $resize_failed && ! $crash_failed && ! $upgrade_failed && ! $export_failed &&
-    [ "$conflicts" -eq 0 ] || result=FAIL
+    [ "$conflicts" -eq 0 ] && [ ${#oversized[@]} -eq 0 ] || result=FAIL
 {
     echo "RESULT: $result"
     echo "run: $run_id"
@@ -1107,6 +1135,7 @@ result=PASS
     echo "failed databases: ${#failures[@]}"
     echo "nodes down at the end: ${down[*]:-none}"
     echo "FATAL lines in server logs: $fatal"
+    [ ${#oversized[@]} -eq 0 ] || echo "server logs over 256 MB, cut: ${oversized[*]}"
     # ENG-30602: failures that did not recur when rerun at once (VoltDBTransientCheck), counted, not failed
     grep -m1 "^PLANS compared different plans:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^PERMS checked:" "$results/sqlancer/out.log" 2>/dev/null
