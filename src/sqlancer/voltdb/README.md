@@ -25,7 +25,8 @@ change; see [The SCHEMA oracle](#the-schema-oracle). Since milestone 19 expressi
 functions and JSON functions, and the GEO oracle checks GEOGRAPHY_POINT and GEOGRAPHY; see
 [Date, JSON, FLOAT math and geography](#date-json-float-math-and-geography). Since milestone 20 the DIFF oracle
 compares this VoltDB with another version, normally the last release, on the same data; see
-[The DIFF oracle](#the-diff-oracle).
+[The DIFF oracle](#the-diff-oracle). Since milestone 21 the run script can also grow and shrink the cluster
+elastically while SQLancer runs (`--resize-interval`); see [Elastic resizes](#elastic-resizes).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -83,6 +84,7 @@ voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 -
 | `--results DIR` | `./sqlancer-results` | Where the run's directory is created. |
 | `--use-reducer` | off | Reduce each failure before saving it (see [Reducing a failure](#reducing-a-failure)). |
 | `--kill-interval SECS` | 0 (never) | Every SECS seconds, kill a random node, node 0 included, with `kill -9`, restart it and wait until it has rejoined (see [Node failures](#node-failures)). Needs k-safety 1 or more. |
+| `--resize-interval SECS` | 0 (never) | Every SECS seconds, add k+1 nodes with `voltdb start --add`, or remove them again with `voltadmin resize`, by turns (see [Elastic resizes](#elastic-resizes)). Does not mix with `--kill-interval`. |
 | `--keep-cluster` | off | Leave the cluster running, with its data, after the run. |
 | `-- ...` | | Everything after `--` goes to the provider, for example `-- --avoid-known-bugs false`. |
 
@@ -98,6 +100,8 @@ that did not start). Each run writes `<results>/sqlancer-<UTC time>-seed<N>/`:
 | `servers/node<i>/` | Each node's `volt.log` and its `voltdb init` and `voltdb start` output. |
 | `sqlancer/` | SQLancer's output (`out.log`) and its `logs/voltdb/` directory (see [Reading the results](#reading-the-results)). |
 | `chaos.log` | With `--kill-interval`: each kill and rejoin, with its time. |
+| `resize.log` | With `--resize-interval`: each grow and shrink, with its time, the planned removal and how long it took. |
+| `servers/add<n>-<j>/` | With `--resize-interval`: the logs of node j added by grow n, like `servers/node<i>/`. A join VoltDB refused is kept as `add<n>-<j>-rejected<a>`. |
 | `reproductions/` | The log of each database whose thread failed: the statements that set it up, then the failing queries. With `--use-reducer`, these are reduced, and `<db>-reduce.log` shows the steps. |
 
 A run FAILs if any of these happens:
@@ -105,6 +109,7 @@ A run FAILs if any of these happens:
 - A node is down at the end.
 - A server log has a FATAL line.
 - With `--kill-interval`, a killed node does not rejoin within 600 seconds.
+- With `--resize-interval`, a grow or a shrink does not complete within 600 seconds.
 
 While `--avoid-known-bugs` is true (the default), a failed check whose queries no longer fail when its reproducer
 reruns them at once is not a failure. It is printed as `ENG-30602 transient: ...` in `sqlancer/out.log`, and the
@@ -161,6 +166,46 @@ handle the errors a node failure causes:
 Without `--node-failures`, these errors fail the run as before. The OPS timeout makes each failure cost up to a minute
 of the threads that read the schema at the time, so a run with failures checks fewer queries.
 
+## Elastic resizes
+
+With `--resize-interval SECS`, the script grows the cluster by k+1 nodes and shrinks it back by turns, a step every
+SECS seconds, while SQLancer runs and the oracles keep checking query results:
+
+1. **Grow.** It starts k+1 new nodes with `voltdb start --add`, each with the whole host list, on the ports after the
+   original nodes' (slots `--nodes` to `--nodes`+k). VoltDB refuses a join while a catalog update is in progress
+   ("Can't do elastic join while catalog update is in progress"), which SQLancer's DDL makes common, and the joiner
+   then exits: the script kills the attempt's other nodes, keeps their logs as `add<n>-<j>-rejected<a>`, and tries
+   again, up to 10 times. A grow is done once every new node has started ("Server completed initialization") and the
+   cluster's topology has settled, about 40 seconds after the join: `voltadmin resize --test` then plans to remove
+   only the new nodes.
+2. **Shrink.** `voltadmin resize` removes the partition group added last, which is the new nodes (the planner
+   removes the highest partitions). A shrink is done once their servers have exited.
+
+Host ids keep growing across grows, and VoltDB refuses to remove more than half the cluster, which is why the script
+adds k+1 nodes: one partition group. When SQLancer stops the script lets the current step finish, and the summary
+counts grows and shrinks. A step that does not finish within 600 seconds fails the run, and FATAL lines in an added
+node's log fail it too (not in a rejected join's, where the FATAL is the refusal).
+
+With `--resize-interval`, the script passes the provider `--resizes true`: a shrink drops the calls in flight on the
+hosts it removes, which the driver is connected to (`--servers`, `topologychangeaware`), so the provider expects the
+same errors as for a killed node (see [Node failures](#node-failures)); the oracles' workarounds for ENG-30612, which
+is about killed nodes, do not apply. It also passes `--ddl-hold <run>/ddl.hold`: the script creates that file 3
+seconds before each shrink and deletes it once the shrink is done, and while it exists the connection holds every
+DDL statement (CREATE, DROP, ALTER, PARTITION), for up to 15 minutes. Without it, a table that SQLancer drops while
+the shrink streams its index snapshot hangs the shrink for good (ENG-30622). With `-- --avoid-known-bugs false` the
+provider ignores the file.
+
+With `--resizes`, the provider also makes no ASSUMEUNIQUE constraint or index (a unique key on a partitioned table
+that leaves out the partitioning column). VoltDB checks ASSUMEUNIQUE within a partition only, so two partitions can
+hold rows with the same key, and a resize that moves one of them next to the other fails ("Found duplicates while
+rebalancing data across partitions") and retries for good: lab build #40 hung a shrink this way for 10 minutes, until
+SQLancer dropped the table. VoltDB documents this; it is not a bug.
+
+An elastic join, like a rejoin, makes system requests time out for a minute (ENG-30229): `@SystemInformation` and
+`@SystemCatalog`, which the JDBC driver's `getMetaData()` and `DatabaseMetaData` calls send, fail with "OPS request hit
+sixty second timeout" or "Too many pending stat requests". The connection retries them for up to 150 seconds, with or
+without `--resizes`.
+
 ## The nightly lab job
 
 `matrix-systemtest-apprunner-sqlancer` on jenkins-st runs this script against master's kit as part of the nightly
@@ -171,18 +216,20 @@ system test (`matrix-systemtest/master`, on the nights the rotation in `internal
 
 The job fetches this repository at the commit in its `SQLANCER_REF` parameter. That commit is pinned in the Jenkinsfile,
 so a change here reaches the nightly run only when the Jenkinsfile is changed to name it. It then builds SQLancer with
-the kit's runtime JDK and makes three runs, one after the other, every node on the agent:
+the kit's runtime JDK and makes four runs, one after the other, every node on the agent:
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all sixteen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all seventeen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF) | 45 minutes |
 | `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
 | `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
+| `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
 
 The shapes differ in what the planner and the execution engine do. With one node and 8 sites, a multi-partition query
 gathers 8 partitions' results in one process. With 3 nodes, k=1, the partitions' leaders are spread over the nodes and
-each has one replica, and node failures move them. With k=2 and 2 sites per host, every node holds every partition, so
-there are only 2 partitions and every write is replicated twice. The whole job takes about 2 hours 20 minutes.
+each has one replica, and node failures move them; elastic resizes add a partition group and move data to it and
+back. With k=2 and 2 sites per host, every node holds every partition, so
+there are only 2 partitions and every write is replicated twice. The whole job takes about 3 hours 10 minutes.
 
 Every run uses `--use-reducer`. The first run's seed is the UTC time as `yyyymmddHHMM`, and each next run's is one
 more.
@@ -197,8 +244,9 @@ To repeat a failure on your machine, take the seed and oracles from the bundle's
 them against the same build. The reproduction in `reproductions/` is usually quicker: run its statements on an empty
 server.
 
-The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor[:kill[:sites]]`, where kill is the
-seconds between node failures and sites the sites per host, default `3:1:300 1:0 3:2:0:2`), `DURATION` (seconds
+The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor[:chaos[:sites]]`, where chaos is the
+seconds between node failures, or `r` and the seconds between elastic resizes, and sites the sites per host, default
+`3:1:300 1:0 3:2:0:2 3:1:r120`), `DURATION` (seconds
 per run, default 2700), `ORACLES`, `SEED`, `EXTRA_ARGS` (provider options) and `SQLANCER_REF`. A run of the job alone
 needs a kit: give `releasedir`, for example `releases/one-offs/16.1.0-SNAPSHOT-master/<kit build>`.
 
@@ -1023,6 +1071,13 @@ The bugs below were found in milestone 19.
 | --- | --- | --- |
 | ENG-30510 (comment) | The RIGHT JOIN bug through a FULL JOIN: a WHERE clause that rejects the right table's NULLs turns `a FULL JOIN b ON c >= b.k` into a RIGHT JOIN and then a LEFT JOIN that uses the ON condition as b's index range, dropping b's row. Found by TLP WHERE. Wrong result. | A FULL JOIN's ON condition reads the left table only. |
 | ENG-30611 | `DATEADD(YEAR, n, d)` on a DATE February 29 into a non-leap year: with a DATE literal the server aborts (uncaught `boost::gregorian::bad_day_of_month`), with a column it is "Invalid date 'February 29' as '2025' is not a leap year"; a TIMESTAMP and MONTH 12 give February 28. Found by PARAMS, crash found probing it. Critical. | DATEADD has no YEAR unit. |
+
+The bugs below were found in milestone 21.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30622 | An elastic remove hangs for good at "Building index for data migration" when a table is dropped while it streams its index snapshot: the hosts being removed log "No table streamer of Type TABLE_STREAM_ELASTIC_INDEX" and "Snapshot of table ... failed to complete", and `voltadmin resize --status` stays at "Planning data migration". Also on 16.0.0. Found by a local `--resize-interval` trial, where SQLancer's cleanup of an old database dropped its tables during a shrink; a script reproduces it in a few cycles. Critical. | DDL waits during each shrink (`--ddl-hold`). |
+| ENG-30229 (existing) | System requests time out for 60 seconds during an elastic join, as during a rejoin, and the JDBC metadata calls with them. | The connection retries them for up to 150 seconds. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.

@@ -3,6 +3,8 @@ package sqlancer.voltdb;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.CallableStatement;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
@@ -39,15 +41,32 @@ public class VoltDBConnection extends SQLConnection {
     private static final Pattern SELECT_PREAMBLE = Pattern.compile("^\\s*select\\s+.*",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
+    // ENG-30229: an OPS request (@SystemInformation, @SystemCatalog, @Statistics) sent while a host is joining or
+    // rejoining waits 60 s and fails ("OPS request hit sixty second timeout"), and while it waits every other one is
+    // refused ("Too many pending stat requests"). The driver's getMetaData() and DatabaseMetaData calls are such
+    // requests; they are retried for up to OPS_RETRY_MILLIS, which covers an elastic join (run-sqlancer.sh
+    // --resize-interval) or a rejoin.
+    private static final long OPS_RETRY_MILLIS = 150_000;
+
+    // ENG-30622: a catalog update that drops a table while an elastic remove streams its index snapshot fails the
+    // snapshot ("No table streamer of Type TABLE_STREAM_ELASTIC_INDEX"), and the remove then waits forever at "Building
+    // index for data migration". run-sqlancer.sh creates the --ddl-hold file around each shrink; while it exists, DDL
+    // waits, for up to DDL_HOLD_MILLIS.
+    private static final Pattern DDL = Pattern.compile("^\\s*(create|drop|alter|partition)\\b.*",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final long DDL_HOLD_MILLIS = 900_000;
+
     private final Connection connection;
     private final long retryMillis;
     private final boolean nodeFailures;
     private boolean closed;
     // the DIFF oracle's second cluster, running another VoltDB version (--mirror), or null; every statement that
-    // changes
-    // the database is repeated on it, and the database is marked diverged when the two disagree on whether it succeeded
+    // changes the database is repeated on it, and the database is marked diverged when the two disagree on whether it
+    // succeeded
     private VoltDBConnection mirror;
     private volatile boolean diverged;
+    // the --ddl-hold file, or null
+    private Path ddlHold;
 
     public VoltDBConnection(Connection connection, int retrySeconds, boolean nodeFailures) {
         super(connection);
@@ -86,6 +105,22 @@ public class VoltDBConnection extends SQLConnection {
         this.mirror = mirror;
     }
 
+    public void setDdlHold(Path ddlHold) {
+        this.ddlHold = ddlHold;
+    }
+
+    // waits while the --ddl-hold file exists, if sql is DDL
+    private void holdDdl(Object... args) throws InterruptedException {
+        if (ddlHold == null || args == null || args.length != 1 || !(args[0] instanceof String)
+                || !DDL.matcher((String) args[0]).matches()) {
+            return;
+        }
+        long deadline = System.currentTimeMillis() + DDL_HOLD_MILLIS;
+        while (Files.exists(ddlHold) && System.currentTimeMillis() < deadline) {
+            Thread.sleep(200);
+        }
+    }
+
     public VoltDBConnection getMirror() {
         return mirror;
     }
@@ -119,28 +154,49 @@ public class VoltDBConnection extends SQLConnection {
         }
     }
 
+    private static boolean isOpsTimeout(Throwable t) {
+        String m = t instanceof SQLException ? t.getMessage() : null;
+        return m != null
+                && (m.contains("OPS request hit sixty second timeout") || m.contains("Too many pending stat requests"));
+    }
+
+    private interface MetaDataCall<T> {
+        T call() throws SQLException, InvocationTargetException, IllegalAccessException;
+    }
+
+    private <T> T opsRetrying(MetaDataCall<T> call) throws Throwable {
+        long deadline = System.currentTimeMillis() + OPS_RETRY_MILLIS;
+        while (true) {
+            try {
+                return call.call();
+            } catch (SQLException | InvocationTargetException e) {
+                Throwable cause = e instanceof InvocationTargetException ? e.getCause() : e;
+                if (isOpsTimeout(cause) && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(1000);
+                    continue;
+                }
+                throw skippedIfNodeFailure(cause);
+            }
+        }
+    }
+
     public DatabaseMetaData getMetaData() throws SQLException {
         DatabaseMetaData md;
         try {
             // the driver reads the cluster's system information here
-            md = connection.getMetaData();
-        } catch (SQLException e) {
-            if (skippedIfNodeFailure(e) instanceof IgnoreMeException) {
-                throw new IgnoreMeException();
+            md = opsRetrying(connection::getMetaData);
+        } catch (Throwable t) {
+            if (t instanceof SQLException) {
+                throw (SQLException) t;
             }
-            throw e;
-        }
-        if (!nodeFailures) {
-            return md;
+            if (t instanceof RuntimeException) {
+                throw (RuntimeException) t;
+            }
+            throw new SQLException(t);
         }
         return (DatabaseMetaData) Proxy.newProxyInstance(DatabaseMetaData.class.getClassLoader(),
-                new Class<?>[] { DatabaseMetaData.class }, (proxy, method, args) -> {
-                    try {
-                        return method.invoke(md, args);
-                    } catch (InvocationTargetException e) {
-                        throw skippedIfNodeFailure(e.getCause());
-                    }
-                });
+                new Class<?>[] { DatabaseMetaData.class },
+                (proxy, method, args) -> opsRetrying(() -> method.invoke(md, args)));
     }
 
     // an error a node failure caused, as IgnoreMeException while --node-failures is on, otherwise the error itself
@@ -155,6 +211,9 @@ public class VoltDBConnection extends SQLConnection {
     private <T extends Statement> T retrying(T statement, Class<T> type) {
         return type
                 .cast(Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[] { type }, (proxy, method, args) -> {
+                    if (method.getName().startsWith("execute")) {
+                        holdDdl(args);
+                    }
                     long deadline = System.currentTimeMillis() + retryMillis;
                     while (true) {
                         try {

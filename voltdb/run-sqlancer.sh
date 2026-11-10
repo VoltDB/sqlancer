@@ -30,6 +30,9 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
   --use-reducer      reduce each failure with SQLancer's statement reducer
   --kill-interval S  every S seconds, kill a random node, node 0 included, with kill -9 and restart it,
                      which rejoins it to the cluster (default 0: never). Needs --kfactor 1 or more.
+  --resize-interval S  every S seconds, resize the cluster elastically, growing and shrinking by turns: add
+                     k+1 nodes (voltdb start --add), then remove them (voltadmin resize) (default 0: never).
+                     Not with --kill-interval.
   --keep-cluster     leave the cluster running and its data in place after the run
   --mirror-voltdb DIR  also start one node of this other VoltDB kit (normally the last release) and run
                      the provider with --mirror: every change is repeated on it, and the DIFF oracle
@@ -68,6 +71,7 @@ results_root=$PWD/sqlancer-results
 use_reducer=false
 keep_cluster=false
 kill_interval=0
+resize_interval=0
 mirror_home=
 mirror_license=
 mirror_java_home=
@@ -91,6 +95,7 @@ while [ $# -gt 0 ]; do
     --use-reducer) use_reducer=true; shift ;;
     --keep-cluster) keep_cluster=true; shift ;;
     --kill-interval) kill_interval=$2; shift 2 ;;
+    --resize-interval) resize_interval=$2; shift 2 ;;
     --mirror-voltdb) mirror_home=$2; shift 2 ;;
     --mirror-license) mirror_license=$2; shift 2 ;;
     --mirror-java-home) mirror_java_home=$2; shift 2 ;;
@@ -117,7 +122,7 @@ if [ -n "$mirror_home" ]; then
         mirror_license_args=(--license "$mirror_license")
     fi
 fi
-for n in "$nodes" "$sites" "$duration" "$threads" "$queries" "$port_base" "$kill_interval"; do
+for n in "$nodes" "$sites" "$duration" "$threads" "$queries" "$port_base" "$kill_interval" "$resize_interval"; do
     case $n in '' | *[!0-9]*) die "not a number: '$n'" ;; esac
 done
 [ "$nodes" -ge 1 ] || die "--nodes must be at least 1"
@@ -126,6 +131,11 @@ if [ -z "$kfactor" ]; then
 fi
 [ "$kfactor" -lt "$nodes" ] || die "--kfactor must be less than --nodes"
 [ -n "$seed" ] || seed=$(date +%s)
+[ "$kill_interval" -eq 0 ] || [ "$resize_interval" -eq 0 ] || die "--kill-interval and --resize-interval do not mix"
+if [ "$resize_interval" -gt 0 ]; then
+    # a shrink drops the calls in flight on the hosts it removes, which the provider then expects (see VoltDBErrors)
+    provider_args=(--resizes true ${provider_args[@]+"${provider_args[@]}"})
+fi
 if [ "$kill_interval" -gt 0 ]; then
     [ "$kfactor" -ge 1 ] || die "--kill-interval needs --kfactor 1 or more"
     # the provider expects the errors a node failure causes (see VoltDBErrors)
@@ -164,9 +174,12 @@ internal_port() { port "$1" 2; }
 
 port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
-# the mirror, if any, takes the port slot after the last node's
-for ((i = 0; i < nodes + 1; i++)); do
-    [ "$i" -eq "$nodes" ] && [ -z "$mirror_home" ] && break
+# the mirror, if any, takes the port slot after the last node's; the k+1 nodes a resize adds take the slots after that
+added=0
+[ "$resize_interval" -gt 0 ] && added=$((kfactor + 1))
+added_slot=$((nodes + 1))
+for ((i = 0; i < added_slot + added; i++)); do
+    [ "$i" -eq "$nodes" ] && [ -z "$mirror_home" ] && continue
     for j in 0 1 2 3 4 5; do
         p=$(port $i $j)
         port_in_use "$p" && die "port $p is in use; pick another --port-base"
@@ -178,6 +191,10 @@ results=$results_root/$run_id
 cluster=$results/cluster
 mkdir -p "$cluster" "$results/sqlancer" "$results/servers" "$results/reproductions" || die "cannot create $results"
 results=$(cd "$results" && pwd)
+if [ "$resize_interval" -gt 0 ]; then
+    # DDL waits while this file exists, which shrink creates (the provider ignores it with --avoid-known-bugs false)
+    provider_args+=(--ddl-hold "$results/ddl.hold")
+fi
 cluster=$results/cluster
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$results/run.log"; }
@@ -231,7 +248,7 @@ stop_cluster() {
         sleep 1
     done
     pkill -f "$cluster/" 2>/dev/null
-    for f in "$cluster"/node*.pid "$cluster"/mirror.pid; do
+    for f in "$cluster"/node*.pid "$cluster"/add*.pid "$cluster"/mirror.pid; do
         [ -e "$f" ] && is_server "$(cat "$f")" && kill -9 "$(cat "$f")" 2>/dev/null
     done
 }
@@ -277,6 +294,7 @@ sqlancer_dirty=$(git -C "$repo_dir" status --porcelain 2>/dev/null | grep -v '^?
     echo "queries per db:   $queries"
     echo "use reducer:      $use_reducer"
     echo "kill interval:    $([ "$kill_interval" -gt 0 ] && echo "$kill_interval s" || echo never)"
+    echo "resize interval:  $([ "$resize_interval" -gt 0 ] && echo "$resize_interval s, $added nodes added and removed by turns" || echo never)"
     echo "provider options: ${provider_args[*]:-}"
 } >"$results/manifest.txt"
 cat "$results/manifest.txt"
@@ -442,6 +460,151 @@ if [ "$kill_interval" -gt 0 ]; then
     log "Killing and rejoining a random node every $kill_interval s (chaos.log)"
 fi
 
+# Every resize_interval seconds, by turns: grow the cluster by k+1 nodes, then shrink it by the same nodes. A grow
+# starts them with "voltdb start --add" in their own directories ($cluster/add<N>-<j>, kept for their logs) and waits
+# until they have joined and until "voltadmin resize --test" would remove them: VoltDB publishes the new topology some
+# seconds after the join (40 s in a trial), and a shrink planned before then would remove the original nodes, which it
+# refuses as more than half the cluster. A shrink runs "voltadmin resize", which removes the partition group with
+# the highest partition ids, those the last grow added, and waits until their servers exit. Each step has 600 s; one
+# that fails or times out ends the loop and fails the run. Each event is a line of resize.log. The loop stops when
+# $results/resize.stop exists, after its step, so the run ends at a settled size.
+grows=0
+shrinks=0
+resize_hosts() {
+    "$voltdb_home/bin/voltadmin" resize --test -H "localhost:$(admin_port 0)" 2>&1 | tail -1
+}
+# start_added N: starts the k+1 nodes of grow N, each initialized afresh in $cluster/add<N>-<j>
+start_added() {
+    local n=$1 j slot dir
+    for ((j = 0; j < added; j++)); do
+        slot=$((added_slot + j))
+        dir=$cluster/add$n-$j
+        "$voltdb_home/bin/voltdb" init --force -D "$dir" -C "$cluster/deployment.xml" \
+            ${license_args[@]+"${license_args[@]}"} >"$dir.init.log" 2>&1 || return 1
+        (nohup "$voltdb_home/bin/voltdb" start --add -D "$dir" -H "$(hosts internal)" \
+            --client="$(client_port $slot)" --admin="$(admin_port $slot)" --internal="$(internal_port $slot)" \
+            --zookeeper="$(port $slot 3)" --replication="$(port $slot 4)" --metrics="$(port $slot 5)" \
+            >"$dir.start.log" 2>&1 &
+            echo $! >"$dir.pid")
+    done
+}
+# grow N: adds k+1 nodes and waits until the cluster would remove them again. VoltDB rejects a join while a catalog
+# update is in progress, and SQLancer's DDL makes one likely: the joining nodes then exit with a FATAL line. Such an
+# attempt is set aside (its directories renamed add<N>-<j>-rejected<A>, whose FATAL lines are not counted) and tried
+# again 5 s later, up to 10 times.
+grow() {
+    local n=$1 j attempt deadline=$((SECONDS + 600)) ready out rejected originals
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        start_added $n || return 1
+        rejected=false
+        while [ $SECONDS -lt $deadline ]; do
+            ready=0
+            for ((j = 0; j < added; j++)); do
+                grep -q "Server completed initialization" "$cluster/add$n-$j.start.log" 2>/dev/null && ready=$((ready + 1))
+                grep -q "Can't do elastic join while catalog update is in progress" "$cluster/add$n-$j.start.log" 2>/dev/null &&
+                    rejected=true
+            done
+            [ "$ready" -eq "$added" ] || $rejected && break
+            # kill -0, not is_server: the PID is the launcher's until it execs the server's JVM
+            for ((j = 0; j < added; j++)); do
+                kill -0 "$(cat "$cluster/add$n-$j.pid")" 2>/dev/null && continue
+                # exited: a rejected join (its log may have been read just before the line was written), or a failure
+                sleep 1
+                grep -q "Can't do elastic join while catalog update is in progress" "$cluster/add$n-$j.start.log" || return 1
+                rejected=true
+            done
+            $rejected && break
+            sleep 1
+        done
+        $rejected || break
+        echo "$(date '+%H:%M:%S') grow $n: join rejected while a catalog update was in progress (attempt $attempt), retrying" >>"$results/resize.log"
+        for ((j = 0; j < added; j++)); do
+            kill -9 "$(cat "$cluster/add$n-$j.pid")" 2>/dev/null
+        done
+        sleep 5
+        for ((j = 0; j < added; j++)); do
+            for f in "" .init.log .start.log .pid; do
+                mv "$cluster/add$n-$j$f" "$cluster/add$n-$j-rejected$attempt$f" 2>/dev/null
+            done
+        done
+        [ $SECONDS -lt $deadline ] || return 1
+    done
+    $rejected && return 1
+    [ "$ready" -eq "$added" ] || return 1
+    # the original nodes are hosts 0 to nodes-1: done once the planned removal names none of them (paste, not
+    # seq -s, as BSD seq ends the list with the separator, which makes an empty alternative)
+    originals=$(seq 0 $((nodes - 1)) | paste -sd '|' -)
+    while [ $SECONDS -lt $deadline ]; do
+        out=$(resize_hosts)
+        if echo "$out" | grep -q "Host Ids: \[" && ! echo "$out" | grep -qE "Host Ids: \[(.*[ ,\[])?($originals)[],]"; then
+            echo "$(date '+%H:%M:%S') grow $n: planned removal: ${out#INFO: }" >>"$results/resize.log"
+            return 0
+        fi
+        sleep 5
+    done
+    return 1
+}
+# ENG-30622: a table dropped while an elastic remove streams its index snapshot hangs the remove for good, so DDL is
+# held (the provider's --ddl-hold) from a few seconds before the shrink, letting a catalog update in flight finish,
+# until it is done
+shrink() {
+    local rc=0
+    touch "$results/ddl.hold"
+    sleep 3
+    shrink_steps "$1" || rc=1
+    rm -f "$results/ddl.hold"
+    return $rc
+}
+shrink_steps() {
+    local n=$1 j alive deadline=$((SECONDS + 600)) out
+    out=$("$voltdb_home/bin/voltadmin" resize -H "localhost:$(admin_port 0)" 2>&1 | tail -1)
+    echo "$(date '+%H:%M:%S') shrink $n: $out" >>"$results/resize.log"
+    echo "$out" | grep -q "^INFO" || return 1
+    while [ $SECONDS -lt $deadline ]; do
+        alive=0
+        for ((j = 0; j < added; j++)); do
+            is_server "$(cat "$cluster/add$n-$j.pid")" && alive=$((alive + 1))
+        done
+        [ "$alive" -eq 0 ] && return 0
+        sleep 1
+    done
+    return 1
+}
+resize_loop() {
+    local n=0 t0
+    while true; do
+        for _ in $(seq 1 "$resize_interval"); do
+            [ -e "$results/resize.stop" ] && return 0
+            sleep 1
+        done
+        n=$((n + 1))
+        t0=$SECONDS
+        echo "$(date '+%H:%M:%S') grow $n: adding $added node(s)" >>"$results/resize.log"
+        if ! grow $n; then
+            echo "$(date '+%H:%M:%S') grow $n: FAILED after $((SECONDS - t0)) s" >>"$results/resize.log"
+            return 1
+        fi
+        echo "$(date '+%H:%M:%S') grow $n: done, $((SECONDS - t0)) s" >>"$results/resize.log"
+        for _ in $(seq 1 "$resize_interval"); do
+            [ -e "$results/resize.stop" ] && return 0
+            sleep 1
+        done
+        t0=$SECONDS
+        if ! shrink $n; then
+            echo "$(date '+%H:%M:%S') shrink $n: FAILED after $((SECONDS - t0)) s" >>"$results/resize.log"
+            return 1
+        fi
+        echo "$(date '+%H:%M:%S') shrink $n: done, $((SECONDS - t0)) s" >>"$results/resize.log"
+    done
+}
+resize_pid=
+if [ "$resize_interval" -gt 0 ]; then
+    : >"$results/resize.log"
+    resize_loop &
+    resize_pid=$!
+    log "Growing and shrinking the cluster by $added node(s) by turns, every $resize_interval s (resize.log)"
+fi
+
 log "Running SQLancer for $duration s: oracles $oracles, seed $seed, $threads threads"
 # in the background, so that an interrupt runs the trap at once instead of after SQLancer finishes
 (cd "$results/sqlancer" && exec "$java" -jar "$jar" "${sqlancer_args[@]}" voltdb --oracle "$oracles" \
@@ -462,6 +625,14 @@ if [ -n "$chaos_pid" ]; then
     rejoins=$(grep -c " rejoin [0-9]*: node[0-9]*, " "$results/chaos.log")
     log "Node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", the last one FAILED")"
 fi
+resize_failed=false
+if [ -n "$resize_pid" ]; then
+    touch "$results/resize.stop"
+    wait "$resize_pid" || resize_failed=true
+    grows=$(grep -c " grow [0-9]*: done" "$results/resize.log")
+    shrinks=$(grep -c " shrink [0-9]*: done" "$results/resize.log")
+    log "Resizes: $grows grows, $shrinks shrinks$($resize_failed && echo ", the last step FAILED")"
+fi
 
 # --- collect -----------------------------------------------------------------------------------------------------
 
@@ -474,6 +645,13 @@ for ((i = 0; i < nodes; i++)); do
     mkdir -p "$results/servers/node$i"
     cp "$cluster/start$i.log" "$cluster/init$i.log" "$cluster"/restart$i-*.log "$results/servers/node$i/" 2>/dev/null
     cp -R "$cluster/node$i/voltdbroot/log/." "$results/servers/node$i/" 2>/dev/null
+done
+for d in "$cluster"/add*-*; do
+    [ -d "$d" ] || continue
+    a=$(basename "$d")
+    mkdir -p "$results/servers/$a"
+    cp "$d.init.log" "$d.start.log" "$results/servers/$a/" 2>/dev/null
+    cp -R "$d/voltdbroot/log/." "$results/servers/$a/" 2>/dev/null
 done
 if [ -n "$mirror_home" ]; then
     mkdir -p "$results/servers/mirror"
@@ -503,12 +681,17 @@ for ((i = 0; i < nodes; i++)); do
         END { print c + 0 }' "$results/servers/node$i/volt.log" 2>/dev/null)
     fatal=$((fatal + ${n:-0}))
 done
+for f in "$results"/servers/add*-*/volt.log; do
+    [ -e "$f" ] || continue
+    case $f in *-rejected*) continue ;; esac
+    fatal=$((fatal + $(grep -c " FATAL " "$f")))
+done
 
 # --- summary -----------------------------------------------------------------------------------------------------
 
 result=PASS
 [ "$sqlancer_exit" -eq 0 ] && [ ${#failures[@]} -eq 0 ] && [ ${#down[@]} -eq 0 ] && [ "$fatal" -eq 0 ] &&
-    ! $chaos_failed || result=FAIL
+    ! $chaos_failed && ! $resize_failed || result=FAIL
 {
     echo "RESULT: $result"
     echo "run: $run_id"
@@ -520,6 +703,7 @@ result=PASS
     # ENG-30602: failures that did not recur when rerun at once (VoltDBTransientCheck), counted, not failed
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
+    [ "$resize_interval" -gt 0 ] && echo "resizes: $grows grows, $shrinks shrinks$($resize_failed && echo ", a step FAILED (resize.log)")"
     for f in ${failures[@]+"${failures[@]}"}; do
         echo
         echo "== reproductions/$(basename "$f")"
