@@ -415,6 +415,8 @@ voltdb/run-coverage.sh --voltdb ~/voltdb-cov --results cov-sqlancer --report-onl
 
 The second command measures VoltDB's own randomized SQL suite (`ant sqlcoverage`, against HSQL) the same way, and the
 third compares the two: `cov-sqlancer/report/compare.txt` lists the lines each covers that the other does not.
+sqlcoverage's server always uses VoltDB's default ports (21212, 21211, 3021), so the script refuses to run it while
+anything is listening on them: a VoltDB server already running there would be asked to take it into its cluster.
 
 - **Nodes killed with kill -9 keep their counts.** The engine's profiles are written continuously (`%c` in
   `LLVM_PROFILE_FILE`), and each JVM's JaCoCo agent connects to a collector (`coverage/CoverageServer.java`) that

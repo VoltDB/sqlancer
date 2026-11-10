@@ -159,6 +159,15 @@ if ! $report_only; then
     # %c: continuous mode, the counters are mapped onto the file and survive kill -9; %p: one file per process
     export LLVM_PROFILE_FILE="$results/profraw/%c%p.profraw"
 
+    # sqlcoverage's server (org.voltdb.sqlgenerator.SimpleServer) always uses VoltDB's default ports, client 21212,
+    # admin 21211 and internal 3021: a VoltDB already on this machine would be asked to take it into its cluster
+    if [[ ",$runs," == *,sqlcoverage,* ]]; then
+        for p in 21212 21211 3021; do
+            if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
+                die "port $p is in use: sqlcoverage's server needs VoltDB's default ports 21212, 21211 and 3021 free"
+            fi
+        done
+    fi
     i=0
     IFS=, read -ra run_list <<<"$runs"
     for run in "${run_list[@]}"; do
@@ -175,6 +184,7 @@ if ! $report_only; then
         *) die "unknown run $run (see --runs)" ;;
         esac
         log "Run $i: $run"
+        # (pro.build.done: sqlcoverage would otherwise rebuild VoltDB first, and run its unit tests under the agent)
         # the server JVMs get the agent through VOLTDB_OPTS, which the voltdb launcher adds; sqlcoverage's server
         # is a plain java command, so it gets it through JAVA_TOOL_OPTIONS (as does ant's own JVM, which loads no
         # VoltDB class)
@@ -183,7 +193,7 @@ if ! $report_only; then
                 ${license_args[@]+"${license_args[@]}"} --results "$results/runs/$run" >"$results/runs/$run.log" 2>&1
         elif [ "$run" = sqlcoverage ]; then
             (cd "$voltdb_home" && JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:-} $agent" ant -Djmemcheck=NO_MEMCHECK \
-                -Dsql_coverage_seed="$s" -Dsqlcoverage.failonerror=false sqlcoverage) >"$results/runs/$run.log" 2>&1
+                -Dpro.build.done=true -Dsql_coverage_seed="$s" -Dsqlcoverage.failonerror=false sqlcoverage) >"$results/runs/$run.log" 2>&1
         else
             VOLTDB_OPTS="${VOLTDB_OPTS:-} $agent" "$script_dir/run-sqlancer.sh" --voltdb "$voltdb_home" \
                 ${license_args[@]+"${license_args[@]}"} --results "$results/runs/$run" "${args[@]}" \
