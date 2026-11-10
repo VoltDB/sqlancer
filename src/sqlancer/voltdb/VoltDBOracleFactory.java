@@ -13,6 +13,7 @@ import sqlancer.voltdb.oracle.VoltDBGeographyOracle;
 import sqlancer.voltdb.oracle.VoltDBLimitOracle;
 import sqlancer.voltdb.oracle.VoltDBParameterOracle;
 import sqlancer.voltdb.oracle.VoltDBPivotedQuerySynthesisOracle;
+import sqlancer.voltdb.oracle.VoltDBPlanOracle;
 import sqlancer.voltdb.oracle.VoltDBSchemaChangeOracle;
 import sqlancer.voltdb.oracle.VoltDBSetOperationOracle;
 import sqlancer.voltdb.oracle.VoltDBSmokeOracle;
@@ -133,6 +134,17 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBDurabilityOracle(globalState);
+        }
+    },
+
+    /**
+     * Differential query plans: the same query planned two ways (an index made unusable, the join order reversed, an
+     * index added) returns the same rows.
+     */
+    PLANS {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBPlanOracle(globalState, expressionErrors());
         }
     },
 
