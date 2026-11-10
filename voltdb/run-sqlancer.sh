@@ -811,8 +811,11 @@ fi
 # $results/resize.stop exists, after its step, so the run ends at a settled size.
 grows=0
 shrinks=0
+# --ignore=disabled_export: the STREAMS oracle's streams have no export target but with --export, and VoltDB will not
+# resize while such a "disabled export target" may hold rows (lab build #43: every grow timed out); a stream with no
+# target discards its rows, so there is nothing to drain
 resize_hosts() {
-    "$voltdb_home/bin/voltadmin" resize --test -H "localhost:$(admin_port 0)" 2>&1 | tail -1
+    "$voltdb_home/bin/voltadmin" resize --test --ignore=disabled_export -H "localhost:$(admin_port 0)" 2>&1 | tail -1
 }
 # start_added N: starts the k+1 nodes of grow N, each initialized afresh in $cluster/add<N>-<j>
 start_added() {
@@ -898,7 +901,7 @@ shrink() {
 }
 shrink_steps() {
     local n=$1 j alive deadline=$((SECONDS + 600)) out
-    out=$("$voltdb_home/bin/voltadmin" resize -H "localhost:$(admin_port 0)" 2>&1 | tail -1)
+    out=$("$voltdb_home/bin/voltadmin" resize --ignore=disabled_export -H "localhost:$(admin_port 0)" 2>&1 | tail -1)
     echo "$(date '+%H:%M:%S') shrink $n: $out" >>"$results/resize.log"
     echo "$out" | grep -q "^INFO" || return 1
     while [ $SECONDS -lt $deadline ]; do
