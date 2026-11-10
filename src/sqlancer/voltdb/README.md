@@ -286,6 +286,12 @@ The script passes the provider `--xdcr` with the second cluster's client ports, 
    succeeds runs on the peer too. A change the peer refuses marks the database split, and XDCR skips it.
 3. Before any rows go in, every table becomes a DR table (`DR TABLE t`) on both sides. Tables without a unique index
    replicate updates and deletes by matching the whole row, which VoltDB warns is slow but allows.
+4. A database that reuses an earlier one's name may write through the other cluster, and drops the old tables on its
+   own first. Rows the old database wrote just before, still on their way, would then reach a table that cluster no
+   longer has, and pause that DR stream for good (ENG-30630). So, before those drops, the provider waits up to 60 s
+   until each cluster's DR producer has had acknowledged everything it had queued (`@Statistics DRPRODUCERPARTITION`:
+   LASTACKDRID reaches the LASTQUEUEDDRID of the start of the wait). With `--avoid-known-bugs false` it does not
+   wait.
 
 ### The XDCR oracle
 
@@ -919,10 +925,11 @@ In a 5-minute trial on 3 nodes with k=2 and 2 sites per host, beside VIEWS, NoRE
 compared 1,548 views and all 15,695 rows were exported. That trial used one shared `outdir` and got by; lab build #43
 did not, as below.
 
-The bug below was found in milestone 29.
+The bugs below were found in milestone 29.
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
+| ENG-30630 | XDCR: when one cluster has dropped and recreated a DR table (here replicated, where it was partitioned) and the other then writes rows into its old one, the first pauses the DR stream on the mismatched schema ("Received binary log with schema that doesn't match local catalog. Pausing this DR stream"), and once the other has recreated the table too and the catalogs match, the stream stays paused for good: nothing more replicates in that direction, not even a new table's rows, while DRROLE says ACTIVE. Also on 16.0.0. Found by lab build #43's XDCR run, which stalled after 157 databases. Critical. | A database waits for XDCR to apply what is queued before it drops its name's leftovers (step 4 of [XDCR](#xdcr)). |
 | ENG-30629 | When the file export target's output file name is taken, it logs "Output file for next period already exists ... ExportToFileClient will stop to prevent data loss" but does not stop: it retries the block at once, for good, with a stack trace each time (about 15,000 a second), and the block's rows are never exported. Two nodes on one host sharing an `outdir` take each other's names. Also on 16.0.0. Found by lab build #43, whose three nodes wrote 48 to 68 GB of `volt.log` each in 45 minutes, until the disk was full, and exported 26,955 of 28,240 rows. Critical. | Each node exports into its own voltdbroot; server logs over 256 MB are cut and fail the run. |
 
 ## The VIEWS oracle
