@@ -49,19 +49,24 @@ public class VoltDBStreamOracle implements TestOracle<VoltDBGlobalState> {
 
     @Override
     public void check() throws Exception {
+        String target = state.getDbmsSpecificOptions().exportTarget;
+        boolean exporting = target != null && !target.isBlank();
         if (prefix == null) {
             prefix = "XS_" + state.getDatabaseName().toUpperCase();
-            String target = state.getDbmsSpecificOptions().exportTarget;
-            String export = target == null || target.isBlank() ? "" : " EXPORT TO TARGET " + target;
-            String columns = " (k INTEGER NOT NULL, v BIGINT, s VARCHAR(16), f FLOAT)";
             // kept from an earlier database of the same name in this run, or made now
-            ddl("CREATE STREAM " + prefix + "_ST PARTITION ON COLUMN k" + export + columns);
-            ddl("CREATE TABLE " + prefix + "_SH" + columns + "; PARTITION TABLE " + prefix + "_SH ON COLUMN k");
-            // a view of a partitioned stream groups by the partitioning column
-            ddl("CREATE VIEW " + prefix + "_SV (k, s, n, sv, mn, mx) AS " + String.format(VIEW_QUERY, prefix + "_ST"));
+            create(exporting ? " EXPORT TO TARGET " + target : "");
         }
         if (OUT_OF_STEP.contains(prefix)) {
-            throw new IgnoreMeException();
+            // an exported stream is kept for the run, as dropping it may lose rows still to export; one that exports
+            // nowhere starts afresh
+            if (exporting) {
+                throw new IgnoreMeException();
+            }
+            ddl("DROP VIEW " + prefix + "_SV IF EXISTS");
+            ddl("DROP STREAM " + prefix + "_ST IF EXISTS");
+            ddl("DROP TABLE " + prefix + "_SH IF EXISTS");
+            create("");
+            OUT_OF_STEP.remove(prefix);
         }
         for (int i = (int) Randomly.getNotCachedInteger(1, 20); i > 0; i--) {
             String values = "(" + Randomly.getNotCachedInteger(0, 50) + ", "
@@ -73,11 +78,26 @@ public class VoltDBStreamOracle implements TestOracle<VoltDBGlobalState> {
                     + ", " + (Randomly.getBooleanWithRatherLowProbability() ? "NULL"
                             : Randomly.getNotCachedInteger(-100, 100) + ".5E0")
                     + ")";
-            if (!insert("INSERT INTO " + prefix + "_ST VALUES " + values)) {
+            // an insert a node failure interrupted (IgnoreMeException with --node-failures, --crashes and the like) may
+            // or may not have committed, so the stream and its shadow can differ from then on (lab build #44)
+            boolean inStream;
+            try {
+                inStream = insert("INSERT INTO " + prefix + "_ST VALUES " + values);
+            } catch (IgnoreMeException e) {
+                OUT_OF_STEP.add(prefix);
+                throw e;
+            }
+            if (!inStream) {
                 continue;
             }
             INSERTED.incrementAndGet();
-            if (!insert("INSERT INTO " + prefix + "_SH VALUES " + values)) {
+            boolean inShadow;
+            try {
+                inShadow = insert("INSERT INTO " + prefix + "_SH VALUES " + values);
+            } catch (IgnoreMeException e) {
+                inShadow = false;
+            }
+            if (!inShadow) {
                 OUT_OF_STEP.add(prefix);
                 throw new IgnoreMeException();
             }
@@ -91,6 +111,14 @@ public class VoltDBStreamOracle implements TestOracle<VoltDBGlobalState> {
                     + VoltDBRows.difference(view, expected) + "; only the rows: "
                     + VoltDBRows.difference(expected, view));
         }
+    }
+
+    private void create(String export) {
+        String columns = " (k INTEGER NOT NULL, v BIGINT, s VARCHAR(16), f FLOAT)";
+        ddl("CREATE STREAM " + prefix + "_ST PARTITION ON COLUMN k" + export + columns);
+        ddl("CREATE TABLE " + prefix + "_SH" + columns + "; PARTITION TABLE " + prefix + "_SH ON COLUMN k");
+        // a view of a partitioned stream groups by the partitioning column
+        ddl("CREATE VIEW " + prefix + "_SV (k, s, n, sv, mn, mx) AS " + String.format(VIEW_QUERY, prefix + "_ST"));
     }
 
     // DDL that may already have been done for this database name earlier in the run
