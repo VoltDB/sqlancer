@@ -34,7 +34,9 @@ Since milestone 24 it can start the cluster on the last release and upgrade it i
 SQLancer runs (`--upgrade-from`); see [In-service upgrades](#in-service-upgrades). Since milestone 25,
 `voltdb/run-repros.sh` reruns the minimal reproduction of every bug the provider found, and the nightly job reports
 which are fixed; see [Bug reproductions](#bug-reproductions). Since milestone 26 the PLANS oracle checks that the
-same query planned two ways returns the same rows; see [The PLANS oracle](#the-plans-oracle).
+same query planned two ways returns the same rows; see [The PLANS oracle](#the-plans-oracle). Since milestone 28 the
+run script can enable security (`--security`), and the PERMS oracle checks what users may and may not do; see
+[The PERMS oracle](#the-perms-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -98,6 +100,7 @@ voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 -
 | `--upgrade-from DIR` | none | Start the cluster on this older kit, normally the last release, and upgrade it in service to `--voltdb`, one node at a time (see [In-service upgrades](#in-service-upgrades)). Needs k-safety 1 or more. Does not mix with `--kill-interval`, `--resize-interval`, `--crash-interval` or `--xdcr`. |
 | `--upgrade-java-home DIR` | the environment's | JAVA_HOME for the older kit's nodes (16.0.0 needs Java 17 or 21). |
 | `--upgrade-at SECS` | a third of `--duration` | When the upgrade starts. |
+| `--security` | off | Enable security: SQLancer connects as the administrator `sqlancer`, and the PERMS oracle runs statements as the users `reader` (role `sqlancer_read`, SQLREAD) and `writer` (role `sqlancer_write`, SQL); see [The PERMS oracle](#the-perms-oracle). Does not mix with the node failure, resize, crash, XDCR and upgrade options. |
 | `--keep-cluster` | off | Leave the cluster running, with its data, after the run. |
 | `-- ...` | | Everything after `--` goes to the provider, for example `-- --avoid-known-bugs false`. |
 
@@ -385,8 +388,8 @@ the kit's runtime JDK and makes seven runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
-| `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-one (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
+| `sqlancer-1n-k0-security` | 1 node, 8 sites per host, security on (see [The PERMS oracle](#the-perms-oracle)); `sqlancer-1n-k0` until milestone 28 | the same | 45 minutes |
 | `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
 | `sqlancer-3n-k1-xdcr-s4` | Two clusters of 3 nodes, k=1, 4 sites per host, linked by XDCR (see [XDCR](#xdcr)) | the same | 45 minutes |
@@ -419,8 +422,8 @@ server.
 
 The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor[:chaos[:sites]]`, where chaos is the
 seconds between node failures, `r` and the seconds between elastic resizes, `c` and the seconds between crashes, or
-`x` for an XDCR pair, or `u` for an in-service upgrade from `MIRROR_VERSION`, and sites the sites per host, default
-`3:1:300 1:0 3:2:0:2 3:1:r120 3:1:x:4 3:1:u 3:1:c600`), `DURATION` (seconds
+`x` for an XDCR pair, `u` for an in-service upgrade from `MIRROR_VERSION`, or `sec` for security, and sites the sites
+per host, default `3:1:300 1:0:sec 3:2:0:2 3:1:r120 3:1:x:4 3:1:u 3:1:c600`), `DURATION` (seconds
 per run, default 2700), `ORACLES`, `SEED`, `EXTRA_ARGS` (provider options) and `SQLANCER_REF`. A run of the job alone
 needs a kit: give `releasedir`, for example `releases/one-offs/16.1.0-SNAPSHOT-master/<kit build>`.
 
@@ -860,6 +863,26 @@ of plans (4,154 skipped), and 3 nodes 95, 53 and 3 (2,920 skipped).
 CERT-style checks (a more restrictive query must not get a larger estimated row count) do not apply: VoltDB's plans
 carry no row estimates in EXPLAIN or EXPLAINJSON, and its planner estimates from fixed table sizes, not from the data.
 
+## The PERMS oracle
+
+With `--security`, the deployment enables security with three users, `sqlancer` (administrator, whom SQLancer and
+voltadmin use), `reader` and `writer`, and the provider creates their roles when it first connects:
+`CREATE ROLE sqlancer_read WITH SQLREAD` and `CREATE ROLE sqlancer_write WITH SQL` (on the mirror too). PERMS then
+runs statements as reader or writer:
+
+| Statement | reader | writer | Checked |
+| --- | --- | --- | --- |
+| A query (columns and a WHERE clause over the usual FROM clauses and joins) | allowed | allowed | The same rows as the administrator gets. |
+| A change (the provider's INSERT, UPDATE and DELETE generators) | refused | allowed | Refused: a permission error, and every table still holds as many rows. Allowed: writer's change matches no row (`UPDATE t SET c = c WHERE 1 = 0`, `DELETE FROM t WHERE 1 = 0`), as a real one would leave the mirror behind. |
+| DDL | refused | refused | A permission error, and no row count changes. |
+| A procedure created `ALLOW sqlancer_read` (created and dropped around the call) | allowed | refused | SQL does not include ALLPROC. |
+
+The database's thread is its only writer, so a row count cannot change for another reason. VoltDB checks for a catalog
+update in progress before it checks a user's permission, so DDL can be refused with "another one is in progress"
+first; PERMS retries that until the permission error comes. At exit, PERMS prints how many allowed and refused
+statements it checked; the summary has the line. Without `--security`, it skips every check. In a 5-minute trial on
+1 node it checked 307 allowed and 283 refused statements.
+
 ## The VIEWS oracle
 
 VIEWS (`oracle/VoltDBViewOracle`) checks VoltDB's materialized views, which it keeps up to date as their tables
@@ -1284,6 +1307,12 @@ The bugs below were found in milestone 26.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30626 | `MOD(x, c + 1)` inside LN, SQRT or EXP fails with "unsupported non-integral or non-decimal type for SQL MOD function": the literal, made a parameter, seems to take FLOAT from the outer function. `MOD(20, c)`, `MOD(20, c + c)` and `ABS(MOD(20, c + 0))` are right. Also on 16.0.0. Found by PLANS, which writes `(c + 0)`. | PLANS leaves a WHERE clause with MOD as it is. |
+
+The bugs below were found in milestone 28.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30627 | Ad hoc DDL from a user without ADMIN is compiled before the permission check: `DROP TABLE T` by a reader, with a procedure reading T, fails with "[SECRET_P]: Failed to plan for statement ... SELECT COUNT(*) FROM T WHERE a = 42 ... object not found: T", disclosing the procedure and its SQL; DDL that compiles gets the permission error. While another catalog update runs, the refusal is "another one is in progress". Also on 16.0.0. Found by PERMS. Major. | PERMS's refused DDL is `CREATE TABLE` of a new table, which always compiles; "in progress" is retried. |
 
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.

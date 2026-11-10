@@ -50,6 +50,9 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--upgrades", description = "The cluster is upgraded in service during the run, one node at a time (run-sqlancer.sh --upgrade-from): expect the errors that a stopped node causes, as for --node-failures", arity = 1)
     public boolean upgrades;
 
+    @Parameter(names = "--security", description = "Security is on (run-sqlancer.sh --security): SQLancer connects as an administrator, the provider creates the roles sqlancer_read (SQLREAD) and sqlancer_write (SQL), and the PERMS oracle runs statements as the users reader and writer, who hold them", arity = 1)
+    public boolean security;
+
     @Parameter(names = "--crashes", description = "Every node is killed at once and the cluster recovered from its command log during the run (run-sqlancer.sh --crash-interval): expect the errors that causes, as for --node-failures, and wait for the cluster to come back before connecting", arity = 1)
     public boolean crashes;
 
