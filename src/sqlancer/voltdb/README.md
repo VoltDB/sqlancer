@@ -26,7 +26,9 @@ functions and JSON functions, and the GEO oracle checks GEOGRAPHY_POINT and GEOG
 [Date, JSON, FLOAT math and geography](#date-json-float-math-and-geography). Since milestone 20 the DIFF oracle
 compares this VoltDB with another version, normally the last release, on the same data; see
 [The DIFF oracle](#the-diff-oracle). Since milestone 21 the run script can also grow and shrink the cluster
-elastically while SQLancer runs (`--resize-interval`); see [Elastic resizes](#elastic-resizes).
+elastically while SQLancer runs (`--resize-interval`); see [Elastic resizes](#elastic-resizes). Since milestone 22 it
+can also crash the whole cluster and recover it from its command log (`--crash-interval`), and the DURABLE oracle
+checks that no acknowledged change was lost; see [Whole-cluster crashes](#whole-cluster-crashes).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -85,6 +87,7 @@ voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 -
 | `--use-reducer` | off | Reduce each failure before saving it (see [Reducing a failure](#reducing-a-failure)). |
 | `--kill-interval SECS` | 0 (never) | Every SECS seconds, kill a random node, node 0 included, with `kill -9`, restart it and wait until it has rejoined (see [Node failures](#node-failures)). Needs k-safety 1 or more. |
 | `--resize-interval SECS` | 0 (never) | Every SECS seconds, add k+1 nodes with `voltdb start --add`, or remove them again with `voltadmin resize`, by turns (see [Elastic resizes](#elastic-resizes)). Does not mix with `--kill-interval`. |
+| `--crash-interval SECS` | 0 (never) | Every SECS seconds, kill every node at once with `kill -9` and restart them all, which recovers the database from its snapshots and synchronous command log (see [Whole-cluster crashes](#whole-cluster-crashes)). Does not mix with `--kill-interval` or `--resize-interval`. |
 | `--keep-cluster` | off | Leave the cluster running, with its data, after the run. |
 | `-- ...` | | Everything after `--` goes to the provider, for example `-- --avoid-known-bugs false`. |
 
@@ -100,6 +103,7 @@ that did not start). Each run writes `<results>/sqlancer-<UTC time>-seed<N>/`:
 | `servers/node<i>/` | Each node's `volt.log` and its `voltdb init` and `voltdb start` output. |
 | `sqlancer/` | SQLancer's output (`out.log`) and its `logs/voltdb/` directory (see [Reading the results](#reading-the-results)). |
 | `chaos.log` | With `--kill-interval`: each kill and rejoin, with its time. |
+| `crash.log` | With `--crash-interval`: each crash and recovery, with its time and how long the recovery took. `servers/node<i>/recover<i>-<n>.log` is node i's output from recovery n. |
 | `resize.log` | With `--resize-interval`: each grow and shrink, with its time, the planned removal and how long it took. |
 | `servers/add<n>-<j>/` | With `--resize-interval`: the logs of node j added by grow n, like `servers/node<i>/`. A join VoltDB refused is kept as `add<n>-<j>-rejected<a>`. |
 | `reproductions/` | The log of each database whose thread failed: the statements that set it up, then the failing queries. With `--use-reducer`, these are reduced, and `<db>-reduce.log` shows the steps. |
@@ -110,6 +114,7 @@ A run FAILs if any of these happens:
 - A server log has a FATAL line.
 - With `--kill-interval`, a killed node does not rejoin within 600 seconds.
 - With `--resize-interval`, a grow or a shrink does not complete within 600 seconds.
+- With `--crash-interval`, the cluster does not recover within 600 seconds of a crash.
 
 While `--avoid-known-bugs` is true (the default), a failed check whose queries no longer fail when its reproducer
 reruns them at once is not a failure. It is printed as `ENG-30602 transient: ...` in `sqlancer/out.log`, and the
@@ -206,6 +211,45 @@ An elastic join, like a rejoin, makes system requests time out for a minute (ENG
 sixty second timeout" or "Too many pending stat requests". The connection retries them for up to 150 seconds, with or
 without `--resizes`.
 
+## Whole-cluster crashes
+
+With `--crash-interval SECS`, every SECS seconds the script kills every node at once with `kill -9`, as a power loss
+would, while SQLancer runs:
+
+1. The deployment has a synchronous command log (`<commandlog enabled="true" synchronous="true"/>`): VoltDB
+   acknowledges a transaction only once it is on disk, so no acknowledged change may be lost. Automatic snapshots
+   every 2 minutes (`<snapshot frequency="2m" retain="2"/>`) give recovery a starting point before it replays the log.
+   The mirror's deployment has neither, as the mirror never crashes.
+2. Once every node's client port has closed, the script restarts them all with the same `voltdb start` command,
+   which recovers: each node loads the last snapshot and replays the command log after it. A recovery is done once
+   every node prints "Server completed initialization"; one that takes over 600 seconds fails the run. A restart that
+   cannot bind its port is tried again, as for node failures.
+3. Each crash and recovery is a line of `crash.log`. When SQLancer stops, the script lets the current recovery
+   finish, so the run ends with every node up, and the summary counts crashes and recoveries. A local recovery of 3
+   nodes takes about 15 seconds.
+
+The script passes the provider `--crashes true`. A crash fails every call in flight, with the errors of a killed node
+(see [Node failures](#node-failures)), and the provider handles them the same way. A database whose change was in
+flight may or may not have it after the recovery, so it is marked diverged and DIFF and DURABLE skip it; a query in
+flight changes nothing, so its database is not. New connections are retried for up to 11 minutes while the cluster
+is down. The JDBC driver reconnects the open ones (`topologychangeaware`) once the nodes are back.
+
+### The DURABLE oracle
+
+With `--mirror`, every change also runs on a cluster that never crashes, so after a recovery every table must hold as
+many rows here as on the mirror. DURABLE counts each of the database's tables on both clusters (`SELECT COUNT(*)`) and
+fails on a difference, or on a table that is missing here and present on the mirror. The first time it compares a
+database after a crash interrupted one of its calls, it prints `DURABLE across a crash: <database>` to
+`sqlancer/out.log`, and the summary counts these lines as "databases DURABLE compared across a crash": the databases
+shown to have kept every row. DIFF compares the rows themselves, but only on tables that are not empty, so it cannot
+see a table that a recovery left empty. Without `--mirror`, DURABLE skips every check. A failure has no reproducer,
+as it depends on the crash.
+
+A control run showed DURABLE catches a loss: with the command log turned off, a crash every 90 seconds and no
+snapshot yet, recovery lost the tables created since start, and DURABLE failed 3 of 4 databases within 5 minutes
+("object not found: DB0_T0 here, 24 on the mirror"). An earlier control with DIFF alone passed: recovery had left
+the tables empty or missing, which DIFF skips.
+
 ## The nightly lab job
 
 `matrix-systemtest-apprunner-sqlancer` on jenkins-st runs this script against master's kit as part of the nightly
@@ -216,20 +260,21 @@ system test (`matrix-systemtest/master`, on the nights the rotation in `internal
 
 The job fetches this repository at the commit in its `SQLANCER_REF` parameter. That commit is pinned in the Jenkinsfile,
 so a change here reaches the nightly run only when the Jenkinsfile is changed to name it. It then builds SQLancer with
-the kit's runtime JDK and makes four runs, one after the other, every node on the agent:
+the kit's runtime JDK and makes five runs, one after the other, every node on the agent:
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all seventeen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all eighteen (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE) | 45 minutes |
 | `sqlancer-1n-k0` | 1 node, 8 sites per host | the same | 45 minutes |
 | `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
+| `sqlancer-3n-k1-crash600` | 3 nodes, k=1, 8 sites per host, a synchronous command log; every 10 minutes every node is killed and the cluster recovered (see [Whole-cluster crashes](#whole-cluster-crashes)) | the same | 45 minutes |
 
 The shapes differ in what the planner and the execution engine do. With one node and 8 sites, a multi-partition query
 gathers 8 partitions' results in one process. With 3 nodes, k=1, the partitions' leaders are spread over the nodes and
 each has one replica, and node failures move them; elastic resizes add a partition group and move data to it and
-back. With k=2 and 2 sites per host, every node holds every partition, so
-there are only 2 partitions and every write is replicated twice. The whole job takes about 3 hours 10 minutes.
+back; crashes replay the command log. With k=2 and 2 sites per host, every node holds every partition, so
+there are only 2 partitions and every write is replicated twice. The whole job takes about 4 hours.
 
 Every run uses `--use-reducer`. The first run's seed is the UTC time as `yyyymmddHHMM`, and each next run's is one
 more.
@@ -245,8 +290,8 @@ them against the same build. The reproduction in `reproductions/` is usually qui
 server.
 
 The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor[:chaos[:sites]]`, where chaos is the
-seconds between node failures, or `r` and the seconds between elastic resizes, and sites the sites per host, default
-`3:1:300 1:0 3:2:0:2 3:1:r120`), `DURATION` (seconds
+seconds between node failures, `r` and the seconds between elastic resizes, or `c` and the seconds between crashes,
+and sites the sites per host, default `3:1:300 1:0 3:2:0:2 3:1:r120 3:1:c600`), `DURATION` (seconds
 per run, default 2700), `ORACLES`, `SEED`, `EXTRA_ARGS` (provider options) and `SQLANCER_REF`. A run of the job alone
 needs a kit: give `releasedir`, for example `releases/one-offs/16.1.0-SNAPSHOT-master/<kit build>`.
 
