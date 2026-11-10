@@ -21,6 +21,7 @@ import sqlancer.voltdb.oracle.VoltDBTLPAggregateOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPOracle;
 import sqlancer.voltdb.oracle.VoltDBViewOracle;
 import sqlancer.voltdb.oracle.VoltDBWindowOracle;
+import sqlancer.voltdb.oracle.VoltDBXdcrOracle;
 
 public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
 
@@ -132,6 +133,17 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBDurabilityOracle(globalState);
+        }
+    },
+
+    /**
+     * XDCR convergence: with --xdcr, every table and view holds the same rows on both clusters of the XDCR pair once
+     * replication has caught up.
+     */
+    XDCR {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBXdcrOracle(globalState);
         }
     },
 
