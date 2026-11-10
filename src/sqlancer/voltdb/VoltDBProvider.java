@@ -1,6 +1,7 @@
 package sqlancer.voltdb;
 
 import java.nio.file.Paths;
+import java.sql.CallableStatement;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
@@ -56,6 +57,8 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
     private static final long CRASH_CONNECT_MILLIS = 660_000;
 
     private static final AtomicBoolean ROLES_CREATED = new AtomicBoolean();
+    // how long a new database waits for XDCR to apply what is queued before it drops its name's leftovers (ENG-30630)
+    private static final long DR_APPLIED_MILLIS = 60_000;
 
     public VoltDBProvider() {
         super(VoltDBGlobalState.class, VoltDBOptions.class);
@@ -186,11 +189,19 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
         if (hold != null && !hold.isBlank() && globalState.getDbmsSpecificOptions().avoidKnownBugs) {
             sqlCon.setDdlHold(Paths.get(hold));
         }
-        dropLeftovers(globalState, sqlCon, true);
         if (peerUrl != null) {
             VoltDBConnection peerCon = connect(globalState, peerUrl, false);
+            // ENG-30630: the earlier database of this name may have written through the other cluster, and rows still
+            // on their way to this one when it drops and recreates the tables pause that DR stream for good; so
+            // everything either cluster has queued for the other is applied first
+            if (globalState.getDbmsSpecificOptions().avoidKnownBugs) {
+                awaitDrApplied(sqlCon, peerCon);
+            }
+            dropLeftovers(globalState, sqlCon, true);
             dropLeftovers(globalState, peerCon, false);
             sqlCon.setPeer(peerCon);
+        } else {
+            dropLeftovers(globalState, sqlCon, true);
         }
         // DIFF (milestone 20): a second cluster, normally the last release, that every change is repeated on
         String mirror = globalState.getDbmsSpecificOptions().mirror;
@@ -237,6 +248,55 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
                 }
             }
         }
+    }
+
+    // waits, for up to DR_APPLIED_MILLIS, until each cluster's DR producer has had acknowledged every transaction it
+    // had
+    // queued for the other when this was called (other databases keep writing, so the queues are seldom empty)
+    private static void awaitDrApplied(VoltDBConnection... clusters) throws SQLException {
+        List<Map<String, long[]>> queued = new ArrayList<>();
+        for (VoltDBConnection c : clusters) {
+            queued.add(drProducer(c));
+        }
+        long deadline = System.currentTimeMillis() + DR_APPLIED_MILLIS;
+        for (int i = 0; i < clusters.length; i++) {
+            while (true) {
+                Map<String, long[]> now = drProducer(clusters[i]);
+                boolean applied = true;
+                for (Map.Entry<String, long[]> e : queued.get(i).entrySet()) {
+                    long[] n = now.get(e.getKey());
+                    if (n != null && n[1] < e.getValue()[0]) {
+                        applied = false;
+                    }
+                }
+                if (applied || System.currentTimeMillis() >= deadline) {
+                    break;
+                }
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+    }
+
+    // each DR producer partition's last queued and last acknowledged DR id, by host, partition and remote cluster
+    private static Map<String, long[]> drProducer(VoltDBConnection c) throws SQLException {
+        Map<String, long[]> ids = new LinkedHashMap<>();
+        try (CallableStatement call = c.prepareCall("{call @Statistics(?, ?)}")) {
+            call.setString(1, "DRPRODUCERPARTITION");
+            call.setInt(2, 0);
+            try (ResultSet rs = call.executeQuery()) {
+                while (rs.next()) {
+                    ids.put(rs.getLong("HOST_ID") + "/" + rs.getLong("PARTITION_ID") + "/"
+                            + rs.getLong("REMOTE_CLUSTER_ID"),
+                            new long[] { rs.getLong("LASTQUEUEDDRID"), rs.getLong("LASTACKDRID") });
+                }
+            }
+        }
+        return ids;
     }
 
     // drops the database's procedures and tables left by an earlier use of its name; logged only for the main cluster,

@@ -20,7 +20,7 @@ X
 H="localhost:$(port 0 2),localhost:$(port 1 2),localhost:$(port 2 2)"
 start() { # i extra-args
   local i=$1; shift
-  $V/bin/voltdb init --force -D $C/n$i -C $C/d.xml > $C/init$i.log 2>&1
+  $V/bin/voltdb init --force ${VOLTDB_LICENSE:+--license "$VOLTDB_LICENSE"} -D $C/n$i -C $C/d.xml > $C/init$i.log 2>&1
   (nohup $V/bin/voltdb start "$@" -D $C/n$i -H $H --client=$(port $i 0) --admin=$(port $i 1) --internal=$(port $i 2) --zookeeper=$(port $i 3) --replication=$(port $i 4) --metrics=$(port $i 5) > $C/start$i.log 2>&1 & echo $! > $C/n$i.pid)
 }
 waitup() { for _ in $(seq 1 300); do grep -q "Server completed initialization" $C/start$1.log 2>/dev/null && return 0; sleep 1; done; return 1; }

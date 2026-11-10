@@ -36,7 +36,8 @@ SQLancer runs (`--upgrade-from`); see [In-service upgrades](#in-service-upgrades
 which are fixed; see [Bug reproductions](#bug-reproductions). Since milestone 26 the PLANS oracle checks that the
 same query planned two ways returns the same rows; see [The PLANS oracle](#the-plans-oracle). Since milestone 28 the
 run script can enable security (`--security`), and the PERMS oracle checks what users may and may not do; see
-[The PERMS oracle](#the-perms-oracle).
+[The PERMS oracle](#the-perms-oracle). Since milestone 29 the STREAMS oracle checks export streams and their views, and
+`--export` checks that every row a stream got was exported; see [The STREAMS oracle](#the-streams-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -101,6 +102,7 @@ voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 -
 | `--upgrade-java-home DIR` | the environment's | JAVA_HOME for the older kit's nodes (16.0.0 needs Java 17 or 21). |
 | `--upgrade-at SECS` | a third of `--duration` | When the upgrade starts. |
 | `--security` | off | Enable security: SQLancer connects as the administrator `sqlancer`, and the PERMS oracle runs statements as the users `reader` (role `sqlancer_read`, SQLREAD) and `writer` (role `sqlancer_write`, SQL); see [The PERMS oracle](#the-perms-oracle). Does not mix with the node failure, resize, crash, XDCR and upgrade options. |
+| `--export` | off | Add a file export target, `sqlancer` (CSV, into the cluster directory), for the STREAMS oracle's streams, and check at the end that every row they got was exported (see [The STREAMS oracle](#the-streams-oracle)). |
 | `--keep-cluster` | off | Leave the cluster running, with its data, after the run. |
 | `-- ...` | | Everything after `--` goes to the provider, for example `-- --avoid-known-bugs false`. |
 
@@ -113,8 +115,8 @@ that did not start). Each run writes `<results>/sqlancer-<UTC time>-seed<N>/`:
 | `manifest.txt` | Run id, host, command line, SQLancer commit, VoltDB version, Java version, cluster shape and ports, oracles, duration, seed and threads. |
 | `run.log` | The script's own steps. |
 | `deployment.xml` | The cluster's configuration. |
-| `servers/node<i>/` | Each node's `volt.log` and its `voltdb init` and `voltdb start` output. |
-| `sqlancer/` | SQLancer's output (`out.log`) and its `logs/voltdb/` directory (see [Reading the results](#reading-the-results)). |
+| `servers/node<i>/` | Each node's `volt.log` and its `voltdb init` and `voltdb start` output. A log over 256 MB keeps its first and last 64 MB and the FATAL lines between, and fails the run: a server logging without end would fill the agent's disk (ENG-30629). |
+| `sqlancer/` | SQLancer's output (`out.log`) and its `logs/voltdb/` directory (see [Reading the results](#reading-the-results)). If SQLancer had not exited 15 minutes after its duration, `jstack.txt` is its thread dump from just before the script killed it. |
 | `chaos.log` | With `--kill-interval`: each kill and rejoin, with its time. |
 | `crash.log` | With `--crash-interval`: each crash and recovery, with its time and how long the recovery took. `servers/node<i>/recover<i>-<n>.log` is node i's output from recovery n. |
 | `servers/xdcr<i>/` | With `--xdcr`: the logs of the second cluster's node i, like `servers/node<i>/`. |
@@ -126,6 +128,7 @@ that did not start). Each run writes `<results>/sqlancer-<UTC time>-seed<N>/`:
 
 A run FAILs if any of these happens:
 - SQLancer exits non-zero, or any thread fails.
+- SQLancer has not exited 15 minutes after its duration (`SQLANCER_HANG_GRACE` seconds): a thread stuck in a call keeps it from stopping, and the run would wait for good. The script saves its thread dump and kills it.
 - A node is down at the end.
 - A server log has a FATAL line.
 - With `--kill-interval`, a killed node does not rejoin within 600 seconds.
@@ -284,6 +287,12 @@ The script passes the provider `--xdcr` with the second cluster's client ports, 
    succeeds runs on the peer too. A change the peer refuses marks the database split, and XDCR skips it.
 3. Before any rows go in, every table becomes a DR table (`DR TABLE t`) on both sides. Tables without a unique index
    replicate updates and deletes by matching the whole row, which VoltDB warns is slow but allows.
+4. A database that reuses an earlier one's name may write through the other cluster, and drops the old tables on its
+   own first. Rows the old database wrote just before, still on their way, would then reach a table that cluster no
+   longer has, and pause that DR stream for good (ENG-30630). So, before those drops, the provider waits up to 60 s
+   until each cluster's DR producer has had acknowledged everything it had queued (`@Statistics DRPRODUCERPARTITION`:
+   LASTACKDRID reaches the LASTQUEUEDDRID of the start of the wait). With `--avoid-known-bugs false` it does not
+   wait.
 
 ### The XDCR oracle
 
@@ -366,13 +375,17 @@ exact output, one header line per line. sqlcmd's output is normalized first: "(R
 "(1 rows)", the dashes under the column names go, and runs of spaces become one. A bug that sqlcmd cannot show (the
 JDBC driver's, a resize hang) is a `.sh` script instead, run with `VOLTDB_HOME`, `PORT_BASE` and `WORKDIR` set; it
 starts its own servers (always with `-H`), and exits 0 while the bug reproduces, 1 once it is fixed, anything else on
-an error. A `-- manual: reason` header marks a reproduction that does not reproduce every time: the runner skips it,
-and lists it in the summary, unless `--only` names it.
+an error. A `-- manual: reason` header marks a reproduction that does not reproduce every time, and a `-- platforms:
+LIST` header (`uname -s` values) one that reproduces on those systems only: the runner skips either, and lists it in
+the summary, unless `--only` names it. A crash counts once the server exits, which it may take minutes to do after
+sqlcmd loses the connection; the runner waits up to 300 s.
 
 Not every bug has a reproduction: ENG-30602 (a query now and then gets another statement's result) and ENG-30608 (a
 SIGILL in a recursive common table, beside other threads' DDL) never reproduced on demand, and ENG-30612 (an MPI
 deadlock after a node dies mid-@UpdateCore) depends on when the kill lands. ENG-30622's script reproduces in a few
-cycles in some runs only, so it is marked `-- manual:` and runs only when `--only` names it.
+cycles in some runs only, so it is marked `-- manual:` and runs only when `--only` names it. ENG-30551 (a subnormal
+FLOAT constant in a plan) reproduces on macOS (arm64) only; the lab's x86_64 Linux agents plan the constant, so it is
+marked `-- platforms: Darwin`.
 
 ## The nightly lab job
 
@@ -388,9 +401,9 @@ the kit's runtime JDK and makes seven runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-one (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-two (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
 | `sqlancer-1n-k0-security` | 1 node, 8 sites per host, security on (see [The PERMS oracle](#the-perms-oracle)); `sqlancer-1n-k0` until milestone 28 | the same | 45 minutes |
-| `sqlancer-3n-k2-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all | the same | 45 minutes |
+| `sqlancer-3n-k2-export-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all; the streams export (see [The STREAMS oracle](#the-streams-oracle)); `sqlancer-3n-k2-s2` until milestone 29 | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
 | `sqlancer-3n-k1-xdcr-s4` | Two clusters of 3 nodes, k=1, 4 sites per host, linked by XDCR (see [XDCR](#xdcr)) | the same | 45 minutes |
 | `sqlancer-3n-k1-upgrade` | 3 nodes, k=1, 8 sites per host, started on 16.0.0 and upgraded in service to the kit a third of the way in (see [In-service upgrades](#in-service-upgrades)) | the same | 45 minutes |
@@ -422,8 +435,8 @@ server.
 
 The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor[:chaos[:sites]]`, where chaos is the
 seconds between node failures, `r` and the seconds between elastic resizes, `c` and the seconds between crashes, or
-`x` for an XDCR pair, `u` for an in-service upgrade from `MIRROR_VERSION`, or `sec` for security, and sites the sites
-per host, default `3:1:300 1:0:sec 3:2:0:2 3:1:r120 3:1:x:4 3:1:u 3:1:c600`), `DURATION` (seconds
+`x` for an XDCR pair, `u` for an in-service upgrade from `MIRROR_VERSION`, `sec` for security, or `exp` for export, and
+sites the sites per host, default `3:1:300 1:0:sec 3:2:exp:2 3:1:r120 3:1:x:4 3:1:u 3:1:c600`), `DURATION` (seconds
 per run, default 2700), `ORACLES`, `SEED`, `EXTRA_ARGS` (provider options) and `SQLANCER_REF`. A run of the job alone
 needs a kit: give `releasedir`, for example `releases/one-offs/16.1.0-SNAPSHOT-master/<kit build>`.
 
@@ -883,6 +896,43 @@ first; PERMS retries that until the permission error comes. At exit, PERMS print
 statements it checked; the summary has the line. Without `--security`, it skips every check. In a 5-minute trial on
 1 node it checked 307 allowed and 283 refused statements.
 
+## The STREAMS oracle
+
+A stream cannot be read, so STREAMS puts each row into a stream and into a shadow table with the same columns, and
+checks the stream's materialized view against the same GROUP BY over the shadow table. Each database gets, at its
+first STREAMS check:
+
+```sql
+CREATE STREAM XS_DB0_ST PARTITION ON COLUMN k [EXPORT TO TARGET sqlancer] (k INTEGER NOT NULL, v BIGINT, s VARCHAR(16), f FLOAT);
+CREATE TABLE XS_DB0_SH (...the same columns...); PARTITION TABLE XS_DB0_SH ON COLUMN k;
+CREATE VIEW XS_DB0_SV (k, s, n, sv, mn, mx) AS SELECT k, s, COUNT(*), SUM(v), MIN(f), MAX(v) FROM XS_DB0_ST GROUP BY k, s;
+```
+
+(VoltDB requires a view of a partitioned stream to group by the partitioning column.) Each check inserts 1 to 20 rows,
+with NULLs now and then, into the stream and the shadow table, and compares the view with the GROUP BY. The names start
+with `XS_`, outside the database's own names, so no generator or other oracle touches them, and they stay for the run:
+a later database of the same name goes on with them, and no stream is dropped with rows still to export.
+
+With `--export`, the deployment adds a file export target, and the provider gets `--export-target sqlancer`, so the
+streams export to it. Its `outdir` is relative, so each node writes into its own `voltdbroot/sqlancer_export`, as on
+separate hosts: in one shared directory two nodes exporting the same stream in the same second name the same file, and
+the second loops on it for good (ENG-30629). When SQLancer stops, the script runs `@Quiesce`, shuts the cluster down gracefully, which closes
+the export files (the file target writes some rows only when it rolls or closes a file, minutes after `@Quiesce`
+returns while many catalog updates run), and counts the distinct rows in them. That must equal the rows STREAMS
+inserted, which it prints at exit. Export is at least once: an identical line (the same transaction id and sequence
+number) counts once, and the summary reports how many were exported twice. A missing row fails the run.
+
+In a 5-minute trial on 3 nodes with k=2 and 2 sites per host, beside VIEWS, NoREC, TLP WHERE, DIFF and SCHEMA, STREAMS
+compared 1,548 views and all 15,695 rows were exported. That trial used one shared `outdir` and got by; lab build #43
+did not, as below.
+
+The bugs below were found in milestone 29.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30630 | XDCR: when one cluster has dropped and recreated a DR table (here replicated, where it was partitioned) and the other then writes rows into its old one, the first pauses the DR stream on the mismatched schema ("Received binary log with schema that doesn't match local catalog. Pausing this DR stream"), and once the other has recreated the table too and the catalogs match, the stream stays paused for good: nothing more replicates in that direction, not even a new table's rows, while DRROLE says ACTIVE. Also on 16.0.0. Found by lab build #43's XDCR run, which stalled after 157 databases. Critical. | A database waits for XDCR to apply what is queued before it drops its name's leftovers (step 4 of [XDCR](#xdcr)). |
+| ENG-30629 | When the file export target's output file name is taken, it logs "Output file for next period already exists ... ExportToFileClient will stop to prevent data loss" but does not stop: it retries the block at once, for good, with a stack trace each time (about 15,000 a second), and the block's rows are never exported. Two nodes on one host sharing an `outdir` take each other's names. Also on 16.0.0. Found by lab build #43, whose three nodes wrote 48 to 68 GB of `volt.log` each in 45 minutes, until the disk was full, and exported 26,955 of 28,240 rows. Critical. | Each node exports into its own voltdbroot; server logs over 256 MB are cut and fail the run. |
+
 ## The VIEWS oracle
 
 VIEWS (`oracle/VoltDBViewOracle`) checks VoltDB's materialized views, which it keeps up to date as their tables
@@ -1307,6 +1357,12 @@ The bugs below were found in milestone 26.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30626 | `MOD(x, c + 1)` inside LN, SQRT or EXP fails with "unsupported non-integral or non-decimal type for SQL MOD function": the literal, made a parameter, seems to take FLOAT from the outer function. `MOD(20, c)`, `MOD(20, c + c)` and `ABS(MOD(20, c + 0))` are right. Also on 16.0.0. Found by PLANS, which writes `(c + 0)`. | PLANS leaves a WHERE clause with MOD as it is. |
+
+The bugs below were found in milestone 29's lab run of the milestones before it.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
 
 The bugs below were found in milestone 28.
 

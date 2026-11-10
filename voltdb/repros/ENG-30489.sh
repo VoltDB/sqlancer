@@ -20,7 +20,7 @@ stop() {
   local s=$!; for _ in $(seq 1 30); do kill -0 $s 2>/dev/null || break; sleep 1; done
   kill -9 $s $(cat $C/n.pid 2>/dev/null) 2>/dev/null
 }
-$V/bin/voltdb init --force -D $C/n -C $C/d.xml > $C/init.log 2>&1 || { echo "init failed"; exit 2; }
+$V/bin/voltdb init --force ${VOLTDB_LICENSE:+--license "$VOLTDB_LICENSE"} -D $C/n -C $C/d.xml > $C/init.log 2>&1 || { echo "init failed"; exit 2; }
 (nohup $V/bin/voltdb start -D $C/n -H localhost:$((B + 2)) --client=$((B + 0)) --admin=$((B + 1)) --internal=$((B + 2)) \
   --zookeeper=$((B + 3)) --replication=$((B + 4)) --metrics=$((B + 5)) > $C/start.log 2>&1 & echo $! > $C/n.pid)
 up=0; for _ in $(seq 1 180); do grep -q "Server completed initialization" $C/start.log 2>/dev/null && { up=1; break; }; sleep 1; done

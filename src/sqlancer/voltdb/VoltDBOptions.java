@@ -50,6 +50,9 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--upgrades", description = "The cluster is upgraded in service during the run, one node at a time (run-sqlancer.sh --upgrade-from): expect the errors that a stopped node causes, as for --node-failures", arity = 1)
     public boolean upgrades;
 
+    @Parameter(names = "--export-target", description = "The export target (run-sqlancer.sh --export) that the STREAMS oracle's streams export to; without it, the streams export nowhere")
+    public String exportTarget;
+
     @Parameter(names = "--security", description = "Security is on (run-sqlancer.sh --security): SQLancer connects as an administrator, the provider creates the roles sqlancer_read (SQLREAD) and sqlancer_write (SQL), and the PERMS oracle runs statements as the users reader and writer, who hold them", arity = 1)
     public boolean security;
 

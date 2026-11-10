@@ -1048,8 +1048,12 @@ public final class VoltDBExpressionGenerator
 
     // ENG-30533 (see setUngroupedAggregates): a subquery's MIN or MAX has no GROUP BY, so unless --avoid-known-bugs is
     // false its argument is a NUMERIC or STRING expression, which (c + 0) and (c || '') keep from being a bare column
+    // ENG-30628: an outer join whose WHERE clause compares a scalar subquery with a partitioned table's primary key
+    // fails to plan (IllegalStateException in SubPlanAssembler.buildIndexAccessPlanForTable), so unless
+    // --avoid-known-bugs is false, there are no scalar subqueries with an outer join
     private boolean canGenerateScalarSubquery(Kind kind) {
-        return canGenerateSubquery() && (!avoidKnownBugs || kind == Kind.NUMERIC || kind == Kind.STRING);
+        return canGenerateSubquery()
+                && (!avoidKnownBugs || (kind == Kind.NUMERIC || kind == Kind.STRING) && !hasOuterJoin);
     }
 
     // A copy of the table under the next alias, S0, S1, ..., whose columns a subquery's expressions reference
