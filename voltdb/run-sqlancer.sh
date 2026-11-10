@@ -954,9 +954,33 @@ log "Running SQLancer for $duration s: oracles $oracles, seed $seed, $threads th
 (cd "$results/sqlancer" && exec "$java" -jar "$jar" "${sqlancer_args[@]}" voltdb --oracle "$oracles" \
     ${provider_args[@]+"${provider_args[@]}"} >out.log 2>&1) &
 sqlancer_pid=$!
+# SQLancer's --timeout-seconds only asks its threads to stop; one stuck in a call never does, and the run (and the ones
+# after it in a nightly) would wait for good (lab build #44). 15 minutes after the duration (SQLANCER_HANG_GRACE
+# seconds), a watchdog saves its thread dump and kills it, and the run fails.
+sqlancer_hung=false
+hang_grace=${SQLANCER_HANG_GRACE:-900}
+jstack=jstack
+case $java in */*) jstack=$(dirname "$java")/jstack ;; esac
+(
+    sleep $((duration + hang_grace))
+    kill -0 "$sqlancer_pid" 2>/dev/null || exit 0
+    : >"$results/sqlancer/hung"
+    "$jstack" -l "$sqlancer_pid" >"$results/sqlancer/jstack.txt" 2>&1
+    kill "$sqlancer_pid" 2>/dev/null
+    sleep 30
+    kill -9 "$sqlancer_pid" 2>/dev/null
+) &
+watchdog_pid=$!
 wait "$sqlancer_pid"
 sqlancer_exit=$?
 sqlancer_pid=
+pkill -P "$watchdog_pid" 2>/dev/null
+kill "$watchdog_pid" 2>/dev/null
+wait "$watchdog_pid" 2>/dev/null
+if [ -e "$results/sqlancer/hung" ]; then
+    sqlancer_hung=true
+    log "SQLancer did not exit within $hang_grace s of its duration; killed (sqlancer/jstack.txt)"
+fi
 log "SQLancer exited with $sqlancer_exit"
 
 chaos_failed=false
@@ -1129,12 +1153,13 @@ done
 result=PASS
 [ "$sqlancer_exit" -eq 0 ] && [ ${#failures[@]} -eq 0 ] && [ ${#down[@]} -eq 0 ] && [ "$fatal" -eq 0 ] &&
     ! $chaos_failed && ! $resize_failed && ! $crash_failed && ! $upgrade_failed && ! $export_failed &&
-    [ "$conflicts" -eq 0 ] && [ ${#oversized[@]} -eq 0 ] || result=FAIL
+    [ "$conflicts" -eq 0 ] && [ ${#oversized[@]} -eq 0 ] && ! $sqlancer_hung || result=FAIL
 {
     echo "RESULT: $result"
     echo "run: $run_id"
     echo "progress: $(grep "Executed" "$results/sqlancer/out.log" | tail -1)"
     echo "sqlancer exit code: $sqlancer_exit"
+    $sqlancer_hung && echo "sqlancer hung: did not exit within $hang_grace s of its duration, killed (sqlancer/jstack.txt)"
     echo "failed databases: ${#failures[@]}"
     echo "nodes down at the end: ${down[*]:-none}"
     echo "FATAL lines in server logs: $fatal"

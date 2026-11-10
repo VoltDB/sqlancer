@@ -116,7 +116,7 @@ that did not start). Each run writes `<results>/sqlancer-<UTC time>-seed<N>/`:
 | `run.log` | The script's own steps. |
 | `deployment.xml` | The cluster's configuration. |
 | `servers/node<i>/` | Each node's `volt.log` and its `voltdb init` and `voltdb start` output. A log over 256 MB keeps its first and last 64 MB and the FATAL lines between, and fails the run: a server logging without end would fill the agent's disk (ENG-30629). |
-| `sqlancer/` | SQLancer's output (`out.log`) and its `logs/voltdb/` directory (see [Reading the results](#reading-the-results)). |
+| `sqlancer/` | SQLancer's output (`out.log`) and its `logs/voltdb/` directory (see [Reading the results](#reading-the-results)). If SQLancer had not exited 15 minutes after its duration, `jstack.txt` is its thread dump from just before the script killed it. |
 | `chaos.log` | With `--kill-interval`: each kill and rejoin, with its time. |
 | `crash.log` | With `--crash-interval`: each crash and recovery, with its time and how long the recovery took. `servers/node<i>/recover<i>-<n>.log` is node i's output from recovery n. |
 | `servers/xdcr<i>/` | With `--xdcr`: the logs of the second cluster's node i, like `servers/node<i>/`. |
@@ -128,6 +128,7 @@ that did not start). Each run writes `<results>/sqlancer-<UTC time>-seed<N>/`:
 
 A run FAILs if any of these happens:
 - SQLancer exits non-zero, or any thread fails.
+- SQLancer has not exited 15 minutes after its duration (`SQLANCER_HANG_GRACE` seconds): a thread stuck in a call keeps it from stopping, and the run would wait for good. The script saves its thread dump and kills it.
 - A node is down at the end.
 - A server log has a FATAL line.
 - With `--kill-interval`, a killed node does not rejoin within 600 seconds.
