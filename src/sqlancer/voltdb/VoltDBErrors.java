@@ -30,8 +30,10 @@ public final class VoltDBErrors {
             // (UpdateApplicationBase). Seen once node 0 was among the nodes killed (milestone 15).
             "@UpdateCore in progress",
             // the same while a node rejoins during an in-service upgrade (run-sqlancer.sh --upgrade-from), before the
-            // DDL statement stages anything
-            "Can not update catalog while catalog update is in progress" };
+            // DDL statement stages anything; and its other form, refused while the upgraded node is still rejoining
+            // (lab build #43, the upgrade run)
+            "Can not update catalog while catalog update is in progress",
+            "Can not update catalog while node rejoin is in progress" };
 
     /**
      * Errors a node failure causes while nodes are killed and rejoined during the run (--node-failures). A statement in
