@@ -161,7 +161,8 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
                 : "jdbc:voltdb://" + servers.trim() + "?topologychangeaware=true";
         // a shrink (--resizes) removes hosts the driver is connected to (topologychangeaware), so the calls in flight
         // on them fail as on a killed node; the oracles' --node-failures workarounds (ENG-30612) do not apply
-        // a crash (--crashes) fails every call in flight, as a killed node does for its own
+        // a crash (--crashes) fails every call in flight, as a killed node does for its own, and so does a node stopped
+        // for an in-service upgrade (--upgrades) for the calls in flight on it
         // XDCR (milestone 23): the database writes through one of the pair, chosen at random, and repeats its DDL on
         // the other; each database's tables are written from one side only, so XDCR has no conflicts to resolve
         String xdcr = globalState.getDbmsSpecificOptions().xdcr;
@@ -174,8 +175,10 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
                 peerUrl = here;
             }
         }
-        VoltDBConnection sqlCon = connect(globalState, url, globalState.getDbmsSpecificOptions().nodeFailures
-                || globalState.getDbmsSpecificOptions().resizes || globalState.getDbmsSpecificOptions().crashes);
+        VoltDBConnection sqlCon = connect(globalState, url,
+                globalState.getDbmsSpecificOptions().nodeFailures || globalState.getDbmsSpecificOptions().resizes
+                        || globalState.getDbmsSpecificOptions().crashes
+                        || globalState.getDbmsSpecificOptions().upgrades);
         String hold = globalState.getDbmsSpecificOptions().ddlHold;
         if (hold != null && !hold.isBlank() && globalState.getDbmsSpecificOptions().avoidKnownBugs) {
             sqlCon.setDdlHold(Paths.get(hold));

@@ -28,7 +28,10 @@ public final class VoltDBErrors {
             // another connection's catalog update (@UpdateCore) is still running; its blocker can be gone when the
             // node that held it failed, so a DDL statement gets this far and is refused before it stages anything
             // (UpdateApplicationBase). Seen once node 0 was among the nodes killed (milestone 15).
-            "@UpdateCore in progress" };
+            "@UpdateCore in progress",
+            // the same while a node rejoins during an in-service upgrade (run-sqlancer.sh --upgrade-from), before the
+            // DDL statement stages anything
+            "Can not update catalog while catalog update is in progress" };
 
     /**
      * Errors a node failure causes while nodes are killed and rejoined during the run (--node-failures). A statement in
