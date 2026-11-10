@@ -159,9 +159,10 @@ run_sql() {
     output=$(echo "$check" | "$voltdb_home/bin/sqlcmd" --port="$(port 0 0)" --stop-on-error=false 2>&1 |
         grep -v "^Warning: voltdb database\|^  But this script\|^    /\|^The 'voltdb' database scripts\|^For ease of use" |
         normalize)
-    # a server that crashed can take some seconds to exit (writing its crash files) after the connection is lost
+    # a server that crashed can take minutes to exit (writing its crash files) after the connection is lost: on the
+    # lab's Linux agents ENG-30595's server was still up 20 s after sqlcmd lost it (lab builds #42 and #43)
     alive=true
-    for _ in $(seq 1 20); do
+    for _ in $(seq 1 300); do
         sleep 1
         cluster_alive "$nodes" || { alive=false; break; }
         echo "$output" | grep -q "was lost before a response was received" || break
@@ -198,7 +199,9 @@ run_sh() {
     rm -rf "$work"
 }
 
-# a reproduction with a "-- manual: reason" header does not reproduce every time; it runs only when --only names it
+# a reproduction with a "-- manual: reason" header does not reproduce every time, and one with a "-- platforms: LIST"
+# header (uname -s values) reproduces only there; either runs only when --only names it
+os=$(uname -s)
 files=()
 manual=()
 for f in "$repros_dir"/ENG-*.sql "$repros_dir"/ENG-*.sh; do
@@ -208,6 +211,9 @@ for f in "$repros_dir"/ENG-*.sql "$repros_dir"/ENG-*.sh; do
         echo ",$only," | grep -q ",$t," || continue
     elif [ -n "$(header "$f" manual)" ]; then
         manual+=("$t: $(header "$f" manual | head -1)")
+        continue
+    elif [ -n "$(header "$f" platforms)" ] && ! echo " $(header "$f" platforms | head -1) " | grep -q " $os "; then
+        manual+=("$t: reproduces only on $(header "$f" platforms | head -1), not on $os")
         continue
     fi
     files+=("$f")
@@ -244,7 +250,7 @@ result=PASS
     echo "reproductions: ${#files[@]}: $broken still broken, $fixed_n fixed, $changed changed, $errors errors"
     echo "time: $SECONDS s"
     for m in ${manual[@]+"${manual[@]}"}; do
-        echo "not run (manual): $m"
+        echo "not run: $m"
     done
     echo
     cat "$results/table.txt"

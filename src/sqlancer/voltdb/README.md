@@ -368,13 +368,17 @@ exact output, one header line per line. sqlcmd's output is normalized first: "(R
 "(1 rows)", the dashes under the column names go, and runs of spaces become one. A bug that sqlcmd cannot show (the
 JDBC driver's, a resize hang) is a `.sh` script instead, run with `VOLTDB_HOME`, `PORT_BASE` and `WORKDIR` set; it
 starts its own servers (always with `-H`), and exits 0 while the bug reproduces, 1 once it is fixed, anything else on
-an error. A `-- manual: reason` header marks a reproduction that does not reproduce every time: the runner skips it,
-and lists it in the summary, unless `--only` names it.
+an error. A `-- manual: reason` header marks a reproduction that does not reproduce every time, and a `-- platforms:
+LIST` header (`uname -s` values) one that reproduces on those systems only: the runner skips either, and lists it in
+the summary, unless `--only` names it. A crash counts once the server exits, which it may take minutes to do after
+sqlcmd loses the connection; the runner waits up to 300 s.
 
 Not every bug has a reproduction: ENG-30602 (a query now and then gets another statement's result) and ENG-30608 (a
 SIGILL in a recursive common table, beside other threads' DDL) never reproduced on demand, and ENG-30612 (an MPI
 deadlock after a node dies mid-@UpdateCore) depends on when the kill lands. ENG-30622's script reproduces in a few
-cycles in some runs only, so it is marked `-- manual:` and runs only when `--only` names it.
+cycles in some runs only, so it is marked `-- manual:` and runs only when `--only` names it. ENG-30551 (a subnormal
+FLOAT constant in a plan) reproduces on macOS (arm64) only; the lab's x86_64 Linux agents plan the constant, so it is
+marked `-- platforms: Darwin`.
 
 ## The nightly lab job
 

@@ -1,5 +1,6 @@
 -- ticket: ENG-30551
 -- summary: A plan with a subnormal FLOAT constant fails with "JSON parse failure"; re-running it after any DDL crashes the node (SIGSEGV in cleanupAllExecutors)
+-- platforms: Darwin
 -- bug: crash
 -- fixed: contains: (1 rows)
 CREATE TABLE r (c0 INTEGER, c2 DATE);
