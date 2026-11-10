@@ -193,7 +193,7 @@ if ! $report_only; then
                 ${license_args[@]+"${license_args[@]}"} --results "$results/runs/$run" >"$results/runs/$run.log" 2>&1
         elif [ "$run" = sqlcoverage ]; then
             (cd "$voltdb_home" && JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:-} $agent" ant -Djmemcheck=NO_MEMCHECK \
-                -Dpro.build.done=true -Dsql_coverage_seed="$s" -Dsqlcoverage.failonerror=false sqlcoverage) >"$results/runs/$run.log" 2>&1
+                -Dpro.build.done=true -Dhsql=true -Dsql_coverage_seed="$s" -Dsqlcoverage.failonerror=false sqlcoverage) >"$results/runs/$run.log" 2>&1
         else
             VOLTDB_OPTS="${VOLTDB_OPTS:-} $agent" "$script_dir/run-sqlancer.sh" --voltdb "$voltdb_home" \
                 ${license_args[@]+"${license_args[@]}"} --results "$results/runs/$run" "${args[@]}" \
