@@ -13,4 +13,4 @@ databaseconnectiontest.db
 database*.log
 database*.properties
 database*.script
-databases/
+databases/__pycache__/
