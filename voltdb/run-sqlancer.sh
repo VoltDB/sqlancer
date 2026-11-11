@@ -284,8 +284,9 @@ results=$results_root/$run_id
 cluster=$results/cluster
 mkdir -p "$cluster" "$results/sqlancer" "$results/servers" "$results/reproductions" || die "cannot create $results"
 results=$(cd "$results" && pwd)
-if [ "$resize_interval" -gt 0 ]; then
-    # DDL waits while this file exists, which shrink creates (the provider ignores it with --avoid-known-bugs false)
+if [ "$resize_interval" -gt 0 ] || [ "$kill_interval" -gt 0 ]; then
+    # DDL waits while this file exists, which shrink and each kill create (the provider ignores it with
+    # --avoid-known-bugs false)
     provider_args+=(--ddl-hold "$results/ddl.hold")
 fi
 cluster=$results/cluster
@@ -639,12 +640,18 @@ chaos_loop() {
             echo "$(date '+%H:%M:%S') kill $n: node$i is not running" >>"$results/chaos.log"
             return 1
         fi
+        # A node killed while a catalog update (@UpdateCore) is in flight deadlocks the MPI (ENG-30612) or crashes a
+        # survivor (ENG-30663), so DDL is held (the provider's --ddl-hold) from a few seconds before the kill, letting
+        # a catalog update in flight finish, until the survivors have handled the failure
+        touch "$results/ddl.hold"
+        sleep 3
         kill -9 "$pid"
         t0=$(date +%s)
         echo "$(date '+%H:%M:%S') kill $n: node$i (pid $pid)" >>"$results/chaos.log"
         while port_in_use "$(client_port $i)"; do sleep 1; done
         # the survivors must notice the failure before the node comes back
         sleep 5
+        rm -f "$results/ddl.hold"
         if ! rejoin_node "$i" "$n"; then
             echo "$(date '+%H:%M:%S') rejoin $n: node$i did not rejoin within 600 s" >>"$results/chaos.log"
             return 1
