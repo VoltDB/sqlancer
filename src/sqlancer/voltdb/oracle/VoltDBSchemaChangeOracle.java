@@ -76,7 +76,7 @@ public class VoltDBSchemaChangeOracle implements TestOracle<VoltDBGlobalState> {
         done = true;
         // tables with a materialized view are left out: VoltDB refuses most changes to them, and ENG-30582 limits the
         // queries that read them
-        Set<String> viewed = state.getViews().values().stream().map(v -> v[0]).collect(Collectors.toSet());
+        Set<String> viewed = state.getViewedTables();
         List<VoltDBTable> tables = state.getSchema().getDatabaseTables().stream()
                 .filter(t -> !viewed.contains(t.getName())).collect(Collectors.toList());
         if (tables.isEmpty()) {

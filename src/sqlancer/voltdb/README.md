@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 30.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 32.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -39,7 +39,9 @@ run script can enable security (`--security`), and the PERMS oracle checks what 
 [The PERMS oracle](#the-perms-oracle). Since milestone 29 the STREAMS oracle checks export streams and their views, and
 `--export` checks that every row a stream got was exported; see [The STREAMS oracle](#the-streams-oracle). Since
 milestone 30 `voltdb/run-coverage.sh` measures the Java and C++ code the runs exercise; see
-[Code coverage](#code-coverage).
+[Code coverage](#code-coverage). Since milestone 31 expressions also use the string, bitwise, number, time and mask
+functions that coverage found unexercised; see [Functions in expressions](#functions-in-expressions). Since milestone 32
+some materialized views read an inner join of two or three tables; see [The VIEWS oracle](#the-views-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -1014,25 +1016,41 @@ change rather than computing them again.
   contains data").
 - A view made first is kept up to date through every insert, upsert, update and delete that builds the database.
 
-A view (`gen/VoltDBViewGenerator`) covers one table:
+A view (`gen/VoltDBViewGenerator`) covers one table, or since milestone 32, a third of the time, an inner join of two
+or three tables:
 - It groups by zero to two non-BOOLEAN columns.
 - It always has `COUNT(*)`, plus up to three more of `COUNT`, `SUM`, `MIN` and `MAX` of the table's columns. MIN and
   MAX are never of BOOLEAN columns (ENG-30493).
 - While `--avoid-known-bugs` is true, SUM is only of NOT NULL TINYINT, SMALLINT and INTEGER columns (ENG-30584 and
   ENG-30588 below). VoltDB sums those as BIGINT, which can't overflow.
-- While `--avoid-known-bugs` is false, half the views have a random WHERE clause. While it is true, none do (ENG-30583
-  below).
+- While `--avoid-known-bugs` is false, half the views of one table have a random WHERE clause. While it is true, none
+  do (ENG-30583 below).
+
+A view over a join is kept up to date by different code from a view of one table: VoltDB runs the view's query for
+each changed row (`MaterializedViewHandler` in the engine), where a view of one table has triggers on the table.
+Milestone 30's coverage run found that code never ran. Such a view:
+- Joins distinct tables (VoltDB's views have no self-join) with `JOIN ... ON` (inner joins only; VoltDB rejects outer
+  joins in a view).
+- Joins at most one partitioned table to replicated ones, or partitioned tables on their partitioning columns and
+  nothing else: VoltDB keeps a view of partitioned tables only when every joined row is in one partition.
+- Joins a replicated table on a comparison of two columns of the same kind (=, <, <=, >, >= or <>; random rows rarely
+  have equal values, and most comparisons let many pairs of rows through), a random predicate over the tables
+  joined so far, or both.
+- Has a random WHERE clause a third of the time, also while `--avoid-known-bugs` is true: ENG-30583 is about views of
+  one table, and constants, LIKE and BETWEEN in a join view's conditions leave later DDL working.
+- While `--avoid-known-bugs` is true, groups by columns with distinct names: the view is right, but its query run as a
+  SELECT merges groups (ENG-30529 below).
 
 While `--avoid-known-bugs` is true, the other oracles' queries never read a table that has a view: VoltDB's view
 rewriter fails to plan some of their GROUP BY and aggregate queries on such a table (ENG-30582 below).
 
 The view's defining query is kept with the database's state.
 
-**The check.** It picks a view. Half the time it first runs one more INSERT, UPDATE or DELETE on the view's table, so
-the check follows a change made right before it. It then compares three results, as multisets, as TLP compares them:
+**The check.** It picks a view. Half the time it first runs one more INSERT, UPDATE or DELETE on the view's table (on
+one of them, for a view over a join), so the check follows a change made right before it. It then compares three results, as multisets, as TLP compares them:
 1. the view's rows, `SELECT * FROM v`;
 2. the defining query with `ORDER BY 1`, which VoltDB's view rewriter (`MVQueryRewriter`) leaves alone, so it is
-   computed from the table;
+   computed from the tables;
 3. the defining query as written, which the rewriter may answer from the view itself.
 
 The view and the query as written must both match the query computed from the table. VoltDB combines a view's
@@ -1295,7 +1313,7 @@ The bugs below were found while building the TLP DISTINCT, HAVING and AGGREGATE 
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
-| ENG-30529 | A multi-partition GROUP BY or DISTINCT groups by only one of two columns with the same name, such as `t0.c0` and `t1.c0`, merging groups. Found while checking the SQL these oracles generate; TLP HAVING found the form where the grouped columns are not selected. Wrong rows. | Grouping and DISTINCT columns have distinct names, and every output column of such a query has its own alias (`AS a0`, `AS a1`, ...). |
+| ENG-30529 | A multi-partition GROUP BY or DISTINCT groups by only one of two columns with the same name, such as `t0.c0` and `t1.c0`, merging groups. Found while checking the SQL these oracles generate; TLP HAVING found the form where the grouped columns are not selected. Wrong rows. | Grouping and DISTINCT columns have distinct names, and every output column of such a query has its own alias (`AS a0`, `AS a1`, ...). Since milestone 32 the VIEWS oracle found it again through a view over a join, whose own rows were right; such a view groups by columns with distinct names. |
 | ENG-30530 | GROUP BY or DISTINCT on the partitioning column of a table an outer join null-extends returns one NULL group per partition, because the planner leaves out the coordinator's aggregation. Found by TLP DISTINCT. Wrong rows. | With an outer join, partitioning columns are not grouped by. |
 | ENG-30531 | GROUP BY or DISTINCT on an indexed column, inlined into a FULL JOIN as a serial aggregation, returns the NULL group twice: the null-extended rows come after the index-ordered ones. Related to the closed ENG-13603. Found by TLP DISTINCT in the 30-minute acceptance run. Wrong rows. | TLP DISTINCT and TLP HAVING make no FULL JOINs. Where partitioned tables are joined, they also keep replicated tables in the FROM list rather than joining them, since a LEFT JOIN there can be "not plannable" (see the join rule above). |
 | ENG-30533 | MIN or MAX of a column without GROUP BY, with a WHERE clause on that column as the leading column of a multi-column index, skips rows whose next index column is NULL: with an index on `(a, b)` and the row `(5, NULL)`, `MIN(a) WHERE a = 5` is NULL. Found by TLP AGGREGATE in the 30-minute acceptance run. Wrong result. | TLP AGGREGATE writes a numeric column `c` as `(c + 0)` and a string column as `(c \|\| '')`, which the shortcut does not apply to, and leaves out MIN and MAX of VARBINARY and temporal values. |

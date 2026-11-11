@@ -23,13 +23,13 @@ import sqlancer.voltdb.gen.VoltDBInsertGenerator;
 import sqlancer.voltdb.gen.VoltDBUpdateGenerator;
 
 /**
- * Materialized views. A view must hold the rows its defining query returns when run on the table now: VoltDB keeps the
- * view up to date as the table changes, rather than running the query again. The defining query is run twice: with
+ * Materialized views. A view must hold the rows its defining query returns when run on its tables now: VoltDB keeps the
+ * view up to date as the tables change, rather than running the query again. The defining query is run twice: with
  * {@code ORDER BY 1}, which VoltDB's view rewriter leaves alone, so it is computed from the table; and as written,
  * which the rewriter may answer from the view. All three must have the same rows. The views are made with the database
  * (see VoltDBViewGenerator), whose inserts, updates and deletes already change the tables under them. Half the time the
- * oracle first runs one more INSERT, UPDATE or DELETE on the view's table, so that the check follows a change made
- * right before it.
+ * oracle first runs one more INSERT, UPDATE or DELETE on the view's table (one of them, for a view over a join), so
+ * that the check follows a change made right before it.
  *
  * <p>
  * VoltDB combines a view's per-partition rows when it is read, so a view on a partitioned table also has one row per
@@ -57,8 +57,10 @@ public class VoltDBViewOracle implements TestOracle<VoltDBGlobalState> {
         }
         String view = Randomly.fromList(new ArrayList<>(views.keySet()));
         String[] definition = views.get(view);
-        VoltDBTable table = state.getSchema().getDatabaseTables().stream()
-                .filter(t -> t.getName().equals(definition[0])).findFirst().orElseThrow(IgnoreMeException::new);
+        // a view over a join reads several tables; one of them is changed
+        String tableName = Randomly.fromOptions(definition[0].split(","));
+        VoltDBTable table = state.getSchema().getDatabaseTables().stream().filter(t -> t.getName().equals(tableName))
+                .findFirst().orElseThrow(IgnoreMeException::new);
         if (Randomly.getBoolean()) {
             SQLQueryAdapter change;
             switch (Randomly.fromOptions(0, 1, 2)) {

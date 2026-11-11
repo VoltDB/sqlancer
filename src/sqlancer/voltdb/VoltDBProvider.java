@@ -9,11 +9,14 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
@@ -126,15 +129,24 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
             return getPrefix() + "V" + nextView.getAndIncrement();
         }
 
-        public void addView(String name, String table, String query) {
-            views.put(name, new String[] { table, query });
+        public void addView(String name, List<String> tables, String query) {
+            views.put(name, new String[] { String.join(",", tables), query });
         }
 
-        // name to {base table, defining query} of each view generated for this database
+        // name to {its tables, comma-separated; defining query} of each view generated for this database
         public Map<String, String[]> getViews() {
             synchronized (views) {
                 return new LinkedHashMap<>(views);
             }
+        }
+
+        // the tables that any of this database's views reads
+        public Set<String> getViewedTables() {
+            Set<String> tables = new HashSet<>();
+            for (String[] v : getViews().values()) {
+                tables.addAll(Arrays.asList(v[0].split(",")));
+            }
+            return tables;
         }
 
         @Override

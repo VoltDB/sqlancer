@@ -1213,7 +1213,7 @@ public final class VoltDBExpressionGenerator
             // ENG-30582: once a table has a materialized view, VoltDB's view rewriter fails to plan some GROUP BY and
             // aggregate queries on it ("Duplicate key", ClassCastException), so queries leave such tables to the VIEWS
             // oracle
-            Set<String> viewed = state.getViews().values().stream().map(v -> v[0]).collect(Collectors.toSet());
+            Set<String> viewed = state.getViewedTables();
             candidates = candidates.stream().filter(t -> !viewed.contains(t.getName())).collect(Collectors.toList());
             if (candidates.isEmpty()) {
                 throw new IgnoreMeException();
@@ -1267,8 +1267,7 @@ public final class VoltDBExpressionGenerator
         subqueryAliases = 0;
         if (subqueries) {
             // ENG-30582 (above) applies to the aggregates of scalar subqueries too
-            Set<String> viewed = avoidKnownBugs
-                    ? state.getViews().values().stream().map(v -> v[0]).collect(Collectors.toSet()) : Set.of();
+            Set<String> viewed = avoidKnownBugs ? state.getViewedTables() : Set.of();
             subqueryTables = state.getSchema().getDatabaseTables().stream()
                     .filter(t -> !t.isPartitioned() && !viewed.contains(t.getName())).collect(Collectors.toList());
         }
