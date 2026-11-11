@@ -293,8 +293,10 @@ The script passes the provider `--xdcr` with the second cluster's client ports, 
    own first. Rows the old database wrote just before, still on their way, would then reach a table that cluster no
    longer has, and pause that DR stream for good (ENG-30630). So, before those drops, the provider waits up to 60 s
    until each cluster's DR producer has had acknowledged everything it had queued (`@Statistics DRPRODUCERPARTITION`:
-   LASTACKDRID reaches the LASTQUEUEDDRID of the start of the wait). With `--avoid-known-bugs false` it does not
-   wait.
+   LASTACKDRID reaches the LASTQUEUEDDRID of the start of the wait). LASTQUEUEDDRID counts only flushed DR buffers,
+   and VoltDB flushes them every second by default, so the wait starts 1.5 s in; read at once, it missed the last
+   rows and the stream paused (lab build #46). A wait that runs out says so on standard error. With
+   `--avoid-known-bugs false` it does not wait.
 
 ### The XDCR oracle
 

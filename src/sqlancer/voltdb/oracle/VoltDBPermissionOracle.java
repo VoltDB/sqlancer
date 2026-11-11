@@ -278,7 +278,29 @@ public class VoltDBPermissionOracle implements TestOracle<VoltDBGlobalState> {
         Statement create() throws SQLException;
     }
 
+    // the users' connections are plain JDBC, which does not retry a query that another thread's DDL made stale ("was
+    // planned against a catalog version which does not match"); so it is retried here, as VoltDBConnection retries
+    // the administrator's. One that stays stale for the whole window, as under the security run's DDL (lab build
+    // #46), is skipped: it says nothing about permissions.
     private List<String> rows(Statements statements, String sql, int columns, User user) throws SQLException {
+        long deadline = System.currentTimeMillis() + 60_000;
+        while (true) {
+            try {
+                return rowsOnce(statements, sql, columns, user);
+            } catch (StaleQuery e) {
+                if (System.currentTimeMillis() >= deadline) {
+                    throw new IgnoreMeException();
+                }
+                sleep();
+            }
+        }
+    }
+
+    private static final class StaleQuery extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+    }
+
+    private List<String> rowsOnce(Statements statements, String sql, int columns, User user) throws SQLException {
         List<String> rows = new ArrayList<>();
         try (Statement st = statements.create(); ResultSet rs = st.executeQuery(sql)) {
             while (rs.next()) {
@@ -295,6 +317,9 @@ public class VoltDBPermissionOracle implements TestOracle<VoltDBGlobalState> {
             if (user != null && REFUSED.matcher(String.valueOf(e.getMessage())).matches()) {
                 throw new AssertionError(
                         "the " + user.name + " user was refused a query: " + sql + ": " + e.getMessage(), e);
+            }
+            if (VoltDBErrors.isRetryable(e)) {
+                throw new StaleQuery();
             }
             if (errors.errorIsExpected(e.getMessage())) {
                 throw new IgnoreMeException();
