@@ -836,6 +836,35 @@ Since milestone 19 the expression generator, and so every oracle that uses it, a
 
 PQS's evaluator does not model these functions: a PQS query that holds one is skipped.
 
+Since milestone 31 it also writes the functions that milestone 30's coverage run found the engine never ran
+(`expressions/stringfunctions.h` was 13% covered, `bitwisefunctions.h` 0%, `datefunctions.h` 38%):
+
+- **Strings:** `LEFT(s, n)`, `RIGHT(s, n)`, `REPEAT(s, n)`, `SPACE(n)`, `REPLACE(s, t, r)` with t a constant that is
+  not empty, `CONCAT(a, b [, c])`, `OVERLAY(s PLACING t FROM start [FOR length])`, `CHAR(code point)`, `HEX(n)` and
+  `BIN(n)`. Counts and positions are small constants of 0 or more: a negative one is an error.
+- **Integers from strings:** `OCTET_LENGTH(s)`, `POSITION(t IN s)` and `REGEXP_POSITION(s, pattern [, 'i' | 'c'])`,
+  the pattern a constant (a generated one would mostly not be a valid regular expression).
+- **Bitwise:** `BITAND`, `BITOR`, `BITXOR`, `BITNOT`, `BIT_SHIFT_LEFT(n, k)` and `BIT_SHIFT_RIGHT(n, k)`, BIGINT in
+  and out. VoltDB rejects any other integer type ("incompatible data type in conversion"), so an operand that is not
+  a BIGINT column is written `CAST(x AS BIGINT)`. A result of BIGINT's minimum, VoltDB's NULL, is an expected error;
+  k runs past 63, where the result is 0.
+- **Numbers:** `SIGN(x)`, an integer; `ROUND(x, places)`, DECIMAL; `STR(x [, length [, decimals]])` and
+  `FORMAT_CURRENCY(x, places)`, VARCHAR. As documented, ROUND and STR take FLOAT or DECIMAL and FORMAT_CURRENCY
+  DECIMAL only, so x is a FLOAT expression or `CAST(... AS DECIMAL)`: VoltDB accepts an integer when it plans the
+  statement, then fails when it runs it ("Type INTEGER can't be cast as DECIMAL").
+- **Time:** `DATEDIFF(unit, t1, t2)`, a BIGINT; `TIME_WINDOW(unit, n, t [, START | END])` and
+  `FROM_UNIXTIME(seconds)`, TIMESTAMPs; `FORMAT_TIMESTAMP(t, zone)`, VARCHAR.
+- **Masks:** `MASK_TEXT(s, mask, keep)`, and `MASK_INNER`, `MASK_OUTER` and `MASK_PARTIAL(s, left, right, mask)`.
+
+PQS's evaluator models LEFT, RIGHT, REPEAT, REPLACE, SPACE, CONCAT, HEX, BIN, OCTET_LENGTH, POSITION, SIGN and the
+bitwise functions, as the engine computes them; a PQS query with any of the others is skipped.
+
+The bugs below were found in milestone 31.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30655 | A procedure created AS a query with `TIME_WINDOW(..., END)` succeeds and runs, but every later DDL statement fails with "unexpected token: END", its own DROP PROCEDURE included, and still after a restart; only `voltdb init --force` gets DDL back. START, no option, and END in a view or an index do not do it. Critical. | `TIME_WINDOW`'s option is START only. |
+
 ### The GEO oracle
 
 GEO (`oracle/VoltDBGeographyOracle`) checks GEOGRAPHY_POINT and GEOGRAPHY against geography computed in Java. On one

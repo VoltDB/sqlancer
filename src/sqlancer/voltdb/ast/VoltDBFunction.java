@@ -1,6 +1,8 @@
 package sqlancer.voltdb.ast;
 
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 
 import sqlancer.common.ast.newast.NewFunctionNode;
 
@@ -24,11 +26,31 @@ public class VoltDBFunction extends NewFunctionNode<VoltDBExpression, VoltDBFunc
         SINCE_EPOCH, TO_TIMESTAMP, DATEADD, TRUNCATE,
         // JSON in VARCHAR (milestone 19): FIELD(doc, name), ARRAY_ELEMENT(array, i) and SET_FIELD(doc, name, value)
         // return VARCHAR, ARRAY_LENGTH(array) an integer
-        FIELD, ARRAY_ELEMENT, SET_FIELD, ARRAY_LENGTH;
+        FIELD, ARRAY_ELEMENT, SET_FIELD, ARRAY_LENGTH,
+        // milestone 31, strings: VARCHAR results
+        LEFT, RIGHT, REPEAT, REPLACE, SPACE, CONCAT, HEX, BIN, CHAR, OVERLAY, STR, FORMAT_CURRENCY, FORMAT_TIMESTAMP,
+        MASK_TEXT, MASK_INNER, MASK_OUTER, MASK_PARTIAL,
+        // milestone 31, integer results: OCTET_LENGTH, POSITION and REGEXP_POSITION read strings, the bitwise
+        // functions take and return BIGINT, SIGN any number, DATEDIFF(unit, t1, t2) two TIMESTAMPs
+        OCTET_LENGTH, POSITION, REGEXP_POSITION, BITAND, BITOR, BITXOR, BITNOT, BIT_SHIFT_LEFT, BIT_SHIFT_RIGHT, SIGN,
+        DATEDIFF,
+        // milestone 31: ROUND(x, n) is DECIMAL; TIME_WINDOW(unit, n, t [, START | END]) and FROM_UNIXTIME(seconds)
+        // are TIMESTAMPs
+        ROUND, TIME_WINDOW, FROM_UNIXTIME,
+        // CAST(x AS BIGINT), for the bitwise functions' operands: they reject any other integer type; CAST(x AS
+        // DECIMAL),
+        // for ROUND, STR and FORMAT_CURRENCY, which reject integers
+        CAST_BIGINT, CAST_DECIMAL;
 
-        // whether the PQS evaluator models the function; the milestone 19 functions it does not
+        private static final Set<VoltDBFunctionName> MODELLED = EnumSet.of(ABS, FLOOR, CEILING, MOD, CHAR_LENGTH,
+                SUBSTRING, UPPER, LOWER, TRIM, LTRIM, RTRIM, COALESCE, LEFT, RIGHT, REPEAT, REPLACE, SPACE, CONCAT, HEX,
+                BIN, OCTET_LENGTH, POSITION, BITAND, BITOR, BITXOR, BITNOT, BIT_SHIFT_LEFT, BIT_SHIFT_RIGHT, SIGN,
+                CAST_BIGINT);
+
+        // whether the PQS evaluator models the function: not the milestone 19 functions, nor the milestone 31 ones
+        // whose results depend on formatting, regular expressions, masks or time
         public boolean isModelled() {
-            return ordinal() <= COALESCE.ordinal();
+            return MODELLED.contains(this);
         }
     }
 

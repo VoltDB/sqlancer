@@ -6,6 +6,7 @@ import sqlancer.voltdb.ast.VoltDBAggregate;
 import sqlancer.voltdb.ast.VoltDBCase;
 import sqlancer.voltdb.ast.VoltDBConstant;
 import sqlancer.voltdb.ast.VoltDBExpression;
+import sqlancer.voltdb.ast.VoltDBFunction;
 import sqlancer.voltdb.ast.VoltDBJoin;
 import sqlancer.voltdb.ast.VoltDBKeyword;
 import sqlancer.voltdb.ast.VoltDBSelect;
@@ -39,8 +40,34 @@ public class VoltDBToStringVisitor extends NewToStringVisitor<VoltDBExpression> 
     @Override
     public void visit(NewFunctionNode<VoltDBExpression, ?> funcCall) {
         sb.append("(");
+        Object name = funcCall.getFunc();
         if (funcCall instanceof VoltDBAggregate && funcCall.getArgs().isEmpty()) {
             sb.append(funcCall.getFunc()).append("(*)");
+        } else if (name == VoltDBFunction.VoltDBFunctionName.CAST_BIGINT
+                || name == VoltDBFunction.VoltDBFunctionName.CAST_DECIMAL) {
+            sb.append("CAST(");
+            visit(funcCall.getArgs().get(0));
+            sb.append(name == VoltDBFunction.VoltDBFunctionName.CAST_BIGINT ? " AS BIGINT)" : " AS DECIMAL)");
+        } else if (name == VoltDBFunction.VoltDBFunctionName.POSITION) {
+            // POSITION(needle IN haystack)
+            sb.append("POSITION(");
+            visit(funcCall.getArgs().get(0));
+            sb.append(" IN ");
+            visit(funcCall.getArgs().get(1));
+            sb.append(")");
+        } else if (name == VoltDBFunction.VoltDBFunctionName.OVERLAY) {
+            // OVERLAY(s PLACING r FROM start [FOR length])
+            sb.append("OVERLAY(");
+            visit(funcCall.getArgs().get(0));
+            sb.append(" PLACING ");
+            visit(funcCall.getArgs().get(1));
+            sb.append(" FROM ");
+            visit(funcCall.getArgs().get(2));
+            if (funcCall.getArgs().size() > 3) {
+                sb.append(" FOR ");
+                visit(funcCall.getArgs().get(3));
+            }
+            sb.append(")");
         } else {
             super.visit(funcCall);
         }

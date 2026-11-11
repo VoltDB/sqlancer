@@ -101,17 +101,23 @@ public final class VoltDBExpressionGenerator
     private enum NumericExpression {
         UNARY_MINUS, ARITHMETIC, ABS, FLOOR_CEILING, MOD, CHAR_LENGTH, CASE, COALESCE,
         // milestone 19
-        FLOAT_MATH, DATE_PART, SINCE_EPOCH, JSON_ARRAY_LENGTH
+        FLOAT_MATH, DATE_PART, SINCE_EPOCH, JSON_ARRAY_LENGTH,
+        // milestone 31
+        BITWISE, STRING_POSITION, SIGN, DATEDIFF, ROUND
     }
 
     private enum StringExpression {
         CONCAT, SUBSTRING, CASE_CONVERSION, TRIM, CASE, COALESCE,
         // milestone 19
-        JSON
+        JSON,
+        // milestone 31
+        STRING_FUNCTION, FORMAT_FUNCTION, MASK
     }
 
     private enum TemporalExpression {
-        DATEADD, TRUNCATE, TO_TIMESTAMP
+        DATEADD, TRUNCATE, TO_TIMESTAMP,
+        // milestone 31
+        TIME_WINDOW, FROM_UNIXTIME
     }
 
     // JSON documents for the JSON functions (milestone 19); FIELD's names and ARRAY_ELEMENT's indexes reach into them
@@ -197,7 +203,8 @@ public final class VoltDBExpressionGenerator
     // DATEADD(unit, n, t) and TRUNCATE(unit, t), of t's type, and TO_TIMESTAMP(unit, n), a TIMESTAMP (milestone 19)
     private VoltDBExpression generateTemporalExpression(int depth) {
         TemporalExpression choice = Randomly.fromOptions(TemporalExpression.values());
-        if (choice == TemporalExpression.TO_TIMESTAMP && temporalType == VoltDBDataType.DATE) {
+        if ((choice == TemporalExpression.TO_TIMESTAMP || choice == TemporalExpression.TIME_WINDOW
+                || choice == TemporalExpression.FROM_UNIXTIME) && temporalType == VoltDBDataType.DATE) {
             choice = TemporalExpression.DATEADD;
         }
         Randomly r = state.getRandomly();
@@ -224,6 +231,24 @@ public final class VoltDBExpressionGenerator
                             Randomly.getBoolean() ? integerConstant(r.getLong(-100_000_000_000L, 100_000_000_000L))
                                     : generateIntegerOperand()),
                     VoltDBFunctionName.TO_TIMESTAMP);
+        case TIME_WINDOW:
+            // TIME_WINDOW(unit, n, t [, START | END]): the start or end of the n-unit window that holds t
+            List<VoltDBExpression> window = new ArrayList<>();
+            window.add(new VoltDBKeyword(Randomly.fromOptions("YEAR", "QUARTER", "MONTH", "WEEK", "DAY", "HOUR",
+                    "MINUTE", "SECOND", "MILLISECOND")));
+            window.add(integerConstant(r.getInteger(1, 13)));
+            window.add(generateTimestamp(depth));
+            if (Randomly.getBoolean()) {
+                // ENG-30655: a procedure created AS a query with TIME_WINDOW(..., END) blocks every later DDL in the
+                // database, so unless --avoid-known-bugs is false the option is START only
+                window.add(new VoltDBKeyword(avoidKnownBugs ? "START" : Randomly.fromOptions("START", "END")));
+            }
+            return new VoltDBFunction(window, VoltDBFunctionName.TIME_WINDOW);
+        case FROM_UNIXTIME:
+            // FROM_UNIXTIME(seconds since 1970); out of TIMESTAMP's range is an expected error
+            return new VoltDBFunction(List.of(Randomly.getBoolean()
+                    ? integerConstant(r.getLong(-12_000_000_000L, 250_000_000_000L)) : generateBigintOperand(depth)),
+                    VoltDBFunctionName.FROM_UNIXTIME);
         default:
             throw new AssertionError(choice);
         }
@@ -323,8 +348,174 @@ public final class VoltDBExpressionGenerator
                                 new VoltDBConstant(Randomly.fromOptions("'5'", "'\"s\"'", "'null'", "'[1]'"))),
                         VoltDBFunctionName.SET_FIELD);
             }
+        case STRING_FUNCTION:
+            return generateStringFunction(depth);
+        case FORMAT_FUNCTION:
+            return generateFormatFunction(depth);
+        case MASK:
+            return generateMask(depth);
         default:
             throw new AssertionError();
+        }
+    }
+
+    // milestone 31: LEFT, RIGHT, REPEAT, REPLACE, SPACE, CONCAT, HEX, BIN, CHAR and OVERLAY. Counts and positions are
+    // small constants of 0 or more: a negative one is an error, and a large REPEAT or SPACE only makes long strings.
+    private VoltDBExpression generateStringFunction(int depth) {
+        Randomly r = state.getRandomly();
+        switch (Randomly.fromOptions(0, 1, 2, 3, 4, 5, 6, 7)) {
+        case 0:
+            return new VoltDBFunction(
+                    List.of(generateExpression(Kind.STRING, depth + 1), integerConstant(r.getInteger(0, 7))),
+                    Randomly.fromOptions(VoltDBFunctionName.LEFT, VoltDBFunctionName.RIGHT));
+        case 1:
+            return new VoltDBFunction(
+                    List.of(generateExpression(Kind.STRING, depth + 1), integerConstant(r.getInteger(0, 4))),
+                    VoltDBFunctionName.REPEAT);
+        case 2:
+            // the text to find is a constant that is not empty
+            return new VoltDBFunction(
+                    List.of(generateExpression(Kind.STRING, depth + 1),
+                            new VoltDBConstant(
+                                    VoltDBConstantGenerator.quote(Randomly.fromOptions("a", "l", " ", "é", "ab", "0"))),
+                            Randomly.getBoolean() ? generateExpression(Kind.STRING, depth + 1)
+                                    : new VoltDBConstant(
+                                            VoltDBConstantGenerator.quote(Randomly.fromOptions("", "x", "ZZ", "ü")))),
+                    VoltDBFunctionName.REPLACE);
+        case 3:
+            return new VoltDBFunction(List.of(integerConstant(r.getInteger(0, 5))), VoltDBFunctionName.SPACE);
+        case 4:
+            // ENG-30546 (see CONCAT above): CONCAT of strings that are all empty is NULL, so unless --avoid-known-bugs
+            // is false its last argument is a constant that is not empty
+            List<VoltDBExpression> parts = new ArrayList<>();
+            int n = 2 + (Randomly.getBoolean() ? 1 : 0);
+            for (int i = 0; i < n - 1; i++) {
+                parts.add(generateExpression(Kind.STRING, depth + 1));
+            }
+            parts.add(avoidKnownBugs ? generateNonEmptyStringConstant() : generateExpression(Kind.STRING, depth + 1));
+            return new VoltDBFunction(parts, VoltDBFunctionName.CONCAT);
+        case 5:
+            return new VoltDBFunction(List.of(generateBigintOperand(depth)),
+                    Randomly.fromOptions(VoltDBFunctionName.HEX, VoltDBFunctionName.BIN));
+        case 6:
+            // CHAR(code point): ASCII and a few beyond
+            return new VoltDBFunction(
+                    List.of(integerConstant(
+                            Randomly.fromOptions((long) r.getInteger(32, 127), 233L, 246L, 8364L, 128512L))),
+                    VoltDBFunctionName.CHAR);
+        default:
+            // OVERLAY(s PLACING t FROM start [FOR length])
+            List<VoltDBExpression> overlay = new ArrayList<>();
+            overlay.add(generateExpression(Kind.STRING, depth + 1));
+            overlay.add(generateExpression(Kind.STRING, depth + 1));
+            overlay.add(integerConstant(r.getInteger(1, 7)));
+            if (Randomly.getBoolean()) {
+                overlay.add(integerConstant(r.getInteger(0, 5)));
+            }
+            return new VoltDBFunction(overlay, VoltDBFunctionName.OVERLAY);
+        }
+    }
+
+    // milestone 31: STR(x [, length [, decimals]]), FORMAT_CURRENCY(x, decimals) and FORMAT_TIMESTAMP(t, zone)
+    private VoltDBExpression generateFormatFunction(int depth) {
+        Randomly r = state.getRandomly();
+        switch (Randomly.fromOptions(0, 1, 2)) {
+        case 0:
+            List<VoltDBExpression> str = new ArrayList<>();
+            str.add(generateFloatOrDecimalOperand(depth));
+            if (Randomly.getBoolean()) {
+                str.add(integerConstant(r.getInteger(1, 21)));
+                if (Randomly.getBoolean()) {
+                    str.add(integerConstant(r.getInteger(0, 6)));
+                }
+            }
+            return new VoltDBFunction(str, VoltDBFunctionName.STR);
+        case 1:
+            return new VoltDBFunction(List.of(generateDecimalOperand(depth), integerConstant(r.getInteger(-2, 6))),
+                    VoltDBFunctionName.FORMAT_CURRENCY);
+        default:
+            return new VoltDBFunction(
+                    List.of(generateTimestamp(depth),
+                            new VoltDBConstant(VoltDBConstantGenerator.quote(Randomly.fromOptions("UTC", "GMT",
+                                    "-08:00", "+05:30", "America/New_York", "Asia/Tokyo")))),
+                    VoltDBFunctionName.FORMAT_TIMESTAMP);
+        }
+    }
+
+    // milestone 31: MASK_TEXT(s, mask, keep), MASK_INNER and MASK_OUTER(s, left, right, mask), MASK_PARTIAL(s, left,
+    // right, mask)
+    private VoltDBExpression generateMask(int depth) {
+        Randomly r = state.getRandomly();
+        VoltDBExpression s = generateExpression(Kind.STRING, depth + 1);
+        VoltDBConstant mask = new VoltDBConstant(
+                VoltDBConstantGenerator.quote(Randomly.fromOptions("*", "#", "-", "x")));
+        VoltDBFunctionName name = Randomly.fromOptions(VoltDBFunctionName.MASK_TEXT, VoltDBFunctionName.MASK_INNER,
+                VoltDBFunctionName.MASK_OUTER, VoltDBFunctionName.MASK_PARTIAL);
+        if (name == VoltDBFunctionName.MASK_TEXT) {
+            return new VoltDBFunction(List.of(s, mask, integerConstant(r.getInteger(0, 5))), name);
+        }
+        return new VoltDBFunction(
+                List.of(s, integerConstant(r.getInteger(0, 5)), integerConstant(r.getInteger(0, 5)), mask), name);
+    }
+
+    // A DECIMAL, for FORMAT_CURRENCY, which takes DECIMAL only (as documented): an exact number under CAST(... AS
+    // DECIMAL). VoltDB accepts an integer or FLOAT argument when it plans the statement, and then fails at run time
+    // ("Type INTEGER can't be cast as DECIMAL").
+    private VoltDBExpression generateDecimalOperand(int depth) {
+        NumericDomain outer = numericDomain;
+        numericDomain = NumericDomain.EXACT;
+        try {
+            return new VoltDBFunction(List.of(generateExpression(Kind.NUMERIC, depth + 1)),
+                    VoltDBFunctionName.CAST_DECIMAL);
+        } finally {
+            numericDomain = outer;
+        }
+    }
+
+    // A FLOAT or a DECIMAL, for ROUND and STR, which take those only (as documented; see generateDecimalOperand)
+    private VoltDBExpression generateFloatOrDecimalOperand(int depth) {
+        if (Randomly.getBoolean()) {
+            return generateDecimalOperand(depth);
+        }
+        NumericDomain outer = numericDomain;
+        numericDomain = NumericDomain.FLOAT;
+        try {
+            return generateExpression(Kind.NUMERIC, depth + 1);
+        } finally {
+            numericDomain = outer;
+        }
+    }
+
+    // A BIGINT, for the bitwise functions, HEX and BIN, which reject any other type: an integer column or constant,
+    // under CAST(... AS BIGINT) unless it is a BIGINT column, or another bitwise function
+    private VoltDBExpression generateBigintOperand(int depth) {
+        if (depth < state.getOptions().getMaxExpressionDepth() && Randomly.getBooleanWithRatherLowProbability()) {
+            return generateBitwise(depth + 1);
+        }
+        VoltDBExpression operand = generateIntegerOperand();
+        if (operand instanceof VoltDBColumnReference
+                && ((VoltDBColumnReference) operand).getColumn().getType().getType() == VoltDBDataType.BIGINT) {
+            return operand;
+        }
+        return new VoltDBFunction(List.of(operand), VoltDBFunctionName.CAST_BIGINT);
+    }
+
+    // BITAND, BITOR, BITXOR, BITNOT, BIT_SHIFT_LEFT and BIT_SHIFT_RIGHT, BIGINT in and out (milestone 31). A result
+    // that would be BIGINT's minimum, VoltDB's NULL, is an expected error; a shift count is a constant of 0 or more
+    // (a negative one is an error), above 63 too, where the result is 0
+    private VoltDBExpression generateBitwise(int depth) {
+        VoltDBFunctionName name = Randomly.fromOptions(VoltDBFunctionName.BITAND, VoltDBFunctionName.BITOR,
+                VoltDBFunctionName.BITXOR, VoltDBFunctionName.BITNOT, VoltDBFunctionName.BIT_SHIFT_LEFT,
+                VoltDBFunctionName.BIT_SHIFT_RIGHT);
+        switch (name) {
+        case BITNOT:
+            return new VoltDBFunction(List.of(generateBigintOperand(depth)), name);
+        case BIT_SHIFT_LEFT:
+        case BIT_SHIFT_RIGHT:
+            return new VoltDBFunction(List.of(generateBigintOperand(depth), integerConstant(
+                    Randomly.fromOptions((long) state.getRandomly().getInteger(0, 8), 31L, 62L, 63L, 64L, 70L))), name);
+        default:
+            return new VoltDBFunction(List.of(generateBigintOperand(depth), generateBigintOperand(depth)), name);
         }
     }
 
@@ -712,6 +903,69 @@ public final class VoltDBExpressionGenerator
                 return generateLeafNode(Kind.NUMERIC);
             }
             return new VoltDBFunction(List.of(generateJsonArray(depth)), VoltDBFunctionName.ARRAY_LENGTH);
+        case BITWISE:
+            if (numericDomain == NumericDomain.FLOAT) {
+                return generateLeafNode(Kind.NUMERIC);
+            }
+            return generateBitwise(depth);
+        case STRING_POSITION:
+            // OCTET_LENGTH(s), POSITION(t IN s) and REGEXP_POSITION(s, pattern [, flags]): integers
+            if (numericDomain == NumericDomain.FLOAT) {
+                return generateLeafNode(Kind.NUMERIC);
+            }
+            switch (Randomly.fromOptions(0, 1, 2)) {
+            case 0:
+                return new VoltDBFunction(List.of(generateExpression(Kind.STRING, depth + 1)),
+                        VoltDBFunctionName.OCTET_LENGTH);
+            case 1:
+                return new VoltDBFunction(List.of(
+                        Randomly.getBoolean() ? generateExpression(Kind.STRING, depth + 1)
+                                : new VoltDBConstant(
+                                        VoltDBConstantGenerator.quote(Randomly.fromOptions("a", "l", "", " ", "é"))),
+                        generateExpression(Kind.STRING, depth + 1)), VoltDBFunctionName.POSITION);
+            default:
+                // the pattern is a constant: a generated one would mostly be an invalid regular expression
+                List<VoltDBExpression> regexp = new ArrayList<>();
+                regexp.add(generateExpression(Kind.STRING, depth + 1));
+                regexp.add(new VoltDBConstant(VoltDBConstantGenerator
+                        .quote(Randomly.fromOptions("a+", "[0-9]+", "^.", "l{2}", "\\s", "(x|y)z?", ".$"))));
+                if (Randomly.getBoolean()) {
+                    regexp.add(new VoltDBConstant(Randomly.fromOptions("'i'", "'c'")));
+                }
+                return new VoltDBFunction(regexp, VoltDBFunctionName.REGEXP_POSITION);
+            }
+        case SIGN:
+            // an integer; ENG-30550 (see ARITHMETIC): no multiplication or division inside, as in ABS
+            if (numericDomain == NumericDomain.FLOAT) {
+                return generateLeafNode(Kind.NUMERIC);
+            }
+            typedFunctionNesting++;
+            try {
+                return new VoltDBFunction(List.of(generateExpression(Kind.NUMERIC, depth + 1)),
+                        VoltDBFunctionName.SIGN);
+            } finally {
+                typedFunctionNesting--;
+            }
+        case DATEDIFF:
+            if (numericDomain == NumericDomain.FLOAT) {
+                return generateLeafNode(Kind.NUMERIC);
+            }
+            return new VoltDBFunction(List.of(
+                    new VoltDBKeyword(Randomly.fromOptions("YEAR", "QUARTER", "MONTH", "WEEK", "DAY", "HOUR", "MINUTE",
+                            "SECOND", "MILLISECOND", "MICROSECOND")),
+                    generateTimestamp(depth), generateTimestamp(depth)), VoltDBFunctionName.DATEDIFF);
+        case ROUND:
+            // ROUND(x, places): DECIMAL
+            if (numericDomain == NumericDomain.FLOAT) {
+                return generateLeafNode(Kind.NUMERIC);
+            }
+            typedFunctionNesting++;
+            try {
+                return new VoltDBFunction(List.of(generateFloatOrDecimalOperand(depth),
+                        integerConstant(state.getRandomly().getInteger(-3, 6))), VoltDBFunctionName.ROUND);
+            } finally {
+                typedFunctionNesting--;
+            }
         default:
             throw new AssertionError();
         }
