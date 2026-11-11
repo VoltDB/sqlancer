@@ -62,6 +62,8 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
     private static final AtomicBoolean ROLES_CREATED = new AtomicBoolean();
     // how long a new database waits for XDCR to apply what is queued before it drops its name's leftovers (ENG-30630)
     private static final long DR_APPLIED_MILLIS = 60_000;
+    // VoltDB's default DR flush interval (deployment systemsettings/flushinterval/dr) is 1 s; a little more
+    private static final long DR_FLUSH_MILLIS = 1_500;
 
     public VoltDBProvider() {
         super(VoltDBGlobalState.class, VoltDBOptions.class);
@@ -263,9 +265,17 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
     }
 
     // waits, for up to DR_APPLIED_MILLIS, until each cluster's DR producer has had acknowledged every transaction it
-    // had
-    // queued for the other when this was called (other databases keep writing, so the queues are seldom empty)
+    // had queued for the other when this was called (other databases keep writing, so the queues are seldom empty).
+    // LASTQUEUEDDRID counts only flushed DR buffers, and a buffer is flushed every DR_FLUSH_MILLIS: rows this
+    // database's name wrote in the last second are not queued yet, and they paused a DR stream once its tables were
+    // dropped (lab build #46). So the queues are read after a flush.
     private static void awaitDrApplied(VoltDBConnection... clusters) throws SQLException {
+        try {
+            Thread.sleep(DR_FLUSH_MILLIS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return;
+        }
         List<Map<String, long[]>> queued = new ArrayList<>();
         for (VoltDBConnection c : clusters) {
             queued.add(drProducer(c));
@@ -281,7 +291,13 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
                         applied = false;
                     }
                 }
-                if (applied || System.currentTimeMillis() >= deadline) {
+                if (applied) {
+                    break;
+                }
+                if (System.currentTimeMillis() >= deadline) {
+                    // dropping now may pause the DR stream for good (ENG-30630); said so the run's log explains it
+                    System.err.println("XDCR: what one cluster queued for the other was not applied within "
+                            + DR_APPLIED_MILLIS / 1000 + " s; dropping the earlier database's tables anyway");
                     break;
                 }
                 try {

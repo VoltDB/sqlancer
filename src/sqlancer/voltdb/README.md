@@ -167,7 +167,9 @@ checking query results through the failures:
    (`voltdb start -H`), so a restarted node 0 rejoins through another node. Until milestone 15, SQLancer connected to
    node 0 alone, and node 0 was never killed.
 2. It kills the node's server with `kill -9`, waits until its client port closes, and waits 5 seconds more for the
-   survivors to notice.
+   survivors to notice. From 3 seconds before the kill until then, it holds DDL (the provider's `--ddl-hold`, as
+   around a shrink): a node killed while a catalog update is in flight can wedge the MPI (ENG-30612) or crash a
+   surviving node (ENG-30663). With `-- --avoid-known-bugs false` the provider ignores the hold.
 3. It restarts the node with the same `voltdb start` command, which rejoins it to the running cluster: it gets its
    partitions' data back from the replicas, while the cluster keeps working.
 4. It waits until the rejoin completes ("Server completed initialization" in the restart's output), up to 600 seconds,
@@ -295,8 +297,10 @@ The script passes the provider `--xdcr` with the second cluster's client ports, 
    own first. Rows the old database wrote just before, still on their way, would then reach a table that cluster no
    longer has, and pause that DR stream for good (ENG-30630). So, before those drops, the provider waits up to 60 s
    until each cluster's DR producer has had acknowledged everything it had queued (`@Statistics DRPRODUCERPARTITION`:
-   LASTACKDRID reaches the LASTQUEUEDDRID of the start of the wait). With `--avoid-known-bugs false` it does not
-   wait.
+   LASTACKDRID reaches the LASTQUEUEDDRID of the start of the wait). LASTQUEUEDDRID counts only flushed DR buffers,
+   and VoltDB flushes them every second by default, so the wait starts 1.5 s in; read at once, it missed the last
+   rows and the stream paused (lab build #46). A wait that runs out says so on standard error. With
+   `--avoid-known-bugs false` it does not wait.
 
 ### The XDCR oracle
 
@@ -1452,6 +1456,12 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
+The bug below was found in milestone 31's lab run (build #46).
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30663 | A node killed while catalog updates are in flight, as in ENG-30612, but here a *surviving* node dies and, at k=1, the cluster is lost: in the lab the MPI restarted the interrupted @UpdateCore while the next DDL's update was prepared on a survivor, whose sites then failed with "Unexpected: @UpdateCore's prepared catalog is null during non-replay case"; locally a survivor aborted in the EE with "getStats() called with selector 0, and an invalid locator 455 that does not correspond to a table". A script (`-- manual:`, a race) reproduced it in 1 of 3 local runs. Critical. | DDL waits from 3 s before each kill until the survivors have handled the failure (`--ddl-hold`). |
 
 The bugs below were found in milestone 28.
 
