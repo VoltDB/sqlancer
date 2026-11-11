@@ -864,6 +864,7 @@ The bugs below were found in milestone 31.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30655 | A procedure created AS a query with `TIME_WINDOW(..., END)` succeeds and runs, but every later DDL statement fails with "unexpected token: END", its own DROP PROCEDURE included, and still after a restart; only `voltdb init --force` gets DDL back. START, no option, and END in a view or an index do not do it. Critical. | `TIME_WINDOW`'s option is START only. |
+| ENG-30656 | ROUND, STR and FORMAT_CURRENCY fail on a DECIMAL whose integer part is 2^63 or more, which DECIMAL holds: "Type DECIMAL with value ... can't be cast as BIGINT because the value is out of range" (the engine narrows the whole part to an int64). Major. | None needed: the error is expected for other reasons ("out of range for the destination type"), and the reproduction tracks the bug. |
 
 ### The GEO oracle
 

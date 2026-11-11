@@ -102,6 +102,14 @@ public final class VoltDBErrors {
         errors.add("will overflow BigInt storage"); // integer +, -, * out of range
         errors.add("causing overflow/underflow"); // DECIMAL out of range
         errors.add("out of range for the destination type"); // a huge DECIMAL or FLOAT result cast to an integer
+        // ENG-30656 gives the same message for ROUND, STR and FORMAT_CURRENCY of a DECIMAL of 2^63 or more, which
+        // should work: it is caught by the line above and by the reproduction, not here
+        // milestone 31: a bitwise result of BIGINT's minimum, which VoltDB reserves for NULL ("Application of bitwise
+        // function BITAND would produce INT64_MIN, which is reserved for SQL NULL values"); by design
+        errors.add("which is reserved for SQL NULL values");
+        // TIME_WINDOW(unit, n, t) whose window would reach past TIMESTAMP's range, as TIME_WINDOW(YEAR, 13, t) near
+        // year 9999
+        errors.add("interval is too large for TIME_WINDOW function");
         // DECIMAL out of range in an expression of constants, which the planner folds; the message quotes a
         // truncated value, e.g. "30145.999" for -99999999999999999999999999.999999999999 + -30146
         errors.add("Numeric conversion error to type DECIMAL");
