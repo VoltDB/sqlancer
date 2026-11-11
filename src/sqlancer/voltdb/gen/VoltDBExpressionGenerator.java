@@ -434,8 +434,19 @@ public final class VoltDBExpressionGenerator
             return new VoltDBFunction(List.of(generateDecimalOperand(depth), integerConstant(r.getInteger(-2, 6))),
                     VoltDBFunctionName.FORMAT_CURRENCY);
         default:
+            // ENG-30658: TO_TIMESTAMP and FROM_UNIXTIME of a NULL give a NULL typed BIGINT, which FORMAT_TIMESTAMP
+            // rejects ("Type BIGINT can't be cast as TIMESTAMP or DATE"), so unless --avoid-known-bugs is false its
+            // argument is a TIMESTAMP column or constant
+            VoltDBExpression formatted;
+            VoltDBDataType outer = temporalType;
+            temporalType = VoltDBDataType.TIMESTAMP;
+            try {
+                formatted = avoidKnownBugs ? generateLeafNode(Kind.TEMPORAL) : generateTimestamp(depth);
+            } finally {
+                temporalType = outer;
+            }
             return new VoltDBFunction(
-                    List.of(generateTimestamp(depth),
+                    List.of(formatted,
                             new VoltDBConstant(VoltDBConstantGenerator.quote(Randomly.fromOptions("UTC", "GMT",
                                     "-08:00", "+05:30", "America/New_York", "Asia/Tokyo")))),
                     VoltDBFunctionName.FORMAT_TIMESTAMP);

@@ -865,6 +865,7 @@ The bugs below were found in milestone 31.
 | --- | --- | --- |
 | ENG-30655 | A procedure created AS a query with `TIME_WINDOW(..., END)` succeeds and runs, but every later DDL statement fails with "unexpected token: END", its own DROP PROCEDURE included, and still after a restart; only `voltdb init --force` gets DDL back. START, no option, and END in a view or an index do not do it. Critical. | `TIME_WINDOW`'s option is START only. |
 | ENG-30656 | ROUND, STR and FORMAT_CURRENCY fail on a DECIMAL whose integer part is 2^63 or more, which DECIMAL holds: "Type DECIMAL with value ... can't be cast as BIGINT because the value is out of range" (the engine narrows the whole part to an int64). Major. | None needed: the error is expected for other reasons ("out of range for the destination type"), and the reproduction tracks the bug. |
+| ENG-30658 | TO_TIMESTAMP and FROM_UNIXTIME of a NULL return a NULL typed BIGINT, which FORMAT_TIMESTAMP rejects ("Type BIGINT can't be cast as TIMESTAMP or DATE"), so `FORMAT_TIMESTAMP(FROM_UNIXTIME(n), zone)` fails on any row where n is NULL. Major. | FORMAT_TIMESTAMP's argument is a TIMESTAMP column or constant. |
 
 ### The GEO oracle
 
