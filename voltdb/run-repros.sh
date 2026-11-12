@@ -171,9 +171,10 @@ run_sql() {
         [ "$bug" = crash ] && [ "$i" -lt 10 ] && continue
         echo "$output" | grep -q "was lost before a response was received" || break
     done
-    # on the lab's agents a crashed server can still be writing its crash files after the 300 s above (ENG-30595,
-    # lab build #46): a lost connection with a crash in the server's output is a crash too
-    if $alive && echo "$output" | grep -q "was lost before a response was received" &&
+    # on the lab's agents a crashed server can still be writing its crash files (a core dump) after the waits above
+    # (ENG-30595, lab build #46; ENG-30664, lab builds #49 and #50, whose server answered the INSERT and then died):
+    # a crash in the server's output is a crash, after a lost connection or for a crash reproduction
+    if $alive && { [ "$bug" = crash ] || echo "$output" | grep -q "was lost before a response was received"; } &&
         grep -qE "SIGSEGV|SIGBUS|SIGABRT|SIGILL|A fatal error has been detected|libc\+\+abi|FATAL" "$work"/start*.log \
             "$work"/node*/voltdbroot/log/volt.log 2>/dev/null; then
         alive=false
