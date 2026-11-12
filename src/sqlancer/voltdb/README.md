@@ -957,6 +957,29 @@ of plans (4,154 skipped), and 3 nodes 95, 53 and 3 (2,920 skipped).
 CERT-style checks (a more restrictive query must not get a larger estimated row count) do not apply: VoltDB's plans
 carry no row estimates in EXPLAIN or EXPLAINJSON, and its planner estimates from fixed table sizes, not from the data.
 
+## The TTL oracle
+
+Milestone 34. Milestone 30's coverage run found the system procedures behind rows that VoltDB removes by itself
+(`LowImpactDeleteNT`, `MigrateRowsNT`) unexercised; clients cannot call them, so TTL drives them through SQL:
+
+- **Time to live.** A table `XT_DB0 (k, ts, v) USING TTL 2 SECONDS ON COLUMN ts`, with a random `BATCH_SIZE` and
+  `MAX_FREQUENCY` and an index on `ts`. Each check inserts 1 to 30 rows, each with a `v` unique in the run and a `ts`
+  an hour ago (expired) or a day ahead (live), and waits up to 60 s until every expired row is gone; then every live
+  row must still be there.
+- **Migration.** A table `XM_DB0 (d, k, v, s, f) MIGRATE TO TARGET ...` with a shadow table `XM_DB0_SH`. Each check
+  inserts rows into both, then runs `MIGRATE FROM XM_DB0 WHERE k < x AND NOT MIGRATING`.
+  - With `--loopback-target` (`--export`), the table migrates to that target, whose procedure inserts into `XS_LB`:
+    once the export has caught up, the table's rows and XS_LB's rows tagged `XM_DB0` must together be the shadow
+    table's, with none in both.
+  - Without it, the target does not exist and the rows stay: the table must hold the shadow's rows, and exactly those
+    migrated so far must be `MIGRATING`.
+
+A statement that fails (a node failure's, as with STREAMS) leaves the table out of step, and that name's TTL or
+migration checks stop for the run. At exit TTL prints how many checks of each kind it made.
+
+In a 5-minute trial on 1 node (beside NoREC and TLP WHERE) TTL made 892 TTL checks and 880 migration checks; in one on
+3 nodes with k=2 and `--export` (beside STREAMS and NoREC), 110 and 105, the migrations through the loopback target.
+
 ## The PERMS oracle
 
 With `--security`, the deployment enables security with three users, `sqlancer` (administrator, whom SQLancer and
