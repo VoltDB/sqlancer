@@ -7,6 +7,7 @@ import sqlancer.common.query.ExpectedErrors;
 import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 import sqlancer.voltdb.gen.VoltDBExpressionGenerator;
 import sqlancer.voltdb.oracle.VoltDBBulkOracle;
+import sqlancer.voltdb.oracle.VoltDBConfigOracle;
 import sqlancer.voltdb.oracle.VoltDBDerivedTableOracle;
 import sqlancer.voltdb.oracle.VoltDBDifferentialOracle;
 import sqlancer.voltdb.oracle.VoltDBDurabilityOracle;
@@ -183,6 +184,16 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBBulkOracle(globalState, VoltDBBulkOracle.Mode.SWAP);
+        }
+    },
+    /**
+     * Configuration changed online (milestone 36): @SetYamlConfiguration changes one system setting and nothing else,
+     * as @GetYamlConfiguration reads back, and refuses a change it cannot apply without changing anything.
+     */
+    CONFIG {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBConfigOracle(globalState);
         }
     },
 
