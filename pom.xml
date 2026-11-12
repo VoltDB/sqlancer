@@ -367,7 +367,6 @@
       <groupId>org.voltdb</groupId>
       <artifactId>voltdbclient</artifactId>
       <version>16.0.0</version>
-      <scope>runtime</scope>
     </dependency>
     <dependency>
       <groupId>org.apache.commons</groupId>

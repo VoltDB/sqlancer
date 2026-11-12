@@ -6,6 +6,7 @@ import sqlancer.common.oracle.TestOracle;
 import sqlancer.common.query.ExpectedErrors;
 import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 import sqlancer.voltdb.gen.VoltDBExpressionGenerator;
+import sqlancer.voltdb.oracle.VoltDBBulkOracle;
 import sqlancer.voltdb.oracle.VoltDBDerivedTableOracle;
 import sqlancer.voltdb.oracle.VoltDBDifferentialOracle;
 import sqlancer.voltdb.oracle.VoltDBDurabilityOracle;
@@ -160,6 +161,28 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBTtlOracle(globalState);
+        }
+    },
+    /**
+     * Bulk loads (milestone 35): a batch loaded by @LoadMultipartitionTable or @LoadSinglepartitionTable must leave a
+     * table as the same rows' INSERT or UPSERT statements leave its twin, or fail as a whole when one of them breaks a
+     * constraint; then @ValidatePartitioning must find every row in its partition.
+     */
+    LOAD {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBBulkOracle(globalState, VoltDBBulkOracle.Mode.LOAD);
+        }
+    },
+    /**
+     * @SwapTables (milestone 35): two twin tables must hold each other's rows, findable through each index; then
+     *
+     * @ValidatePartitioning must find every row in its partition.
+     */
+    SWAP {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBBulkOracle(globalState, VoltDBBulkOracle.Mode.SWAP);
         }
     },
 
