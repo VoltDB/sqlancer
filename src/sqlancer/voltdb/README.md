@@ -1054,6 +1054,9 @@ Milestone 30's coverage run found that code never ran. Such a view:
 - While `--avoid-known-bugs` is true, a comparison of two columns of different types in the join is = or <>: with an
   ordered comparison, the view's maintenance can read a narrower integer column through its index with a key below
   its range, which matches every row (ENG-30511), and the server crashes (ENG-30665 below).
+- While `--avoid-known-bugs` is true, a VARBINARY column in the join is compared only with one of the same size: the
+  view's maintenance scans the other table's index with the condition's values, and a value longer than a VARBINARY(n)
+  column fails the change ("Type VARCHAR can't be cast as VARBINARY", ENG-12656 below; lab build #49's upgrade run).
 - While `--avoid-known-bugs` is true, an index on a table a view reads is never UNIQUE or ASSUMEUNIQUE: a unique index
   that duplicates the primary key of a join view's source table crashes the server on the next insert (ENG-30664
   below).

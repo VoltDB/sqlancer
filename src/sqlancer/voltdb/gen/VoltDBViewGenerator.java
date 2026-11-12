@@ -149,7 +149,13 @@ public final class VoltDBViewGenerator {
             for (VoltDBColumn b : joined) {
                 Kind kind = Kind.fromType(a.getType().getType());
                 // VoltDB orders BOOLEAN values TRUE < FALSE (ENG-30493), so they are compared for equality only
-                if (b.getTable() != t && kind == Kind.fromType(b.getType().getType())) {
+                // ENG-12656: an index scan on a VARBINARY(n) column with a longer key fails ("Type VARCHAR can't be
+                // cast as VARBINARY"), and a join view's maintenance scans the other table's indexes with this
+                // condition's values (lab build #49, the upgrade run); while avoiding known bugs, VARBINARY columns
+                // are compared only with one of the same size
+                boolean varbinarySizes = kind != Kind.VARBINARY || !globalState.getDbmsSpecificOptions().avoidKnownBugs
+                        || a.getType().getSize() == b.getType().getSize();
+                if (b.getTable() != t && kind == Kind.fromType(b.getType().getType()) && varbinarySizes) {
                     pairs.add(new VoltDBColumn[] { b, a });
                 }
             }
