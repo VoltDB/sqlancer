@@ -625,7 +625,7 @@ rejoin_node() {
 }
 
 chaos_loop() {
-    local n=0 i pid t0
+    local n=0 i pid t0 rejoins
     while true; do
         for _ in $(seq 1 "$kill_interval"); do
             [ -e "$results/chaos.stop" ] && return 0
@@ -641,21 +641,28 @@ chaos_loop() {
             return 1
         fi
         # A node killed while a catalog update (@UpdateCore) is in flight deadlocks the MPI (ENG-30612) or crashes a
-        # survivor (ENG-30663), so DDL is held (the provider's --ddl-hold) from a few seconds before the kill, letting
-        # a catalog update in flight finish, until the survivors have handled the failure
+        # survivor (ENG-30663), and DDL while the node rejoins crashed both survivors (lab build #49, ENG-30663), so
+        # DDL is held (the provider's --ddl-hold) from a few seconds before the kill, letting a catalog update in
+        # flight finish, until the node has rejoined ("Node rejoin completed")
         touch "$results/ddl.hold"
         sleep 3
+        rejoins=$(grep -c "Node rejoin completed" "$cluster/node$i/voltdbroot/log/volt.log" 2>/dev/null)
         kill -9 "$pid"
         t0=$(date +%s)
         echo "$(date '+%H:%M:%S') kill $n: node$i (pid $pid)" >>"$results/chaos.log"
         while port_in_use "$(client_port $i)"; do sleep 1; done
         # the survivors must notice the failure before the node comes back
         sleep 5
-        rm -f "$results/ddl.hold"
         if ! rejoin_node "$i" "$n"; then
+            rm -f "$results/ddl.hold"
             echo "$(date '+%H:%M:%S') rejoin $n: node$i did not rejoin within 600 s" >>"$results/chaos.log"
             return 1
         fi
+        for _ in $(seq 1 120); do
+            [ "$(grep -c "Node rejoin completed" "$cluster/node$i/voltdbroot/log/volt.log" 2>/dev/null)" -gt "${rejoins:-0}" ] && break
+            sleep 1
+        done
+        rm -f "$results/ddl.hold"
         echo "$(date '+%H:%M:%S') rejoin $n: node$i, $(($(date +%s) - t0)) s after the kill" >>"$results/chaos.log"
     done
 }
