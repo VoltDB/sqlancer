@@ -1051,6 +1051,9 @@ Milestone 30's coverage run found that code never ran. Such a view:
 - While `--avoid-known-bugs` is true and DIFF's mirror or an in-service upgrade runs 16.0.0, groups by no DECIMAL
   column: a join view grouped by a NULL DECIMAL aborts a 16.0.0 server (ENG-30255, fixed after 16.0.0; lab build #48's
   mirror died of it). Views of one table do not.
+- While `--avoid-known-bugs` is true, a comparison of two columns of different types in the join is = or <>: with an
+  ordered comparison, the view's maintenance can read a narrower integer column through its index with a key below
+  its range, which matches every row (ENG-30511), and the server crashes (ENG-30665 below).
 - While `--avoid-known-bugs` is true, an index on a table a view reads is never UNIQUE or ASSUMEUNIQUE: a unique index
   that duplicates the primary key of a join view's source table crashes the server on the next insert (ENG-30664
   below).
@@ -1467,11 +1470,12 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
 
-The bug below was found in milestone 32's lab run (build #48).
+The bugs below were found in milestone 32's lab runs (builds #48 and #49).
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30664 | A materialized view over a join of T with a partitioned table; T, holding a row, gets a UNIQUE index on its primary key's column: the next INSERT into T kills the server with "Could not find Index with name I among {VOLTDB_AUTOGEN_IDX_PK_T_A}" (`persistenttable.cpp`), as if the engine kept one of the two identical indexes while the view's maintenance plan names the other. A non-unique index, an empty T, no view, a view of one table or two replicated tables do not crash. Also on 16.0.0. Found by the security run, whose server died 12 minutes in. Server crash. | An index on a table a view reads is not unique. |
+| ENG-30665 | A view over a join of a partitioned table T0 and a replicated T1 on `T0.tinyint_col < T1.int_col`, with an index on the TINYINT column created after the view: when a T1 value is below TINYINT's range, the view's maintenance reads T0 through the index with that key, which matches every row (ENG-30511), and the next change kills the server: "MaterializedViewHandler for table V went looking for a tuple in the view and expected to find it but didn't". Also on 16.0.0. Found by the resize run (lab build #49), where an UPDATE of the replicated table killed two nodes at once and the cluster with them. Server crash. | Columns of different types in a join view's condition are compared with = or <> only. |
 | ENG-30255 (existing, fixed after 16.0.0) | A view over a join grouped by a DECIMAL column that is NULL aborts a 16.0.0 server ("Type DECIMAL with value -1701...728 can't be cast as BIGINT", the NULL DECIMAL); master is fixed. The mirror of the kill run died of it 75 s in. | With a 16.0.0 mirror or upgrade, join views do not group by DECIMAL. |
 
 The bug below was found in milestone 31's lab run (build #46).

@@ -157,8 +157,14 @@ public final class VoltDBViewGenerator {
         String comparison = null;
         if (!pairs.isEmpty()) {
             VoltDBColumn[] pair = Randomly.fromList(pairs);
+            // ENG-30665: the view's maintenance reads a narrower integer column through its index with keys from a
+            // wider one, and a key below the narrower type's range matches every row (ENG-30511), so the view loses
+            // track of its rows and the server crashes; while avoiding known bugs, columns of different types are
+            // compared with = and <> only
+            boolean sameType = pair[0].getType().getType() == pair[1].getType().getType();
             String operator = Kind.fromType(pair[0].getType().getType()) == Kind.BOOLEAN ? "="
-                    : Randomly.fromOptions("=", "<", "<=", ">", ">=", "<>");
+                    : !sameType && globalState.getDbmsSpecificOptions().avoidKnownBugs ? Randomly.fromOptions("=", "<>")
+                            : Randomly.fromOptions("=", "<", "<=", ">", ">=", "<>");
             comparison = pair[0].getFullQualifiedName() + " " + operator + " " + pair[1].getFullQualifiedName();
             if (Randomly.getBoolean()) {
                 return comparison;
