@@ -1029,6 +1029,11 @@ In a 90-second trial on 1 node: 643 loads (263 batches rejected as a whole), 986
 5-minute trial on 3 nodes with k=1 and a node killed every 60 s (beside NoREC, TLP WHERE and VIEWS): 663 loads (282
 rejected), 989 swaps and 1,323 validations, across 4 kills and rejoins.
 
+Measured with `run-coverage.sh`'s kill run (15 minutes, master bf8602e3, every oracle), against milestone 30's seven
+runs together: `@SwapTables` 13 of 18 lines (from 1), the engine's swap executor 56 of 60 and plan node 27 of 52
+(from 0), `@LoadMultipartitionTable` 88 of 104 (from 3), `@LoadSinglepartitionTable` 50 of 76 (from 2) and
+`@ValidatePartitioning` 59 of 62 (from 3).
+
 ## The CONFIG oracle
 
 Milestone 36. Milestone 30's coverage run found the procedures that change the configuration while the database runs
@@ -1052,6 +1057,10 @@ the check's own. SQLancer connects to every node, so the reads come from all of 
 kill included. In a 90-second trial on 1 node (beside NoREC) CONFIG checked 750 changes and 77 refusals; in a 5-minute
 trial on 3 nodes with k=1 and a node killed every 60 s (beside LOAD, NoREC and TLP WHERE), 616 and 53 across 4 kills
 and rejoins.
+
+Measured with `run-coverage.sh`'s kill run (15 minutes, master bf8602e3, every oracle), against milestone 30's seven
+runs together: `@SetYamlConfiguration` 176 of 404 lines (from 10), `@GetYamlConfiguration` 73 of 155 (from 2),
+`YamlUtils` 86 of 169 (from 0) and `@UpdateDeployment` 168 of 256 (from 3).
 
 ## The PERMS oracle
 
