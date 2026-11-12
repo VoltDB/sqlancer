@@ -76,6 +76,14 @@ public final class VoltDBViewGenerator {
             List<String> names = new ArrayList<>();
             grouping = grouping.stream().filter(c -> !names.contains(c.getName()) && names.add(c.getName()))
                     .collect(Collectors.toList());
+            // ENG-30255 (fixed after 16.0.0): a join view grouped by a DECIMAL that is NULL aborts a 16.0.0 server
+            // (lab build #48's mirror); single-table views do not. So with a mirror (--mirror, normally 16.0.0) or
+            // an in-service upgrade from it, a join view does not group by a DECIMAL column
+            String mirror = globalState.getDbmsSpecificOptions().mirror;
+            if (mirror != null && !mirror.isBlank() || globalState.getDbmsSpecificOptions().upgrades) {
+                grouping = grouping.stream().filter(c -> c.getType().getType() != VoltDBDataType.DECIMAL)
+                        .collect(Collectors.toList());
+            }
         }
         List<String> outputs = outputs(globalState, grouping, all, VoltDBColumn::getFullQualifiedName);
         StringBuilder query = new StringBuilder("SELECT ").append(String.join(", ", outputs)).append(" FROM ")

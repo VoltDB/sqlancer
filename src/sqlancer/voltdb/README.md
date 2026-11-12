@@ -1044,6 +1044,12 @@ Milestone 30's coverage run found that code never ran. Such a view:
   one table, and constants, LIKE and BETWEEN in a join view's conditions leave later DDL working.
 - While `--avoid-known-bugs` is true, groups by columns with distinct names: the view is right, but its query run as a
   SELECT merges groups (ENG-30529 below).
+- While `--avoid-known-bugs` is true and DIFF's mirror or an in-service upgrade runs 16.0.0, groups by no DECIMAL
+  column: a join view grouped by a NULL DECIMAL aborts a 16.0.0 server (ENG-30255, fixed after 16.0.0; lab build #48's
+  mirror died of it). Views of one table do not.
+- While `--avoid-known-bugs` is true, an index on a table a view reads is never UNIQUE or ASSUMEUNIQUE: a unique index
+  that duplicates the primary key of a join view's source table crashes the server on the next insert (ENG-30664
+  below).
 
 While `--avoid-known-bugs` is true, the other oracles' queries never read a table that has a view: VoltDB's view
 rewriter fails to plan some of their GROUP BY and aggregate queries on such a table (ENG-30582 below).
@@ -1456,6 +1462,13 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
+The bug below was found in milestone 32's lab run (build #48).
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30664 | A materialized view over a join of T with a partitioned table; T, holding a row, gets a UNIQUE index on its primary key's column: the next INSERT into T kills the server with "Could not find Index with name I among {VOLTDB_AUTOGEN_IDX_PK_T_A}" (`persistenttable.cpp`), as if the engine kept one of the two identical indexes while the view's maintenance plan names the other. A non-unique index, an empty T, no view, a view of one table or two replicated tables do not crash. Also on 16.0.0. Found by the security run, whose server died 12 minutes in. Server crash. | An index on a table a view reads is not unique. |
+| ENG-30255 (existing, fixed after 16.0.0) | A view over a join grouped by a DECIMAL column that is NULL aborts a 16.0.0 server ("Type DECIMAL with value -1701...728 can't be cast as BIGINT", the NULL DECIMAL); master is fixed. The mirror of the kill run died of it 75 s in. | With a 16.0.0 mirror or upgrade, join views do not group by DECIMAL. |
 
 The bug below was found in milestone 31's lab run (build #46).
 

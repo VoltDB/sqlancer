@@ -24,7 +24,11 @@ public final class VoltDBIndexGenerator {
         VoltDBTable table = globalState.getSchema().getRandomTable();
         List<VoltDBColumn> columns = Randomly.nonEmptySubset(table.getColumns());
         StringBuilder sb = new StringBuilder("CREATE ");
-        if (Randomly.getBooleanWithRatherLowProbability()) {
+        // ENG-30664: a unique index that duplicates the primary key of a join view's source table crashes the server
+        // on the next insert, so while avoiding known bugs an index on a table a view reads is not unique
+        boolean viewed = globalState.getDbmsSpecificOptions().avoidKnownBugs
+                && globalState.getViewedTables().contains(table.getName());
+        if (!viewed && Randomly.getBooleanWithRatherLowProbability()) {
             boolean hasPartitionColumn = !table.isPartitioned()
                     || columns.stream().anyMatch(c -> c.getName().equals(table.getPartitionColumn()));
             if (hasPartitionColumn) {
