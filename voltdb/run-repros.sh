@@ -161,10 +161,14 @@ run_sql() {
         normalize)
     # a server that crashed can take minutes to exit (writing its crash files) after the connection is lost: on the
     # lab's Linux agents ENG-30595's server was still up 20 s after sqlcmd lost it (lab builds #42 and #43)
+    # A crash reproduction is watched for 10 s even when sqlcmd got every answer: a server can answer a statement and
+    # die in the fragments that follow it (ENG-30664 reported FIXED in lab build #49)
     alive=true
-    for _ in $(seq 1 300); do
+    local i
+    for i in $(seq 1 300); do
         sleep 1
         cluster_alive "$nodes" || { alive=false; break; }
+        [ "$bug" = crash ] && [ "$i" -lt 10 ] && continue
         echo "$output" | grep -q "was lost before a response was received" || break
     done
     # on the lab's agents a crashed server can still be writing its crash files after the 300 s above (ENG-30595,
