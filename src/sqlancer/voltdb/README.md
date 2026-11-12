@@ -167,9 +167,7 @@ checking query results through the failures:
    (`voltdb start -H`), so a restarted node 0 rejoins through another node. Until milestone 15, SQLancer connected to
    node 0 alone, and node 0 was never killed.
 2. It kills the node's server with `kill -9`, waits until its client port closes, and waits 5 seconds more for the
-   survivors to notice. From 3 seconds before the kill until then, it holds DDL (the provider's `--ddl-hold`, as
-   around a shrink): a node killed while a catalog update is in flight can wedge the MPI (ENG-30612) or crash a
-   surviving node (ENG-30663). With `-- --avoid-known-bugs false` the provider ignores the hold.
+   survivors to notice.
 3. It restarts the node with the same `voltdb start` command, which rejoins it to the running cluster: it gets its
    partitions' data back from the replicas, while the cluster keeps working.
 4. It waits until the rejoin completes ("Server completed initialization" in the restart's output), up to 600 seconds,
@@ -180,6 +178,12 @@ checking query results through the failures:
 
 When SQLancer stops, the script lets the current rejoin finish, so the run ends with every node up, and the summary
 counts the kills and rejoins. A local rejoin takes about 10 seconds.
+
+From 3 seconds before each kill until the node logs "Node rejoin completed", the script holds DDL (the provider's
+`--ddl-hold`, as around a shrink): a node killed while a catalog update is in flight can wedge the MPI (ENG-30612) or
+crash a surviving node (ENG-30663), and in lab build #49, DDL while a node rejoined was followed by both survivors
+crashing in the engine (SIGSEGV in `PersistentTable::index`), noted on ENG-30663. With `-- --avoid-known-bugs false`
+the provider ignores the hold.
 
 With `--kill-interval`, the script passes `--node-failures true` to the provider, which makes `VoltDBConnection`
 handle the errors a node failure causes:
