@@ -294,6 +294,14 @@ cluster=$results/cluster
 # a server JVM that crashes writes its error report (the native stack, and the statement and registers at the crash)
 # here rather than into the directory the script was started from, so that the results keep it (lab build #51)
 export VOLTDB_OPTS="${VOLTDB_OPTS:-} -XX:ErrorFile=$cluster/hs_err_pid%p.log"
+# a user snapshot asked for while another snapshot runs is queued and retried every USER_SNAPSHOT_RETRY_INTERVAL
+# seconds (30 by default); every SNAPSHOT restore asks for a truncation snapshot, so the next save would wait 30 s
+# (SQLANCER_USER_SNAPSHOT_RETRY overrides it; empty keeps VoltDB's default)
+user_snapshot_retry=${SQLANCER_USER_SNAPSHOT_RETRY-1}
+[ -n "$user_snapshot_retry" ] && export VOLTDB_OPTS="$VOLTDB_OPTS -DUSER_SNAPSHOT_RETRY_INTERVAL=$user_snapshot_retry"
+# the SNAPSHOT oracle's snapshots go to each node's own snapshot directory, under its voltdbroot here, where SQLancer
+# reads the files they write
+provider_args+=(--snapshot-path "$cluster")
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$results/run.log"; }
 
@@ -1214,6 +1222,7 @@ result=PASS
     grep -m1 "^TTL checks:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^LOAD checks:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^CONFIG changes checked:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^SNAPSHOT restores checked:" "$results/sqlancer/out.log" 2>/dev/null
     $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)")"
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
