@@ -984,7 +984,7 @@ checks the stream's materialized view against the same GROUP BY over the shadow 
 first STREAMS check:
 
 ```sql
-CREATE STREAM XS_DB0_ST PARTITION ON COLUMN k [EXPORT TO TARGET sqlancer] (k INTEGER NOT NULL, v BIGINT, s VARCHAR(16), f FLOAT);
+CREATE STREAM XS_DB0_ST PARTITION ON COLUMN k [EXPORT TO TARGET sqlancer] (k INTEGER NOT NULL, v BIGINT, s VARCHAR(16), f FLOAT, i BIGINT NOT NULL);
 CREATE TABLE XS_DB0_SH (...the same columns...); PARTITION TABLE XS_DB0_SH ON COLUMN k;
 CREATE VIEW XS_DB0_SV (k, s, n, sv, mn, mx) AS SELECT k, s, COUNT(*), SUM(v), MIN(f), MAX(v) FROM XS_DB0_ST GROUP BY k, s;
 ```
@@ -1006,6 +1006,27 @@ number) counts once, and the summary reports how many were exported twice. A mis
 In a 5-minute trial on 3 nodes with k=2 and 2 sites per host, beside VIEWS, NoREC, TLP WHERE, DIFF and SCHEMA, STREAMS
 compared 1,548 views and all 15,695 rows were exported. That trial used one shared `outdir` and got by; lab build #43
 did not, as below.
+
+### Other export targets (milestone 33)
+
+Milestone 30's coverage run found export the least covered area (15.9% of its lines), as only the file target ever ran.
+So `--export` adds two more targets:
+
+- **HTTP** (`sqlancer_http`, `type="http"`, endpoint `http://localhost:<port-base + 7>/%t`). The script starts
+  `voltdb/http-receiver.py` there, which appends each request (one row, its columns as form fields) to
+  `cluster/http-export.log`, copied into the results' `export/`. The provider gets `--export-target
+  sqlancer,sqlancer_http`, and a database's stream exports to one of the two by the database's number: db0 and db2 to
+  the file target, db1 and db3 to HTTP. HTTP sends the columns only, so each row carries a column `i`, numbered in the
+  run, and the count at the end adds the distinct `i` the receiver got to the file target's distinct lines.
+- **Loopback** (`sqlancer_lb`, the custom `LoopbackExportClient`), whose procedure is `XS_LB.insert`. With
+  `--loopback-target`, STREAMS also creates the table `XS_LB (d, k, v, s, f)` and, per database, a stream `XS_DB0_LS`
+  of the same columns that exports to it, and puts each row into it with the database's prefix in `d`. After each
+  check's inserts it waits, up to 60 s, until `XS_LB` holds for that prefix the shadow table's distinct rows: the rows
+  come back into the database through the export.
+
+In a 6-minute trial on 3 nodes with k=2 and 2 sites per host, beside NoREC, TLP WHERE and VIEWS, STREAMS inserted 3,400
+rows: all were exported, 1,529 of them through HTTP, and 337 loopback checks found every row in `XS_LB`. A STREAMS check
+now waits for the export, so the run makes fewer queries.
 
 The bugs below were found in milestone 29.
 
@@ -1057,6 +1078,8 @@ Milestone 30's coverage run found that code never ran. Such a view:
 - While `--avoid-known-bugs` is true, a VARBINARY column in the join is compared only with one of the same size: the
   view's maintenance scans the other table's index with the condition's values, and a value longer than a VARBINARY(n)
   column fails the change ("Type VARCHAR can't be cast as VARBINARY", ENG-12656 below; lab build #49's upgrade run).
+- While `--avoid-known-bugs` is true and nodes fail, rejoin, resize, crash or upgrade, groups by at least one column:
+  after a rejoin, a join view without GROUP BY holds its one row twice on the rejoined node (ENG-30667 below).
 - While `--avoid-known-bugs` is true, an index on a table a view reads is never UNIQUE or ASSUMEUNIQUE: a unique index
   that duplicates the primary key of a join view's source table crashes the server on the next insert (ENG-30664
   below).
@@ -1472,6 +1495,12 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
+The bug below was found in milestone 33.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30667 | After a node rejoins, a view without GROUP BY over a join of replicated tables (`SELECT COUNT(*), MIN(b.d) FROM b JOIN a ON ...`) returns its one row twice on about one read in three, through any node: the rejoined node's copy holds the row twice. A view without GROUP BY of one table stays right. Also on 16.0.0. Found by VIEWS in a local trial with export and a node killed every 60 s; a script reproduces it at every run (`voltdb/repros/ENG-30667.sh`). Wrong result. | While nodes fail, rejoin, resize, crash or upgrade, a join view groups by at least one column. |
 
 The bugs below were found in milestone 32's lab runs (builds #48 and #49).
 

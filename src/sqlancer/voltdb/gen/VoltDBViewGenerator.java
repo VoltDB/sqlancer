@@ -7,10 +7,12 @@ import java.util.Random;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import sqlancer.IgnoreMeException;
 import sqlancer.Randomly;
 import sqlancer.common.query.ExpectedErrors;
 import sqlancer.common.query.SQLQueryAdapter;
 import sqlancer.voltdb.VoltDBErrors;
+import sqlancer.voltdb.VoltDBOptions;
 import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 import sqlancer.voltdb.VoltDBSchema.VoltDBColumn;
 import sqlancer.voltdb.VoltDBSchema.VoltDBDataType;
@@ -83,6 +85,20 @@ public final class VoltDBViewGenerator {
             if (mirror != null && !mirror.isBlank() || globalState.getDbmsSpecificOptions().upgrades) {
                 grouping = grouping.stream().filter(c -> c.getType().getType() != VoltDBDataType.DECIMAL)
                         .collect(Collectors.toList());
+            }
+            // ENG-30667: after a rejoin, a join view without GROUP BY holds its one row twice on the rejoined node;
+            // so while nodes fail, rejoin, resize, crash or upgrade, a join view groups by at least one column
+            VoltDBOptions o = globalState.getDbmsSpecificOptions();
+            if (grouping.isEmpty() && (o.nodeFailures || o.resizes || o.crashes || o.upgrades)) {
+                boolean noDecimal = mirror != null && !mirror.isBlank() || o.upgrades;
+                List<VoltDBColumn> groupable = all.stream()
+                        .filter(c -> Kind.fromType(c.getType().getType()) != Kind.BOOLEAN)
+                        .filter(c -> !noDecimal || c.getType().getType() != VoltDBDataType.DECIMAL)
+                        .collect(Collectors.toList());
+                if (groupable.isEmpty()) {
+                    throw new IgnoreMeException();
+                }
+                grouping = List.of(Randomly.fromList(groupable));
             }
         }
         List<String> outputs = outputs(globalState, grouping, all, VoltDBColumn::getFullQualifiedName);

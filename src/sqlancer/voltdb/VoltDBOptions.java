@@ -53,6 +53,9 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--export-target", description = "The export target (run-sqlancer.sh --export) that the STREAMS oracle's streams export to; without it, the streams export nowhere")
     public String exportTarget;
 
+    @Parameter(names = "--loopback-target", description = "A loopback export target (run-sqlancer.sh --export) whose procedure is XS_LB.insert: the STREAMS oracle also exports each row through it into the table XS_LB, and checks the table gets the rows")
+    public String loopbackTarget;
+
     @Parameter(names = "--security", description = "Security is on (run-sqlancer.sh --security): SQLancer connects as an administrator, the provider creates the roles sqlancer_read (SQLREAD) and sqlancer_write (SQL), and the PERMS oracle runs statements as the users reader and writer, who hold them", arity = 1)
     public boolean security;
 
