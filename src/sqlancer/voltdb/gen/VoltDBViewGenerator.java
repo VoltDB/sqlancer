@@ -32,7 +32,8 @@ import sqlancer.voltdb.gen.VoltDBExpressionGenerator.Kind;
  * neither), joins at most one partitioned table to the others unless they are joined on their partitioning columns, and
  * its ON conditions compare two columns, are random predicates, or both. It has a random WHERE clause a third of the
  * time. A view of one table has a WHERE clause only when --avoid-known-bugs is false (ENG-30583, which views over joins
- * do not hit).
+ * do not hit); with --avoid-known-bugs, a view over a join has no random predicate in its ON or WHERE clauses either,
+ * only column comparisons (ENG-30673).
  */
 public final class VoltDBViewGenerator {
 
@@ -122,7 +123,10 @@ public final class VoltDBViewGenerator {
             }
             query.append(" JOIN ").append(t.getName()).append(" ON ").append(on);
         }
-        if (Randomly.fromOptions(true, false, false)) {
+        // ENG-30673: a row whose join-view maintenance fails on an expression's error (DATEADD out of range, say) is not
+        // entirely rolled back, and the next DDL crashes the server; while avoiding known bugs, a join view's ON and
+        // WHERE clauses hold only column comparisons, which cannot fail
+        if (!globalState.getDbmsSpecificOptions().avoidKnownBugs && Randomly.fromOptions(true, false, false)) {
             VoltDBExpressionGenerator gen = new VoltDBExpressionGenerator(globalState).setColumns(all);
             query.append(" WHERE ").append(VoltDBToStringVisitor.asString(gen.generateBooleanExpression()));
         }
@@ -188,9 +192,12 @@ public final class VoltDBViewGenerator {
                     : !sameType && globalState.getDbmsSpecificOptions().avoidKnownBugs ? Randomly.fromOptions("=", "<>")
                             : Randomly.fromOptions("=", "<", "<=", ">", ">=", "<>");
             comparison = pair[0].getFullQualifiedName() + " " + operator + " " + pair[1].getFullQualifiedName();
-            if (Randomly.getBoolean()) {
+            if (Randomly.getBoolean() || globalState.getDbmsSpecificOptions().avoidKnownBugs) {
                 return comparison;
             }
+        } else if (globalState.getDbmsSpecificOptions().avoidKnownBugs) {
+            // ENG-30673 (see above): no predicate that can fail
+            throw new IgnoreMeException();
         }
         VoltDBExpressionGenerator gen = new VoltDBExpressionGenerator(globalState).setColumns(joined);
         String predicate = VoltDBToStringVisitor.asString(gen.generateBooleanExpression());
