@@ -123,9 +123,9 @@ public final class VoltDBViewGenerator {
             }
             query.append(" JOIN ").append(t.getName()).append(" ON ").append(on);
         }
-        // ENG-30673: a row whose join-view maintenance fails on an expression's error (DATEADD out of range, say) is not
-        // entirely rolled back, and the next DDL crashes the server; while avoiding known bugs, a join view's ON and
-        // WHERE clauses hold only column comparisons, which cannot fail
+        // ENG-30673: a row whose join-view maintenance fails on an expression's error (DATEADD out of range, say) is
+        // not entirely rolled back, and the next DDL crashes the server; while avoiding known bugs, a join view's ON
+        // and WHERE clauses hold only column comparisons, which cannot fail
         if (!globalState.getDbmsSpecificOptions().avoidKnownBugs && Randomly.fromOptions(true, false, false)) {
             VoltDBExpressionGenerator gen = new VoltDBExpressionGenerator(globalState).setColumns(all);
             query.append(" WHERE ").append(VoltDBToStringVisitor.asString(gen.generateBooleanExpression()));
