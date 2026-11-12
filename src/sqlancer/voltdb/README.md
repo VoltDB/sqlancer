@@ -966,6 +966,12 @@ Milestone 34. Milestone 30's coverage run found the system procedures behind row
   `MAX_FREQUENCY` and an index on `ts`. Each check inserts 1 to 30 rows, each with a `v` unique in the run and a `ts`
   an hour ago (expired) or a day ahead (live), and waits up to 60 s until every expired row is gone; then every live
   row must still be there.
+- **Time to live with migration.** With `--ttl-migrate-target` (`--export` adds the loopback target `sqlancer_lbt`,
+  procedure `XS_LBT.insert`), half the TTL checks use a table `XTM_DB0 MIGRATE TO TARGET sqlancer_lbt (d, k, ts, v)`
+  with the same TTL: its expired rows are migrated, not deleted, through `MigrateRowsNT`. They must leave the table and
+  arrive in `XS_LBT`, and no live row may. Its index on `ts` is `WHERE NOT MIGRATING`: a TTL table that migrates finds
+  its expired rows only through such an index, and with an ordinary one never migrates them (`TTLManager` logs a
+  warning saying so).
 - **Migration.** A table `XM_DB0 (d, k, v, s, f) MIGRATE TO TARGET ...` with a shadow table `XM_DB0_SH`. Each check
   inserts rows into both, then runs `MIGRATE FROM XM_DB0 WHERE k < x AND NOT MIGRATING`.
   - With `--loopback-target` (`--export`), the table migrates to that target, whose procedure inserts into `XS_LB`:
@@ -978,7 +984,9 @@ A statement that fails (a node failure's, as with STREAMS) leaves the table out 
 migration checks stop for the run. At exit TTL prints how many checks of each kind it made.
 
 In a 5-minute trial on 1 node (beside NoREC and TLP WHERE) TTL made 892 TTL checks and 880 migration checks; in one on
-3 nodes with k=2 and `--export` (beside STREAMS and NoREC), 110 and 105, the migrations through the loopback target.
+3 nodes with k=2 and `--export` (beside STREAMS and NoREC), 110 and 105, the migrations through the loopback target. With
+the migrating TTL tables, a 5-minute trial on 3 nodes with k=2 and `--export` (beside NoREC) made 294 TTL checks and
+307 migration checks.
 
 ## The PERMS oracle
 

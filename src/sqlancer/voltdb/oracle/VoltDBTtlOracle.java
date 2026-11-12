@@ -59,28 +59,39 @@ public class VoltDBTtlOracle implements TestOracle<VoltDBGlobalState> {
     public void check() throws Exception {
         String db = state.getDatabaseName().toUpperCase();
         if (Randomly.getBoolean()) {
-            ttl("XT_" + db);
+            String target = state.getDbmsSpecificOptions().ttlMigrateTarget;
+            boolean migrating = target != null && !target.isBlank() && Randomly.getBoolean();
+            ttl(migrating ? "XTM_" + db : "XT_" + db, migrating ? target : null);
         } else {
             migrate("XM_" + db);
         }
     }
 
-    private void ttl(String table) throws SQLException {
+    // with migrateTarget (--ttl-migrate-target), the table migrates its expired rows to that loopback target, whose
+    // procedure inserts them into XS_LBT, instead of deleting them
+    private void ttl(String table, String migrateTarget) throws SQLException {
         if (OUT_OF_STEP.contains(table)) {
             throw new IgnoreMeException();
         }
-        ddl("CREATE TABLE " + table + " (k INTEGER NOT NULL, ts TIMESTAMP NOT NULL, v BIGINT NOT NULL)"
+        boolean migrating = migrateTarget != null;
+        String columns = " (d VARCHAR(24) NOT NULL, k INTEGER NOT NULL, ts TIMESTAMP NOT NULL, v BIGINT NOT NULL)";
+        if (migrating) {
+            ddl("CREATE TABLE XS_LBT" + columns + "; PARTITION TABLE XS_LBT ON COLUMN k");
+        }
+        ddl("CREATE TABLE " + table + (migrating ? " MIGRATE TO TARGET " + migrateTarget : "") + columns
                 + " USING TTL 2 SECONDS ON COLUMN ts BATCH_SIZE " + Randomly.fromOptions(1, 10, 1000)
                 + " MAX_FREQUENCY " + Randomly.fromOptions(1, 10, 100) + "; PARTITION TABLE " + table + " ON COLUMN k");
-        ddl("CREATE INDEX " + table + "_TS ON " + table + " (ts)");
+        // a TTL table that migrates finds its expired rows through an index WHERE NOT MIGRATING; with an ordinary one
+        // it never migrates them
+        ddl("CREATE INDEX " + table + "_TS ON " + table + " (ts)" + (migrating ? " WHERE NOT MIGRATING" : ""));
         List<Long> expired = new ArrayList<>();
         List<Long> live = new ArrayList<>();
         for (int i = (int) Randomly.getNotCachedInteger(1, 30); i > 0; i--) {
             long v = IDS.incrementAndGet();
             boolean expires = Randomly.getBoolean();
             String ts = expires ? "DATEADD(HOUR, -1, NOW)" : "DATEADD(DAY, 1, NOW)";
-            write(table, "INSERT INTO " + table + " VALUES (" + Randomly.getNotCachedInteger(0, 50) + ", " + ts + ", "
-                    + v + ")");
+            write(table, "INSERT INTO " + table + " VALUES ('" + table + "', " + Randomly.getNotCachedInteger(0, 50)
+                    + ", " + ts + ", " + v + ")");
             (expires ? expired : live).add(v);
         }
         long deadline = System.currentTimeMillis() + WAIT_MILLIS;
@@ -95,6 +106,34 @@ public class VoltDBTtlOracle implements TestOracle<VoltDBGlobalState> {
         }
         Set<Long> remaining = left;
         TTL_CHECKED.incrementAndGet();
+        if (migrating) {
+            // the expired rows must have arrived in XS_LBT, and no live one
+            Set<Long> moved;
+            while (true) {
+                moved = ids("SELECT v FROM XS_LBT WHERE d = '" + table + "' AND v >= " + min(expired, live));
+                if (moved.containsAll(expired) || System.currentTimeMillis() >= deadline) {
+                    break;
+                }
+                sleep();
+            }
+            List<Long> missing = new ArrayList<>();
+            for (long v : expired) {
+                if (!moved.contains(v)) {
+                    missing.add(v);
+                }
+            }
+            List<Long> early = new ArrayList<>();
+            for (long v : live) {
+                if (moved.contains(v)) {
+                    early.add(v);
+                }
+            }
+            if (!missing.isEmpty() || !early.isEmpty()) {
+                throw new AssertionError("TTL table " + table + " MIGRATE TO TARGET " + migrateTarget
+                        + ": expired rows " + "that never reached XS_LBT within " + WAIT_MILLIS / 1000 + " s, by v: "
+                        + missing + "; live rows that did: " + early);
+            }
+        }
         List<Long> notExpired = new ArrayList<>();
         expired.stream().filter(remaining::contains).forEach(notExpired::add);
         List<Long> lost = new ArrayList<>();
