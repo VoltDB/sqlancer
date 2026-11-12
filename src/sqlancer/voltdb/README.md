@@ -988,6 +988,10 @@ In a 5-minute trial on 1 node (beside NoREC and TLP WHERE) TTL made 892 TTL chec
 the migrating TTL tables, a 5-minute trial on 3 nodes with k=2 and `--export` (beside NoREC) made 294 TTL checks and
 307 migration checks.
 
+Measured with `run-coverage.sh`'s export run (20 minutes, master bf8602e3, every oracle), against milestone 30's seven
+runs together: `TTLManager` 107 of 132 lines (from 25), `LowImpactDeleteNT` 77 of 108 (from 2), `MigrateRowsNT` 72 of
+109 (from 2) and `MigrateRowsBase` 76 of 108 (from 4).
+
 ## The PERMS oracle
 
 With `--security`, the deployment enables security with three users, `sqlancer` (administrator, whom SQLancer and
