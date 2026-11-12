@@ -28,6 +28,7 @@ import sqlancer.voltdb.oracle.VoltDBTLPOracle;
 import sqlancer.voltdb.oracle.VoltDBTtlOracle;
 import sqlancer.voltdb.oracle.VoltDBViewOracle;
 import sqlancer.voltdb.oracle.VoltDBWindowOracle;
+import sqlancer.voltdb.oracle.VoltDBXdcrConflictOracle;
 import sqlancer.voltdb.oracle.VoltDBXdcrOracle;
 
 public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
@@ -206,6 +207,16 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBSnapshotOracle(globalState);
+        }
+    },
+    /**
+     * XDCR conflicts (milestone 38): the same keys written through both clusters at once; where the clusters still
+     * differ once replication settles, XDCR's conflict log must report the key as diverged (--cluster-dir).
+     */
+    XCONFLICT {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBXdcrConflictOracle(globalState);
         }
     },
 

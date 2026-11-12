@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 37.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 38.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -48,7 +48,9 @@ Since milestone 34 the TTL oracle checks rows VoltDB removes by itself, time to 
 `@SwapTables`, and `@ValidatePartitioning` after each; see [The LOAD and SWAP oracles](#the-load-and-swap-oracles).
 Since milestone 36 the CONFIG oracle changes the configuration while the database runs; see
 [The CONFIG oracle](#the-config-oracle). Since milestone 37 the SNAPSHOT oracle saves and restores a table by
-snapshot; see [The SNAPSHOT oracle](#the-snapshot-oracle).
+snapshot; see [The SNAPSHOT oracle](#the-snapshot-oracle). Since milestone 38 the XCONFLICT oracle makes XDCR
+conflicts on purpose and checks that every divergence they leave is reported; see
+[The XCONFLICT oracle](#the-xconflict-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -458,7 +460,7 @@ the kit's runtime JDK and makes seven runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-seven (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP, CONFIG, SNAPSHOT; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-eight (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP, CONFIG, SNAPSHOT, XCONFLICT; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
 | `sqlancer-1n-k0-security` | 1 node, 8 sites per host, security on (see [The PERMS oracle](#the-perms-oracle)); `sqlancer-1n-k0` until milestone 28 | the same | 45 minutes |
 | `sqlancer-3n-k2-export-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all; the streams export (see [The STREAMS oracle](#the-streams-oracle)); `sqlancer-3n-k2-s2` until milestone 29 | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
@@ -1102,6 +1104,27 @@ How the oracle fits VoltDB's snapshot handling:
   `--avoid-known-bugs` is true no DDL of SQLancer runs during a restore: every connection's DDL holds a lock shared
   (`VoltDBConnection`), and a restore holds it exclusive.
 
+## The XCONFLICT oracle
+
+Milestone 38. The XDCR oracle never makes a conflict: each database writes through one cluster only, and any conflict
+XDCR logs fails the run. So milestone 30's coverage run found XDCR's conflict handling (`DRConflictManagerImpl`, 7 of
+190 lines) and much of the replication of multi-partition writes (`DRConsumerMpCoordinatorImpl`, 255 of 949)
+unexercised. In an XDCR run (`--xdcr`), each XCONFLICT check:
+
+1. uses a DR table of its own, `XCP_DB0` (partitioned on `k`) or `XCR_DB0` (replicated), `(k, v, n)`, created on
+   both clusters; if the clusters do not hold the same rows (a divergence an earlier check left), it empties the table
+   through both first;
+2. writes the same few keys through both clusters at once, alternating, without waiting for replication: inserts,
+   upserts and updates by key, and updates by value (multi-partition on the partitioned table); deletes by key and by
+   value too, but only while `--avoid-known-bugs` is false (ENG-30679 below);
+3. waits up to 60 s for the clusters to agree. VoltDB resolves most conflicts so that they do. Where they still differ
+   on a key, XDCR's conflict log (its `xdcr_conflicts` export files under each node's voltdbroot, which the oracle
+   finds through `--cluster-dir`) must have a row for that table and key with `DIVERGENCE` `D`.
+
+`run-sqlancer.sh` does not count conflicts on these tables against the run. At exit the oracle prints how many checks
+converged and how many differing keys were reported as diverged. In a 5-minute trial on two 3-node clusters (k=1,
+4 sites per host), beside XDCR and NoREC: 719 checks, 716 converged.
+
 ## The PERMS oracle
 
 With `--security`, the deployment enables security with three users, `sqlancer` (administrator, whom SQLancer and
@@ -1650,6 +1673,12 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
+The bug below was found in milestone 38.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30679 | XDCR silently diverges when a DELETE of a key on one cluster races a write of it (insert, update, upsert) on the other: e.g. `A: INSERT (0, 'a0', 3)`, `B: UPSERT (0, 'b1', 2)`, `B: DELETE k = 0` (twice), sent without waiting for replication, leave cluster A without the row and cluster B with A's, and every conflict in the log says consistent (`C`). Other forms leave each cluster with the other's value. 16.0.0 too. Found by XCONFLICT; `repros/ENG-30679.sh` starts an XDCR pair and replays the sequence with `repros/xdcr/XdcrRepro.java`. Wrong result, Blocker for V16.1.0. | While `--avoid-known-bugs` is true, XCONFLICT's checks delete nothing |
 
 The bugs below were found in milestone 37.
 
