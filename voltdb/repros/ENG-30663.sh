@@ -1,17 +1,18 @@
 #!/bin/bash
 : <<'HEADER'
 -- ticket: ENG-30663
--- manual: a race: reproduced in 1 of 3 local runs (at the 40th kill); run it with --only ENG-30663, more than once
+-- manual: a race: reproduced in 1 of 2 local runs (at the 2nd kill), and 1 of 3 without the join view's DML; run it with --only ENG-30663, more than once
 -- summary: A surviving node crashes when another node is killed during a catalog update ("@UpdateCore's prepared catalog is null", or an EE abort in getStats())
 HEADER
-# The runner's env: VOLTDB_HOME, PORT_BASE, WORKDIR. 3 nodes, k=1, 8 sites per host. Four clients each loop CREATE TABLE,
-# CREATE INDEX and DROP TABLE on their own tables, while a random node is killed with kill -9 every KILL_EVERY seconds
-# and rejoined, up to KILLS times. Exit 0 if a surviving node crashes (the bug: "prepared catalog is null", or the EE's
+# The runner's env: VOLTDB_HOME, PORT_BASE, WORKDIR. 3 nodes, k=1, 8 sites per host. A view over a join of a
+# replicated and a partitioned table, with two clients inserting into and deleting from both; beside them, DDL clients
+# each loop CREATE TABLE, CREATE INDEX and DROP TABLE on their own tables, while a random node is killed with kill -9 every KILL_EVERY seconds
+# and rejoined, up to KILLS times. Exit 0 if a node crashes, a survivor or the one that just rejoined (the bug: "prepared catalog is null", or the EE's
 # "getStats() called with ... an invalid locator"), 3 if the cluster wedges another way (a rejoin that does not finish
 # in 600 s, as ENG-30612), 1 if every kill and rejoin goes through.
 set -u
 V=$VOLTDB_HOME; W=$WORKDIR/killddl; P=$PORT_BASE
-KILLS=${KILLS:-80}; KILL_EVERY=${KILL_EVERY:-8}
+KILLS=${KILLS:-60}; KILL_EVERY=${KILL_EVERY:-8}
 rm -rf "$W"; mkdir -p "$W"
 port() { echo $((P + 10 * $1 + $2)); }
 hosts="localhost:$(port 0 2),localhost:$(port 1 2),localhost:$(port 2 2)"
@@ -52,9 +53,20 @@ ddl() {
             "$V/bin/sqlcmd" --servers=localhost --port=$(port $((c % 3)) 0) --stop-on-error=false >/dev/null 2>&1
     done
 }
-for c in $(seq 0 $((${CLIENTS:-6} - 1))); do ddl $c & done
+printf 'CREATE TABLE jr (a VARBINARY(16) NOT NULL, b VARCHAR(16) NOT NULL, PRIMARY KEY (a, b));\nCREATE TABLE jp (k BIGINT NOT NULL, a VARBINARY(16) NOT NULL, PRIMARY KEY (a, k));\nPARTITION TABLE jp ON COLUMN k;\nCREATE VIEW jv (n, m) AS SELECT COUNT(*), COUNT(jp.k) FROM jp JOIN jr ON jp.a >= jr.a;\nCREATE VIEW jv1 (b, n) AS SELECT b, COUNT(*) FROM jr GROUP BY b;\n' | "$V/bin/sqlcmd" --port=$(port 0 0) >/dev/null 2>&1
+dml() {
+    local c=$1 k=0
+    while [ ! -e "$W/stop" ]; do
+        k=$((k + 1))
+        { for j in 1 2 3 4 5; do printf "INSERT INTO jr VALUES (x'%02X', 'b%s');\nINSERT INTO jp VALUES (%s, x'%02X');\n" $(((k * 5 + j) % 256)) $((k % 7)) $((k * 5 + j)) $(((k + j) % 256)); done
+          printf "DELETE FROM jr WHERE a <> x'AE' AND b LIKE 'b%s';\nDELETE FROM jp WHERE k %% 3 = %s;\n" $((k % 7)) $((k % 3)); } |
+            "$V/bin/sqlcmd" --servers=localhost --port=$(port $((c % 3)) 0) --stop-on-error=false >/dev/null 2>&1
+    done
+}
+for c in 0 1; do dml $c & done
+for c in $(seq 0 $((${CLIENTS:-4} - 1))); do ddl $c & done
 # a survivor's crash: either signature, in its volt.log or its start log (the EE's abort is only in the latter)
-SIG="prepared catalog is null|invalid locator|libc\+\+abi|encountered an unexpected error and will die"
+SIG="prepared catalog is null|invalid locator|libc\+\+abi|encountered an unexpected error and will die|A fatal error has been detected|Could not find Index"
 crashed() { grep -lE "$SIG" "$W"/n*/voltdbroot/log/volt.log "$W"/start*.log 2>/dev/null | head -1; }
 for n in $(seq 1 "$KILLS"); do
     sleep "$KILL_EVERY"
