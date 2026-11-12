@@ -180,7 +180,7 @@ public class VoltDBSetOperationOracle implements TestOracle<VoltDBGlobalState> {
     private List<VoltDBTable> candidateTables() {
         List<VoltDBTable> tables = new ArrayList<>(state.getSchema().getDatabaseTables());
         if (state.getDbmsSpecificOptions().avoidKnownBugs) {
-            Set<String> viewed = state.getViews().values().stream().map(v -> v[0]).collect(Collectors.toSet());
+            Set<String> viewed = state.getViewedTables();
             tables.removeIf(t -> viewed.contains(t.getName()));
         }
         if (tables.isEmpty() || tables.stream().allMatch(VoltDBTable::isPartitioned)) {
