@@ -1106,9 +1106,12 @@ Milestone 30's coverage run found that code never ran. Such a view:
   nothing else: VoltDB keeps a view of partitioned tables only when every joined row is in one partition.
 - Joins a replicated table on a comparison of two columns of the same kind (=, <, <=, >, >= or <>; random rows rarely
   have equal values, and most comparisons let many pairs of rows through), a random predicate over the tables
-  joined so far, or both.
-- Has a random WHERE clause a third of the time, also while `--avoid-known-bugs` is true: ENG-30583 is about views of
-  one table, and constants, LIKE and BETWEEN in a join view's conditions leave later DDL working.
+  joined so far, or both; while `--avoid-known-bugs` is true, on the comparison alone (ENG-30673 below).
+- Has a random WHERE clause a third of the time while `--avoid-known-bugs` is false. ENG-30583 is about views of one
+  table, and constants, LIKE and BETWEEN in a join view's conditions leave later DDL working; but a random predicate
+  can fail on a row (DATEADD out of range, say), and a row whose join-view maintenance fails is not entirely rolled
+  back: the next DDL crashes the server (ENG-30673 below; lab build #51's export run, where the 16.0.0 mirror died of
+  it too). So while `--avoid-known-bugs` is true, a join view's ON and WHERE clauses hold only column comparisons.
 - While `--avoid-known-bugs` is true, groups by columns with distinct names: the view is right, but its query run as a
   SELECT merges groups (ENG-30529 below).
 - While `--avoid-known-bugs` is true and DIFF's mirror or an in-service upgrade runs 16.0.0, groups by no DECIMAL
@@ -1538,10 +1541,11 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
 
-The bug below was found in milestone 33.
+The bugs below were found in milestone 33.
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
+| ENG-30673 | A view over a join whose ON clause can fail on a row (`ON DATEADD(QUARTER, t0.a, t1.d) IS NOT NULL`): an INSERT of a row out of DATEADD's range fails, as it should, but the row stays visible to the view's maintenance (a later UPDATE of the other table fails on it), and the next DDL, whatever it is, aborts the server while rebuilding the tables ("getStats() called with ... an invalid locator"). 16.0.0 too. Lab build #51's export run: all three nodes and the mirror died at one catalog update. `repros/ENG-30673.sql`. | While `--avoid-known-bugs` is true, a join view's ON and WHERE clauses hold only column comparisons |
 | ENG-30667 | After a node rejoins, a view without GROUP BY over a join of replicated tables (`SELECT COUNT(*), MIN(b.d) FROM b JOIN a ON ...`) returns its one row twice on about one read in three, through any node: the rejoined node's copy holds the row twice. A view without GROUP BY of one table stays right. Also on 16.0.0. Found by VIEWS in a local trial with export and a node killed every 60 s; a script reproduces it at every run (`voltdb/repros/ENG-30667.sh`). Wrong result. | While nodes fail, rejoin, resize, crash or upgrade, a join view groups by at least one column. |
 
 The bugs below were found in milestone 32's lab runs (builds #48 and #49).
