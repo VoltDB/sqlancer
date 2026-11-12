@@ -51,7 +51,8 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
                      "writer" (role sqlancer_write, SQL). Not with --kill-interval, --resize-interval,
                      --crash-interval, --xdcr or --upgrade-from.
   --export           add a file export target ("sqlancer", CSV into each node's voltdbroot/sqlancer_export) for the
-                     STREAMS oracle's streams, and check at the end, after @Quiesce, that it wrote every row they got
+                     STREAMS oracle's streams, and check at the end, after @Quiesce, that it wrote every row they got;
+                     and a loopback target ("sqlancer_lb", into the table XS_LB) whose rows STREAMS checks as it goes
   --keep-cluster     leave the cluster running and its data in place after the run
   --mirror-voltdb DIR  also start one node of this other VoltDB kit (normally the last release) and run
                      the provider with --mirror: every change is repeated on it, and the DIFF oracle
@@ -184,7 +185,7 @@ if $security; then
     provider_args=(--security true ${provider_args[@]+"${provider_args[@]}"})
 fi
 if $export; then
-    provider_args=(--export-target sqlancer ${provider_args[@]+"${provider_args[@]}"})
+    provider_args=(--export-target sqlancer,sqlancer_http --loopback-target sqlancer_lb ${provider_args[@]+"${provider_args[@]}"})
 fi
 # the administrator's credentials for voltadmin and sqlancer, with --security
 admin_creds=()
@@ -290,6 +291,9 @@ if [ "$resize_interval" -gt 0 ] || [ "$kill_interval" -gt 0 ]; then
     provider_args+=(--ddl-hold "$results/ddl.hold")
 fi
 cluster=$results/cluster
+# a server JVM that crashes writes its error report (the native stack, and the statement and registers at the crash)
+# here rather than into the directory the script was started from, so that the results keep it (lab build #51)
+export VOLTDB_OPTS="${VOLTDB_OPTS:-} -XX:ErrorFile=$cluster/hs_err_pid%p.log"
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$results/run.log"; }
 
@@ -455,6 +459,13 @@ if $export; then
             <property name="outdir">sqlancer_export</property>
             <property name="period">1</property>
         </configuration>
+        <configuration target="sqlancer_http" enabled="true" type="http">
+            <property name="endpoint">http://localhost:'"$(port 0 7)"'/%t</property>
+        </configuration>
+        <configuration target="sqlancer_lb" enabled="true" type="custom"
+                exportconnectorclass="org.voltdb.exportclient.loopback.LoopbackExportClient">
+            <property name="procedure">XS_LB.insert</property>
+        </configuration>
     </export>'
 fi
 cat >"$cluster/deployment.xml" <<EOF
@@ -465,6 +476,12 @@ cat >"$cluster/deployment.xml" <<EOF
 </deployment>
 EOF
 
+# with --export, the HTTP target's receiver (voltdb/http-receiver.py): one line per request, under $cluster so that
+# stopping the cluster stops it too
+if $export; then
+    python3 -I "$repo_dir/voltdb/http-receiver.py" "$(port 0 7)" "$cluster/http-export.log" \
+        >"$cluster/http-receiver.out" 2>&1 &
+fi
 log "Starting $nodes node(s), k=$kfactor, $sites sites per host"
 for ((i = 0; i < nodes; i++)); do
     node=$cluster/node$i
@@ -1102,6 +1119,8 @@ if $xdcr; then
             "$cluster/xdcr$i/voltdbroot/log"
     done
 fi
+# the JVM error reports of servers that crashed; each names its node's directory in its command line
+save_logs "$results/servers" "$cluster"/hs_err_pid*.log
 if [ -n "$mirror_home" ]; then
     save_logs "$results/servers/mirror" "$cluster/start-mirror.log" "$cluster/init-mirror.log" \
         "$cluster/mirror/voltdbroot/log"
@@ -1114,11 +1133,17 @@ if $export; then
         mkdir -p "$results/export/node$i"
         cp "$cluster/node$i/voltdbroot/sqlancer_export"/*.csv "$results/export/node$i/" 2>/dev/null
     done
+    cp "$cluster/http-export.log" "$results/export/" 2>/dev/null
     total=$(cat "$cluster"/node*/voltdbroot/sqlancer_export/*.csv 2>/dev/null | wc -l | tr -d ' ')
     exported=$(cat "$cluster"/node*/voltdbroot/sqlancer_export/*.csv 2>/dev/null | sort -u | wc -l | tr -d ' ')
+    # the HTTP target's rows: each request is one row, its columns as form fields; the row's I is unique in the run
+    http_total=$(grep -c "&I=[0-9]*" "$cluster/http-export.log" 2>/dev/null)
+    http_rows=$(grep -o "&I=[0-9]*" "$cluster/http-export.log" 2>/dev/null | sort -u | wc -l | tr -d ' ')
+    total=$((total + ${http_total:-0}))
+    exported=$((exported + ${http_rows:-0}))
     duplicates=$((total - exported))
     [ "$exported" -eq "$inserted" ] || export_failed=true
-    log "Export: $exported rows exported ($duplicates exported twice), $inserted inserted into the streams$($export_failed && echo ", MISMATCH")"
+    log "Export: $exported rows exported (${http_rows:-0} through HTTP; $duplicates exported twice), $inserted inserted into the streams$($export_failed && echo ", MISMATCH")"
 fi
 # XDCR's conflict log: each database writes through one cluster only, so XDCR has nothing to resolve, and any
 # conflict it logged fails the run
@@ -1182,7 +1207,7 @@ result=PASS
     grep -m1 "^PLANS compared different plans:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^PERMS checked:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^STREAMS inserted rows:" "$results/sqlancer/out.log" 2>/dev/null
-    $export && echo "export: $exported rows exported ($duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)")"
+    $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)")"
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
     [ "$crash_interval" -gt 0 ] && echo "crashes: $crashes crashes, $recoveries recoveries$($crash_failed && echo ", a recovery FAILED (crash.log)")"

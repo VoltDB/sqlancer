@@ -176,7 +176,7 @@ if ! $report_only; then
         case $run in
         security) args=(--nodes 1 --kfactor 0 --sites 8 --security) ;;
         kill) args=(--nodes 3 --kfactor 1 --sites 8 --kill-interval 300) ;;
-        export) args=(--nodes 3 --kfactor 2 --sites 2 --export) ;;
+        export) args=(--nodes 3 --kfactor 2 --sites 2 --export --kill-interval 300) ;;
         resize) args=(--nodes 3 --kfactor 1 --sites 8 --resize-interval 120) ;;
         xdcr) args=(--nodes 3 --kfactor 1 --sites 4 --xdcr) ;;
         crash) args=(--nodes 3 --kfactor 1 --sites 8 --crash-interval 600) ;;
