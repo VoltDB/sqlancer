@@ -291,6 +291,9 @@ if [ "$resize_interval" -gt 0 ] || [ "$kill_interval" -gt 0 ]; then
     provider_args+=(--ddl-hold "$results/ddl.hold")
 fi
 cluster=$results/cluster
+# a server JVM that crashes writes its error report (the native stack, and the statement and registers at the crash)
+# here rather than into the directory the script was started from, so that the results keep it (lab build #51)
+export VOLTDB_OPTS="${VOLTDB_OPTS:-} -XX:ErrorFile=$cluster/hs_err_pid%p.log"
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$results/run.log"; }
 
@@ -1116,6 +1119,8 @@ if $xdcr; then
             "$cluster/xdcr$i/voltdbroot/log"
     done
 fi
+# the JVM error reports of servers that crashed; each names its node's directory in its command line
+save_logs "$results/servers" "$cluster"/hs_err_pid*.log
 if [ -n "$mirror_home" ]; then
     save_logs "$results/servers/mirror" "$cluster/start-mirror.log" "$cluster/init-mirror.log" \
         "$cluster/mirror/voltdbroot/log"
