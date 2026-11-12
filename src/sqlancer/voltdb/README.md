@@ -1028,6 +1028,13 @@ In a 6-minute trial on 3 nodes with k=2 and 2 sites per host, beside NoREC, TLP 
 rows: all were exported, 1,529 of them through HTTP, and 337 loopback checks found every row in `XS_LB`. A STREAMS check
 now waits for the export, so the run makes fewer queries.
 
+The nightly job's k=2 export run also kills a node every 300 s (pro's run shape `3:2:exp300:2`), and so does
+`run-coverage.sh`'s export run. Measured with it (20 minutes, master bf8602e3), export and streams went from 15.9% of
+its lines (milestone 30's seven runs together) to 25.8% from the export run alone, 1,138 of 4,418; its branches from
+7.7% to 16.9%. The HTTP target's classes went from 0 to 166 lines and the loopback target's from 0 to 150. The export
+gap sessions (`E3ServerGapSession`, `E3ClientGapSession`, 237 lines) still never run: with k=2 every replica has every
+row, and a rejoined node never had to fill a gap.
+
 The bugs below were found in milestone 29.
 
 | Ticket | Issue | Workaround |
