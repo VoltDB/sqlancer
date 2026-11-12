@@ -336,8 +336,94 @@ public final class VoltDBExpressionEvaluator {
         case RTRIM:
             return args[0] == null ? null : trimSpaces((String) args[0], false, true);
         default:
-            throw new AssertionError(f.getFunc());
+            return function31(f.getFunc(), args);
         }
+    }
+
+    // the milestone 31 functions the evaluator models, as VoltDB's engine computes them (src/ee/expressions/
+    // stringfunctions.h and bitwisefunctions.h); any NULL argument makes the result NULL
+    private static Object function31(VoltDBFunction.VoltDBFunctionName name, Object... args) {
+        for (Object arg : args) {
+            if (arg == null) {
+                return null;
+            }
+        }
+        switch (name) {
+        case LEFT:
+        case RIGHT:
+            String s = (String) args[0];
+            int n = s.codePointCount(0, s.length());
+            long count = Math.min((Long) args[1], n);
+            return name == VoltDBFunction.VoltDBFunctionName.LEFT ? s.substring(0, s.offsetByCodePoints(0, (int) count))
+                    : s.substring(s.offsetByCodePoints(0, n - (int) count));
+        case REPEAT:
+            return ((String) args[0]).repeat((int) (long) (Long) args[1]);
+        case REPLACE:
+            if (((String) args[1]).isEmpty()) {
+                throw new Unpredictable("REPLACE of the empty string");
+            }
+            return ((String) args[0]).replace((String) args[1], (String) args[2]);
+        case SPACE:
+            return " ".repeat((int) (long) (Long) args[0]);
+        case CONCAT:
+            StringBuilder sb = new StringBuilder();
+            for (Object arg : args) {
+                sb.append((String) arg);
+            }
+            if (sb.length() == 0) {
+                throw new Unpredictable("ENG-30546: empty concatenation");
+            }
+            return sb.toString();
+        case HEX:
+            return Long.toHexString((Long) args[0]).toUpperCase(Locale.ROOT);
+        case BIN:
+            return Long.toBinaryString((Long) args[0]);
+        case OCTET_LENGTH:
+            return (long) ((String) args[0]).getBytes(StandardCharsets.UTF_8).length;
+        case POSITION:
+            String haystack = (String) args[1];
+            int at = haystack.indexOf((String) args[0]);
+            return at < 0 ? 0L : (long) haystack.codePointCount(0, at) + 1;
+        case BITAND:
+            return bigint((Long) args[0] & (Long) args[1]);
+        case BITOR:
+            return bigint((Long) args[0] | (Long) args[1]);
+        case BITXOR:
+            return bigint((Long) args[0] ^ (Long) args[1]);
+        case BITNOT:
+            return bigint(~(Long) args[0]);
+        case BIT_SHIFT_LEFT:
+        case BIT_SHIFT_RIGHT:
+            long shifts = (Long) args[1];
+            if (shifts < 0) {
+                throw new Unpredictable("negative shift");
+            }
+            if (shifts > 63) {
+                return 0L;
+            }
+            return bigint(name == VoltDBFunction.VoltDBFunctionName.BIT_SHIFT_LEFT ? (Long) args[0] << shifts
+                    : (Long) args[0] >>> shifts);
+        case SIGN:
+            if (args[0] instanceof Long) {
+                return (long) Long.signum((Long) args[0]);
+            }
+            if (args[0] instanceof BigDecimal) {
+                return (long) ((BigDecimal) args[0]).signum();
+            }
+            return (long) Math.signum((Double) args[0]);
+        case CAST_BIGINT:
+            return args[0];
+        default:
+            throw new AssertionError(name);
+        }
+    }
+
+    // a bitwise result that would be BIGINT's minimum, VoltDB's NULL, is an error
+    private static Long bigint(long v) {
+        if (v == Long.MIN_VALUE) {
+            throw new Unpredictable("bitwise result is VoltDB's NULL");
+        }
+        return v;
     }
 
     private static Object round(Object v, RoundingMode mode) {
@@ -438,7 +524,22 @@ public final class VoltDBExpressionEvaluator {
             case WEEKDAY:
             case SINCE_EPOCH:
             case ARRAY_LENGTH:
+            case OCTET_LENGTH:
+            case POSITION:
+            case REGEXP_POSITION:
+            case BITAND:
+            case BITOR:
+            case BITXOR:
+            case BITNOT:
+            case BIT_SHIFT_LEFT:
+            case BIT_SHIFT_RIGHT:
+            case SIGN:
+            case DATEDIFF:
+            case CAST_BIGINT:
                 return Long.class;
+            case ROUND:
+            case CAST_DECIMAL:
+                return BigDecimal.class;
             case SQRT:
             case EXP:
             case LN:

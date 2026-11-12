@@ -296,4 +296,50 @@ public class TestVoltDBExpressionEvaluator {
         assertEquals(dec("3.5"),
                 eval(op(new VoltDBCase(List.of(yes), List.of(c("7")), c("1.0")), VoltDBBinaryOperator.DIVIDE, c("2"))));
     }
+
+    // milestone 31: the values VoltDB 16.1 returned for these functions over columns holding the same values
+    @Test
+    public void testStringFunctions31() {
+        VoltDBExpression s = c("'héllo wörld'");
+        assertEquals("hél", eval(f(VoltDBFunctionName.LEFT, s, c("3"))));
+        assertEquals("örld", eval(f(VoltDBFunctionName.RIGHT, s, c("4"))));
+        assertEquals("héllo wörld", eval(f(VoltDBFunctionName.RIGHT, s, c("40"))));
+        assertEquals("", eval(f(VoltDBFunctionName.LEFT, s, c("0"))));
+        assertEquals("héllo wörldhéllo wörld", eval(f(VoltDBFunctionName.REPEAT, s, c("2"))));
+        assertEquals("héLLLLo wörLLd", eval(f(VoltDBFunctionName.REPLACE, s, c("'l'"), c("'LL'"))));
+        assertThrows(Unpredictable.class, () -> eval(f(VoltDBFunctionName.REPLACE, s, c("''"), c("'x'"))));
+        assertEquals("   ", eval(f(VoltDBFunctionName.SPACE, c("3"))));
+        assertEquals("héllo wörld-héllo wörld", eval(f(VoltDBFunctionName.CONCAT, s, c("'-'"), s)));
+        // ENG-30546: VoltDB returns NULL for an empty concatenation
+        assertThrows(Unpredictable.class, () -> eval(f(VoltDBFunctionName.CONCAT, c("''"), c("''"))));
+        assertNull(eval(f(VoltDBFunctionName.CONCAT, s, c("CAST(NULL AS VARCHAR)"))));
+        assertEquals(13L, eval(f(VoltDBFunctionName.OCTET_LENGTH, s)));
+        assertEquals(8L, eval(f(VoltDBFunctionName.POSITION, c("'ö'"), s)));
+        assertEquals(0L, eval(f(VoltDBFunctionName.POSITION, c("'z'"), s)));
+        assertEquals(1L, eval(f(VoltDBFunctionName.POSITION, c("''"), s)));
+    }
+
+    @Test
+    public void testBitwiseFunctions31() {
+        VoltDBExpression twelve = f(VoltDBFunctionName.CAST_BIGINT, c("12"));
+        VoltDBExpression minus7 = f(VoltDBFunctionName.CAST_BIGINT, c("(-7)"));
+        assertEquals(8L, eval(f(VoltDBFunctionName.BITAND, twelve, c("10"))));
+        assertEquals(-7L, eval(f(VoltDBFunctionName.BITOR, minus7, c("1"))));
+        assertEquals(6L, eval(f(VoltDBFunctionName.BITXOR, f(VoltDBFunctionName.CAST_BIGINT, c("3")), c("5"))));
+        assertEquals(-13L, eval(f(VoltDBFunctionName.BITNOT, twelve)));
+        assertEquals(48L, eval(f(VoltDBFunctionName.BIT_SHIFT_LEFT, twelve, c("2"))));
+        // a logical shift: the sign bit moves right
+        assertEquals(15L, eval(f(VoltDBFunctionName.BIT_SHIFT_RIGHT, minus7, c("60"))));
+        assertEquals(0L, eval(f(VoltDBFunctionName.BIT_SHIFT_RIGHT, twelve, c("64"))));
+        assertEquals("FFFFFFFFFFFFFFF9", eval(f(VoltDBFunctionName.HEX, minus7)));
+        assertEquals("C", eval(f(VoltDBFunctionName.HEX, twelve)));
+        assertEquals("1100", eval(f(VoltDBFunctionName.BIN, twelve)));
+        // a result of BIGINT's minimum, VoltDB's NULL, is an error
+        assertThrows(Unpredictable.class,
+                () -> eval(f(VoltDBFunctionName.BIT_SHIFT_LEFT, f(VoltDBFunctionName.CAST_BIGINT, c("1")), c("63"))));
+        assertNull(eval(f(VoltDBFunctionName.BITAND, twelve, c("CAST(NULL AS BIGINT)"))));
+        assertEquals(-1L, eval(f(VoltDBFunctionName.SIGN, c("(-7)"))));
+        assertEquals(1L, eval(f(VoltDBFunctionName.SIGN, c("2.5"))));
+        assertEquals(-1L, eval(f(VoltDBFunctionName.SIGN, c("(-1.5E0)"))));
+    }
 }

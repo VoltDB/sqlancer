@@ -177,6 +177,12 @@ checking query results through the failures:
 When SQLancer stops, the script lets the current rejoin finish, so the run ends with every node up, and the summary
 counts the kills and rejoins. A local rejoin takes about 10 seconds.
 
+From 3 seconds before each kill until the node logs "Node rejoin completed", the script holds DDL (the provider's
+`--ddl-hold`, as around a shrink): a node killed while a catalog update is in flight can wedge the MPI (ENG-30612) or
+crash a surviving node (ENG-30663), and in lab build #49, DDL while a node rejoined was followed by both survivors
+crashing in the engine (SIGSEGV in `PersistentTable::index`), noted on ENG-30663. With `-- --avoid-known-bugs false`
+the provider ignores the hold.
+
 With `--kill-interval`, the script passes `--node-failures true` to the provider, which makes `VoltDBConnection`
 handle the errors a node failure causes:
 
@@ -293,8 +299,10 @@ The script passes the provider `--xdcr` with the second cluster's client ports, 
    own first. Rows the old database wrote just before, still on their way, would then reach a table that cluster no
    longer has, and pause that DR stream for good (ENG-30630). So, before those drops, the provider waits up to 60 s
    until each cluster's DR producer has had acknowledged everything it had queued (`@Statistics DRPRODUCERPARTITION`:
-   LASTACKDRID reaches the LASTQUEUEDDRID of the start of the wait). With `--avoid-known-bugs false` it does not
-   wait.
+   LASTACKDRID reaches the LASTQUEUEDDRID of the start of the wait). LASTQUEUEDDRID counts only flushed DR buffers,
+   and VoltDB flushes them every second by default, so the wait starts 1.5 s in; read at once, it missed the last
+   rows and the stream paused (lab build #46). A wait that runs out says so on standard error. With
+   `--avoid-known-bugs false` it does not wait.
 
 ### The XDCR oracle
 
@@ -835,6 +843,37 @@ Since milestone 19 the expression generator, and so every oracle that uses it, a
   expression, which is mostly not JSON: "Invalid JSON" is expected.
 
 PQS's evaluator does not model these functions: a PQS query that holds one is skipped.
+
+Since milestone 31 it also writes the functions that milestone 30's coverage run found the engine never ran
+(`expressions/stringfunctions.h` was 13% covered, `bitwisefunctions.h` 0%, `datefunctions.h` 38%):
+
+- **Strings:** `LEFT(s, n)`, `RIGHT(s, n)`, `REPEAT(s, n)`, `SPACE(n)`, `REPLACE(s, t, r)` with t a constant that is
+  not empty, `CONCAT(a, b [, c])`, `OVERLAY(s PLACING t FROM start [FOR length])`, `CHAR(code point)`, `HEX(n)` and
+  `BIN(n)`. Counts and positions are small constants of 0 or more: a negative one is an error.
+- **Integers from strings:** `OCTET_LENGTH(s)`, `POSITION(t IN s)` and `REGEXP_POSITION(s, pattern [, 'i' | 'c'])`,
+  the pattern a constant (a generated one would mostly not be a valid regular expression).
+- **Bitwise:** `BITAND`, `BITOR`, `BITXOR`, `BITNOT`, `BIT_SHIFT_LEFT(n, k)` and `BIT_SHIFT_RIGHT(n, k)`, BIGINT in
+  and out. VoltDB rejects any other integer type ("incompatible data type in conversion"), so an operand that is not
+  a BIGINT column is written `CAST(x AS BIGINT)`. A result of BIGINT's minimum, VoltDB's NULL, is an expected error;
+  k runs past 63, where the result is 0.
+- **Numbers:** `SIGN(x)`, an integer; `ROUND(x, places)`, DECIMAL; `STR(x [, length [, decimals]])` and
+  `FORMAT_CURRENCY(x, places)`, VARCHAR. As documented, ROUND and STR take FLOAT or DECIMAL and FORMAT_CURRENCY
+  DECIMAL only, so x is a FLOAT expression or `CAST(... AS DECIMAL)`: VoltDB accepts an integer when it plans the
+  statement, then fails when it runs it ("Type INTEGER can't be cast as DECIMAL").
+- **Time:** `DATEDIFF(unit, t1, t2)`, a BIGINT; `TIME_WINDOW(unit, n, t [, START | END])` and
+  `FROM_UNIXTIME(seconds)`, TIMESTAMPs; `FORMAT_TIMESTAMP(t, zone)`, VARCHAR.
+- **Masks:** `MASK_TEXT(s, mask, keep)`, and `MASK_INNER`, `MASK_OUTER` and `MASK_PARTIAL(s, left, right, mask)`.
+
+PQS's evaluator models LEFT, RIGHT, REPEAT, REPLACE, SPACE, CONCAT, HEX, BIN, OCTET_LENGTH, POSITION, SIGN and the
+bitwise functions, as the engine computes them; a PQS query with any of the others is skipped.
+
+The bugs below were found in milestone 31.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30655 | A procedure created AS a query with `TIME_WINDOW(..., END)` succeeds and runs, but every later DDL statement fails with "unexpected token: END", its own DROP PROCEDURE included, and still after a restart; only `voltdb init --force` gets DDL back. START, no option, and END in a view or an index do not do it. Critical. | `TIME_WINDOW`'s option is START only. |
+| ENG-30656 | ROUND, STR and FORMAT_CURRENCY fail on a DECIMAL whose integer part is 2^63 or more, which DECIMAL holds: "Type DECIMAL with value ... can't be cast as BIGINT because the value is out of range" (the engine narrows the whole part to an int64). Major. | None needed: the error is expected for other reasons ("out of range for the destination type"), and the reproduction tracks the bug. |
+| ENG-30658 | TO_TIMESTAMP and FROM_UNIXTIME of a NULL return a NULL typed BIGINT, which FORMAT_TIMESTAMP rejects ("Type BIGINT can't be cast as TIMESTAMP or DATE"), so `FORMAT_TIMESTAMP(FROM_UNIXTIME(n), zone)` fails on any row where n is NULL. Major. | FORMAT_TIMESTAMP's argument is a TIMESTAMP column or constant. |
 
 ### The GEO oracle
 
@@ -1403,6 +1442,12 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
+The bug below was found in milestone 31's lab run (build #46).
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30663 | A node killed while catalog updates are in flight, as in ENG-30612, but here a *surviving* node dies and, at k=1, the cluster is lost: in the lab the MPI restarted the interrupted @UpdateCore while the next DDL's update was prepared on a survivor, whose sites then failed with "Unexpected: @UpdateCore's prepared catalog is null during non-replay case"; locally a survivor aborted in the EE with "getStats() called with selector 0, and an invalid locator 455 that does not correspond to a table". A script (`-- manual:`, a race) reproduced it in 1 of 3 local runs. Critical. | DDL waits from 3 s before each kill until the survivors have handled the failure (`--ddl-hold`). |
 
 The bugs below were found in milestone 28.
 

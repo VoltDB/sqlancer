@@ -167,6 +167,14 @@ run_sql() {
         cluster_alive "$nodes" || { alive=false; break; }
         echo "$output" | grep -q "was lost before a response was received" || break
     done
+    # on the lab's agents a crashed server can still be writing its crash files after the 300 s above (ENG-30595,
+    # lab build #46): a lost connection with a crash in the server's output is a crash too
+    if $alive && echo "$output" | grep -q "was lost before a response was received" &&
+        grep -qE "SIGSEGV|SIGBUS|SIGABRT|SIGILL|A fatal error has been detected|libc\+\+abi|FATAL" "$work"/start*.log \
+            "$work"/node*/voltdbroot/log/volt.log 2>/dev/null; then
+        alive=false
+        echo "== a server crashed but had not exited" >>"$log"
+    fi
     {
         echo "== check (normalized)"
         echo "$output"
