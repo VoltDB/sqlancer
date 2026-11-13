@@ -1213,6 +1213,7 @@ result=PASS
     grep -m1 "^STREAMS inserted rows:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^TTL checks:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^LOAD checks:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^CONFIG changes checked:" "$results/sqlancer/out.log" 2>/dev/null
     $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)")"
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"

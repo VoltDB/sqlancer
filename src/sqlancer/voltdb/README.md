@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 35.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 36.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -46,6 +46,8 @@ milestone 33 `--export` also exports through HTTP and loopback targets; see [The
 Since milestone 34 the TTL oracle checks rows VoltDB removes by itself, time to live and migration; see
 [The TTL oracle](#the-ttl-oracle). Since milestone 35 the LOAD and SWAP oracles check bulk loads and
 `@SwapTables`, and `@ValidatePartitioning` after each; see [The LOAD and SWAP oracles](#the-load-and-swap-oracles).
+Since milestone 36 the CONFIG oracle changes the configuration while the database runs; see
+[The CONFIG oracle](#the-config-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -455,7 +457,7 @@ the kit's runtime JDK and makes seven runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-five (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-six (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP, CONFIG; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
 | `sqlancer-1n-k0-security` | 1 node, 8 sites per host, security on (see [The PERMS oracle](#the-perms-oracle)); `sqlancer-1n-k0` until milestone 28 | the same | 45 minutes |
 | `sqlancer-3n-k2-export-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all; the streams export (see [The STREAMS oracle](#the-streams-oracle)); `sqlancer-3n-k2-s2` until milestone 29 | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
@@ -1026,6 +1028,39 @@ fails other than on a constraint (a node failure's) is only skipped. At exit the
 In a 90-second trial on 1 node: 643 loads (263 batches rejected as a whole), 986 swaps and 1,286 validations. In a
 5-minute trial on 3 nodes with k=1 and a node killed every 60 s (beside NoREC, TLP WHERE and VIEWS): 663 loads (282
 rejected), 989 swaps and 1,323 validations, across 4 kills and rejoins.
+
+Measured with `run-coverage.sh`'s kill run (15 minutes, master bf8602e3, every oracle), against milestone 30's seven
+runs together: `@SwapTables` 13 of 18 lines (from 1), the engine's swap executor 56 of 60 and plan node 27 of 52
+(from 0), `@LoadMultipartitionTable` 88 of 104 (from 3), `@LoadSinglepartitionTable` 50 of 76 (from 2) and
+`@ValidatePartitioning` 59 of 62 (from 3).
+
+## The CONFIG oracle
+
+Milestone 36. Milestone 30's coverage run found the procedures that change the configuration while the database runs
+unexercised: `@SetYamlConfiguration` (10 of 404 lines), `@GetYamlConfiguration` (2 of 155), `YamlUtils` (0 of 169)
+and `@UpdateDeployment` (3 of 256). Each CONFIG check:
+
+- reads the system settings (`@GetYamlConfiguration('deployment.systemsettings')`);
+- changes one of them with `@SetYamlConfiguration`, either by an assignment
+  (`deployment.systemsettings.snapshot.priority=6`) or by a YAML document, which `@UpdateDeployment` applies;
+- reads them again: that setting must have its new value and every other its old one. A value equal to the current one
+  gives `@UpdateDeployment`'s status 2, no change, and nothing may change.
+
+About one check in ten instead sends a change VoltDB must refuse (a value that is not a number, a setting that cannot
+change while the database runs, one that does not exist, a YAML document that is not a deployment, text that is not
+YAML), and nothing may change.
+
+The settings are ones that cannot change other oracles' results: snapshot priority, the flush intervals, the resource
+monitor's frequency, compaction, elastic resize throughput and duration, procedure logging, the clock skew interval,
+and query timeouts of 10 s or more. One check runs at a time across SQLancer's threads, so the settings read back are
+the check's own. SQLancer connects to every node, so the reads come from all of them, those that rejoined after a
+kill included. In a 90-second trial on 1 node (beside NoREC) CONFIG checked 750 changes and 77 refusals; in a 5-minute
+trial on 3 nodes with k=1 and a node killed every 60 s (beside LOAD, NoREC and TLP WHERE), 616 and 53 across 4 kills
+and rejoins.
+
+Measured with `run-coverage.sh`'s kill run (15 minutes, master bf8602e3, every oracle), against milestone 30's seven
+runs together: `@SetYamlConfiguration` 176 of 404 lines (from 10), `@GetYamlConfiguration` 73 of 155 (from 2),
+`YamlUtils` 86 of 169 (from 0) and `@UpdateDeployment` 168 of 256 (from 3).
 
 ## The PERMS oracle
 
