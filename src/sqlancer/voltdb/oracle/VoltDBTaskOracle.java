@@ -84,10 +84,12 @@ public class VoltDBTaskOracle implements TestOracle<VoltDBGlobalState> {
         // the rows all go to that k's partition)
         String call = partitions ? "XKQ_" + db + " WITH (" + Randomly.getNotCachedInteger(0, 1000) + ", '" + task + "')"
                 : "XKP_" + db + " WITH ('" + task + "')";
+        // from before CREATE TASK is sent: the task runs as soon as the catalog has it, which can be seconds before the
+        // DDL's response arrives (lab build #55's security run: rows 2.7 s before CREATE TASK returned)
+        long created = System.currentTimeMillis();
         // ON ERROR comes before RUN ON
         ddl("CREATE TASK " + task + " ON SCHEDULE " + schedule + " PROCEDURE " + call + " ON ERROR "
                 + Randomly.fromOptions("LOG", "IGNORE") + (partitions ? " RUN ON PARTITIONS" : ""));
-        long created = System.currentTimeMillis();
         try {
             Thread.sleep(3000);
             ddl("ALTER TASK " + task + " DISABLE");
