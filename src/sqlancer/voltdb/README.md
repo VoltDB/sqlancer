@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 43.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 45.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -56,6 +56,8 @@ also exports through a JDBC target into a sink cluster; see [The JDBC target](#t
 milestone 41 the IMPORT oracle sends rows through the pull socket importer; see [The IMPORT oracle](#the-import-oracle).
 Since milestone 42 `--ssl` runs the cluster with TLS, and the nightly job's security run uses it; see [TLS](#tls).
 Since milestone 43 the STATS oracle checks the statistics against the tables; see [The STATS oracle](#the-stats-oracle).
+Since milestone 45 export runs hold the HTTP target across every other kill, so rejoined replicas fill gaps; see
+[Gap fills](#gap-fills-milestone-45).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -1362,6 +1364,22 @@ miscounted there:
 In a 5-minute trial on 3 nodes with k=2 and 2 sites per host, beside NoREC, STREAMS inserted 2,653 rows; all were
 exported, 729 through HTTP and 656 through JDBC. In an 8-minute one with a node killed every 2 minutes, beside NoREC,
 TLP WHERE, VIEWS and TTL, 3,221 rows, 883 through HTTP and 828 through JDBC (before these fixes, 1 and 1).
+
+### Gap fills (milestone 45)
+
+A replica that rejoins has missed the rows its stream took while it was down; while some target has not acknowledged
+them, it fetches them from the other replicas (E3's gap fill). Every target acknowledges at once, so milestone 44's
+coverage run found the gap fill never run: `E3ClientGapSession`, `E3ServerGapSession`, `GapFillResponse` and the gap
+fill messages, 0 of 325 lines. With `--export` every other kill, the first included, is now made while the HTTP target
+refuses rows: `voltdb/http-receiver.py` answers 503, and records nothing, while the cluster's `http.hold` exists, and the
+HTTP export client keeps the rows and sends them again later. The hold starts before the kill and ends 20 s after the
+node has rejoined (`hold N` lines in `chaos.log`). The count at the end still requires every inserted row to arrive;
+the summary adds the gap fills the servers logged ("Replica hosts filled gaps").
+
+In an 8-minute local run (3 nodes, k=2, a kill a minute, NoREC, TLP WHERE and STREAMS): 8 gap fills over 3 held kills,
+3,553 of 3,553 rows exported, none twice. In run-coverage.sh's 10-minute export run: 2 gap fills, 754 of 754 rows;
+the gap fill's classes went from 13 to 322 of 537 lines (`E3ClientGapSession` 61 of 105, `E3ServerGapSession` 71 of
+132, `GapFillResponse` 72 of 88).
 
 The bugs below were found in milestone 29.
 
