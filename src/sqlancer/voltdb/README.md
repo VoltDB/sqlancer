@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 45.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 46.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -58,6 +58,8 @@ Since milestone 42 `--ssl` runs the cluster with TLS, and the nightly job's secu
 Since milestone 43 the STATS oracle checks the statistics against the tables; see [The STATS oracle](#the-stats-oracle).
 Since milestone 45 export runs hold the HTTP target across every other kill, so rejoined replicas fill gaps; see
 [Gap fills](#gap-fills-milestone-45).
+Since milestone 46 the LOGIN oracle adds, changes and removes users while the database runs and checks who may log
+in; see [The LOGIN oracle](#the-login-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -1268,6 +1270,38 @@ update in progress before it checks a user's permission, so DDL can be refused w
 first; PERMS retries that until the permission error comes. At exit, PERMS prints how many allowed and refused
 statements it checked; the summary has the line. Without `--security`, it skips every check. In a 5-minute trial on
 1 node it checked 307 allowed and 283 refused statements.
+
+## The LOGIN oracle
+
+Milestone 46, with `--security`. Milestone 44's coverage run found failed logins never run (`AuthFailedBecause`, 0 of
+14 lines, and the log lines for a refused login), nor user expiry dates, nor users changed while the database runs.
+Each LOGIN check adds a user of its own, `loginN`, with a random password and the role `user`, `sqlancer_read` or
+`sqlancer_write`, through `@SetYamlConfiguration`: a YAML document with the password in plain text, one with it masked
+(its SHA-256 digest, `plaintext: false`), or assignments (`.users[loginN].password=...`). Then:
+
+1. `@GetYamlConfiguration('deployment.users')` must list the user with its role and its password masked (the digest in
+   uppercase hex, `plaintext: false`);
+2. the user must log in with its password, and be refused with another; a user that does not exist must be refused;
+3. one change: a new password (the old one is refused, the new one logs in); an expiry date in the past (refused), then
+   one in the future (logs in); an expiry date in the future set by a YAML document; another role; or a change VoltDB
+   must refuse, after which the user logs in as before: an expiry date that is not a date, or the only administrator
+   made a plain user;
+4. the user is removed (`.users[loginN]=null`); it must no longer be listed, and must be refused.
+
+Logins use the native client, each a new connection closed at once: the JDBC driver reports every failed connection as
+"Unable to connect to the cluster", where the client reports "Authentication rejected". Changes to the deployment take
+turns with CONFIG's. At exit LOGIN prints its checks, the logins accepted and refused, and the user changes refused;
+the summary has the line. Without `--security` it skips every check.
+
+A masked password in lowercase hex, as `shasum` prints it, gives a user that is refused with every password: VoltDB
+keeps the digest as given and compares it with the client's in uppercase (MASKED_CASE_BUG). While avoiding known bugs,
+LOGIN masks passwords in uppercase; otherwise half of the masked ones are in lowercase, and the login fails.
+
+In a 5-minute trial on 1 node with TLS, beside NoREC, PERMS and CONFIG: 167 checks, 334 logins accepted, 574 refused
+and 32 user changes refused. In run-coverage.sh's 10-minute security run, against milestone 44's six runs:
+`AuthFailedBecause` 14 of 14 lines (from 0), `AuthUser` 36 of 46 (from 28), `HashAuthenticationRequest` 23 of 31
+(from 19), `SetYamlConfiguration` 294 of 396 (from 173), `YamlUtils.PropertyParser` 56 of 68 (from 34); security as a
+whole 26.3% of its lines (from 23.4%). The rest is mostly LDAP and Kerberos, which need servers of their own.
 
 ## The STREAMS oracle
 
