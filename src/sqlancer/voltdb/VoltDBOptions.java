@@ -59,6 +59,9 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--ttl-migrate-target", description = "A loopback export target (run-sqlancer.sh --export) whose procedure is XS_LBT.insert: the TTL oracle's TTL tables that MIGRATE TO TARGET it move their expired rows into the table XS_LBT")
     public String ttlMigrateTarget;
 
+    @Parameter(names = "--ssl-truststore", description = "A Java truststore (password sqlancer) trusting the cluster's TLS certificate (run-sqlancer.sh --ssl): SQLancer connects to the cluster, and the XDCR peer, over TLS; not to the mirror")
+    public String sslTruststore;
+
     @Parameter(names = "--import-ports", description = "The ports on this machine, FIRST or FIRST-LAST, that the cluster's pull socket importer (run-sqlancer.sh, with IMPORT among the oracles) pulls CSV lines from into XI.insert: the IMPORT oracle listens on them and sends lines; without it, IMPORT does nothing")
     public String importPorts;
 
