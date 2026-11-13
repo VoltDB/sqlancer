@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 32.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 35.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -41,7 +41,11 @@ run script can enable security (`--security`), and the PERMS oracle checks what 
 milestone 30 `voltdb/run-coverage.sh` measures the Java and C++ code the runs exercise; see
 [Code coverage](#code-coverage). Since milestone 31 expressions also use the string, bitwise, number, time and mask
 functions that coverage found unexercised; see [Functions in expressions](#functions-in-expressions). Since milestone 32
-some materialized views read an inner join of two or three tables; see [The VIEWS oracle](#the-views-oracle).
+some materialized views read an inner join of two or three tables; see [The VIEWS oracle](#the-views-oracle). Since
+milestone 33 `--export` also exports through HTTP and loopback targets; see [The STREAMS oracle](#the-streams-oracle).
+Since milestone 34 the TTL oracle checks rows VoltDB removes by itself, time to live and migration; see
+[The TTL oracle](#the-ttl-oracle). Since milestone 35 the LOAD and SWAP oracles check bulk loads and
+`@SwapTables`, and `@ValidatePartitioning` after each; see [The LOAD and SWAP oracles](#the-load-and-swap-oracles).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -451,7 +455,7 @@ the kit's runtime JDK and makes seven runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-two (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-five (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
 | `sqlancer-1n-k0-security` | 1 node, 8 sites per host, security on (see [The PERMS oracle](#the-perms-oracle)); `sqlancer-1n-k0` until milestone 28 | the same | 45 minutes |
 | `sqlancer-3n-k2-export-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all; the streams export (see [The STREAMS oracle](#the-streams-oracle)); `sqlancer-3n-k2-s2` until milestone 29 | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
@@ -991,6 +995,37 @@ the migrating TTL tables, a 5-minute trial on 3 nodes with k=2 and `--export` (b
 Measured with `run-coverage.sh`'s export run (20 minutes, master bf8602e3, every oracle), against milestone 30's seven
 runs together: `TTLManager` 107 of 132 lines (from 25), `LowImpactDeleteNT` 77 of 108 (from 2), `MigrateRowsNT` 72 of
 109 (from 2) and `MigrateRowsBase` 76 of 108 (from 4).
+
+## The LOAD and SWAP oracles
+
+Milestone 35. Milestone 30's coverage run found the system procedures for bulk operations unexercised:
+`@LoadMultipartitionTable` (3 of 104 lines), `@LoadSinglepartitionTable` (2 of 76), `@SwapTables` (1 of 18, and the
+engine's swap executor and plan node 0 of 112) and `@ValidatePartitioning` (3 of 62). Each check uses two twin tables
+of its own, partitioned on `k` or replicated at random:
+`XLPA_DB0`/`XLPB_DB0` (LOAD, partitioned), `XLRA_DB0`/`XLRB_DB0` (LOAD, replicated), and `XW...` for SWAP, each
+`(k INTEGER, id SMALLINT, v VARCHAR(12), b VARBINARY(6), f FLOAT, d DECIMAL, t TIMESTAMP, PRIMARY KEY (k, id))`
+with a unique index on `(k, v)` and an ordinary one on `(f, t)`.
+
+- **LOAD.** Both twins are emptied and get the same 0 to 8 base rows. A batch of 1 to 12 rows is then loaded into A,
+  in insert or upsert mode, by `@LoadMultipartitionTable` (replicated) or `@LoadSinglepartitionTable` (partitioned,
+  every row of the batch with the same `k`, as `VoltBulkLoader` sends it), and applied to B as single `INSERT` or
+  `UPSERT` statements. If every statement succeeded, A must hold B's rows and the procedure must report the batch's
+  size. If one broke a constraint (the primary key or the unique index), the load must fail as a whole and leave A as
+  it was. About two batches in five break one.
+- **SWAP.** A and B get 0 to 10 rows each, then `@SwapTables(A, B)`, once or twice: each table must hold the other's
+  rows, the procedure must report how many rows moved, and each row must be found through the primary key's index, the
+  unique index, and, by count, the index on `(f, t)`.
+- **Partitioning.** After each check, `@ValidatePartitioning` with NULL (the current hash configuration) must find no
+  row of any table in the wrong partition: with node kills or resizes that checks the whole database, not only the
+  twins. A byte array it cannot parse crashes the server (ENG-30674 below), so the oracle never passes one.
+
+The twins' rows change through prepared statements and calls, which DIFF's mirror does not repeat, so the mirror never
+compares them. Their DDL goes through an ordinary statement, which waits while a node is killed (`--ddl-hold`), and
+only once per run, as each catalog change is slow on a cluster. Each check starts by emptying the twins, so one that
+fails other than on a constraint (a node failure's) is only skipped. At exit the oracle prints how many checks it made.
+In a 90-second trial on 1 node: 643 loads (263 batches rejected as a whole), 986 swaps and 1,286 validations. In a
+5-minute trial on 3 nodes with k=1 and a node killed every 60 s (beside NoREC, TLP WHERE and VIEWS): 663 loads (282
+rejected), 989 swaps and 1,323 validations, across 4 kills and rejoins.
 
 ## The PERMS oracle
 
@@ -1540,6 +1575,12 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
+The bug below was found in milestone 35.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30674 | `@ValidatePartitioning` passes a non-NULL hash configuration from the client straight to the engine, which parses it without checking: `exec @ValidatePartitioning 'AB';` (or an empty byte array through JDBC) crashes the server with SIGSEGV in `ElasticHashinator::newInstance`. 16.0.0 too. Found while adding the LOAD and SWAP oracles' validation. `repros/ENG-30674.sql`. | The oracles pass NULL, which means the current configuration |
 
 The bugs below were found in milestone 33.
 
