@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 39.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 40.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -51,7 +51,8 @@ Since milestone 36 the CONFIG oracle changes the configuration while the databas
 snapshot; see [The SNAPSHOT oracle](#the-snapshot-oracle). Since milestone 38 the XCONFLICT oracle makes XDCR
 conflicts on purpose and checks that every divergence they leave is reported; see
 [The XCONFLICT oracle](#the-xconflict-oracle). Since milestone 39 the TASK oracle runs scheduled tasks and checks that
-they run as scheduled and stop when disabled; see [The TASK oracle](#the-task-oracle).
+they run as scheduled and stop when disabled; see [The TASK oracle](#the-task-oracle). Since milestone 40 `--export`
+also exports through a JDBC target into a sink cluster; see [The JDBC target](#the-jdbc-target-milestone-40).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -1232,6 +1233,44 @@ its lines (milestone 30's seven runs together) to 25.8% from the export run alon
 gap sessions (`E3ServerGapSession`, `E3ClientGapSession`, 237 lines) still never run: with k=2 every replica has every
 row, and a rejoined node never had to fill a gap.
 
+### The JDBC target (milestone 40)
+
+Milestone 33's coverage run still found the JDBC export client (`JDBCExportClient`, 623 lines) never run. So
+`--export` adds a third target for the streams, **JDBC** (`sqlancer_jdbc`, `type="jdbc"`), into VoltDB itself: the
+script starts a sink, one node of the kit under test (k=0, 2 sites per host, on port slot 19, never killed), and the
+target's `jdbcurl` is `jdbc:voltdb://localhost:<its client port>`, with `ignoregenerations` and `skipinternals`, so
+that each stream's rows go into a sink table of the stream's name and columns. The provider gets `--export-target
+sqlancer,sqlancer_http,sqlancer_jdbc`, so db0 and db3 export to the file target, db1 to HTTP and db2 to JDBC. After
+`@Quiesce`, once the sink's counts have not changed for 10 s, each `XS_DB<n>_ST` table's rows and distinct `I` go into
+the results' `export/jdbc.csv`, and the count at the end adds the distinct `I` to the file and HTTP targets' rows.
+
+Into VoltDB the target writes rows with `UPSERT`, and the tables it creates have no primary key, so VoltDB refuses
+every row; its `CREATE TABLE` also gives a FLOAT column the type `DOUBLE PRECISION`, which VoltDB refuses (ENG-30681
+below). So while `--avoid-known-bugs` is true (the provider's default; the script reads `-- --avoid-known-bugs false`),
+the script creates the sink's tables beforehand, with `I` as their primary key, and sets `createtable` to false.
+
+Milestone 40 also fixes four things that kept the HTTP and JDBC targets nearly idle in runs that kill nodes, or that
+miscounted there:
+
+- With `--node-failures`, the connection reports "object name already exists" as a node failure, so STREAMS' `CREATE`
+  of an object made earlier (`XS_LB`, made by another database first) ended the check, and the database name's loopback
+  stream was never made: from then on every check of db1, db2 and db3 failed its first loopback insert and left its
+  stream out of step. In lab runs with kills, HTTP got 1 row. STREAMS now creates only what the catalog lacks, and
+  takes a stream's name only once all of its objects exist.
+- A stream out of step (an insert a node failure interrupted) was skipped for the rest of the run. Its database name
+  now goes on with a stream of the next generation, `XS_DB2G1_ST` and so on, up to 8; the old one is kept, as dropping
+  it may lose rows still to export. The sink has a table for each generation.
+- An insert into a stream that failed, or that a node failure interrupted, may still have committed and been exported.
+  STREAMS counts these, and those still running when SQLancer exits, as interrupted, and the count at the end allows
+  between the inserted rows and those plus the interrupted ones.
+- The file target's rows were counted as distinct lines. After a failover the new partition leader exports some rows
+  again with its own site id, so the line differs: the rows are now counted by their distinct `I`, like the HTTP and
+  JDBC targets'.
+
+In a 5-minute trial on 3 nodes with k=2 and 2 sites per host, beside NoREC, STREAMS inserted 2,653 rows; all were
+exported, 729 through HTTP and 656 through JDBC. In an 8-minute one with a node killed every 2 minutes, beside NoREC,
+TLP WHERE, VIEWS and TTL, 3,221 rows, 883 through HTTP and 828 through JDBC (before these fixes, 1 and 1).
+
 The bugs below were found in milestone 29.
 
 | Ticket | Issue | Workaround |
@@ -1702,6 +1741,12 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
+The bug below was found in milestone 40.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30681 | JDBC export to VoltDB with `createtable` (its default) delivers no rows: the tables it creates have no primary key, but it writes rows with `UPSERT` ("Unsupported UPSERT table without primary key"), and for a FLOAT column its `CREATE TABLE` uses `DOUBLE PRECISION` ("type not found or user lacks privilege: DOUBLE"). The export retries each block for good, and a graceful shutdown stops with the cluster paused. 16.0.0 too. Found by the JDBC target's first trial; `repros/ENG-30681.sh` exports a stream with a FLOAT column and one without from one 1-node cluster to another and finds neither row. Hang, Blocker for V16.1.0. | While `--avoid-known-bugs` is true, the script creates the sink's tables beforehand, with a primary key, and sets `createtable` to false |
 
 The bug below was found in milestone 39.
 

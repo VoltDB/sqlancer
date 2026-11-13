@@ -32,6 +32,12 @@ import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 public class VoltDBStreamOracle implements TestOracle<VoltDBGlobalState> {
 
     private static final AtomicLong INSERTED = new AtomicLong();
+    // inserts into a stream that a node failure interrupted, or that failed: each may have committed, and been
+    // exported, or not
+    private static final AtomicLong INTERRUPTED = new AtomicLong();
+    // inserts into a stream not yet counted either way: at exit, SQLancer's threads may still be running one, which may
+    // commit and be exported after INSERTED is printed (an export one row over in a milestone 40 trial)
+    private static final AtomicLong IN_FLIGHT = new AtomicLong();
     private static final AtomicLong CHECKED = new AtomicLong();
     private static final AtomicLong LOOPBACK_CHECKED = new AtomicLong();
     // how long a loopback check waits for the export to deliver the rows
@@ -44,17 +50,30 @@ public class VoltDBStreamOracle implements TestOracle<VoltDBGlobalState> {
     private static final String VIEW_QUERY = "SELECT k, s, COUNT(*), SUM(v), MIN(f), MAX(v) FROM %s GROUP BY k, s";
 
     static {
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> System.out.println("STREAMS inserted rows: " + INSERTED
-                + "; views compared: " + CHECKED + "; loopback exports compared: " + LOOPBACK_CHECKED)));
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            // in flight first: an insert that completes between the reads is then counted twice, never not at all
+            long inFlight = IN_FLIGHT.get();
+            long inserted = INSERTED.get();
+            System.out.println(
+                    "STREAMS inserted rows: " + inserted + "; interrupted inserts: " + (INTERRUPTED.get() + inFlight)
+                            + "; views compared: " + CHECKED + "; loopback exports compared: " + LOOPBACK_CHECKED);
+        }));
     }
 
     // the streams whose rows went into the stream but not into the shadow table, after which the two may differ;
     // static, as a database name, and so its stream, is used again by later databases of the run
     private static final java.util.Set<String> OUT_OF_STEP = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    // an exported stream out of step is kept, and the database name's checks go on with a stream of a new generation,
+    // XS_DB0G1_ST and so on, up to MAX_GENERATION; so that, in a run that kills nodes, each export target still gets
+    // rows after its stream's first interrupted insert (milestone 40: with kills, the HTTP and JDBC targets got 1 row
+    // each)
+    static final int MAX_GENERATION = 8;
+    private static final java.util.Map<String, Integer> GENERATION = new java.util.concurrent.ConcurrentHashMap<>();
 
     private final VoltDBGlobalState state;
     private String prefix;
     private String lastQuery;
+    private String lastError;
 
     public VoltDBStreamOracle(VoltDBGlobalState state) {
         this.state = state;
@@ -66,22 +85,39 @@ public class VoltDBStreamOracle implements TestOracle<VoltDBGlobalState> {
         String loopback = state.getDbmsSpecificOptions().loopbackTarget;
         boolean looping = loopback != null && !loopback.isBlank();
         boolean exporting = target != null && !target.isBlank() || looping;
-        if (prefix == null) {
-            prefix = "XS_" + state.getDatabaseName().toUpperCase();
-            // kept from an earlier database of the same name in this run, or made now
-            create(target != null && !target.isBlank() ? " EXPORT TO TARGET " + target(target) : "");
-            if (looping) {
-                ddl("CREATE TABLE XS_LB" + TAGGED_COLUMNS + "; PARTITION TABLE XS_LB ON COLUMN k");
-                ddl("CREATE STREAM " + prefix + "_LS PARTITION ON COLUMN k EXPORT TO TARGET " + loopback
-                        + TAGGED_COLUMNS);
+        String base = "XS_" + state.getDatabaseName().toUpperCase();
+        if (exporting && OUT_OF_STEP.contains(generationPrefix(base))) {
+            // an exported stream is kept for the run, as dropping it may lose rows still to export: the next
+            // generation's stream takes over
+            int next = GENERATION.getOrDefault(base, 0) + 1;
+            if (next > MAX_GENERATION) {
+                throw new IgnoreMeException();
+            }
+            GENERATION.put(base, next);
+            prefix = null;
+        }
+        if (prefix == null || !prefix.equals(generationPrefix(base))) {
+            // kept from an earlier database of the same name in this run, or made now; the prefix is taken only once
+            // all of it exists, so that DDL a node failure interrupted (IgnoreMeException) is done again by the next
+            // check (before milestone 40 the loopback stream could be left missing, and every later check of the
+            // name failed)
+            String next = generationPrefix(base);
+            prefix = next;
+            try {
+                create(target != null && !target.isBlank() ? " EXPORT TO TARGET " + target(target) : "");
+                if (looping) {
+                    ddlIfMissing("XS_LB",
+                            "CREATE TABLE XS_LB" + TAGGED_COLUMNS + "; PARTITION TABLE XS_LB ON COLUMN k");
+                    ddlIfMissing(next + "_LS", "CREATE STREAM " + next + "_LS PARTITION ON COLUMN k EXPORT TO TARGET "
+                            + loopback + TAGGED_COLUMNS);
+                }
+            } catch (IgnoreMeException e) {
+                prefix = null;
+                throw e;
             }
         }
         if (OUT_OF_STEP.contains(prefix)) {
-            // an exported stream is kept for the run, as dropping it may lose rows still to export; one that exports
-            // nowhere starts afresh
-            if (exporting) {
-                throw new IgnoreMeException();
-            }
+            // one that exports nowhere starts afresh
             ddl("DROP VIEW " + prefix + "_SV IF EXISTS");
             ddl("DROP STREAM " + prefix + "_ST IF EXISTS");
             ddl("DROP TABLE " + prefix + "_SH IF EXISTS");
@@ -101,16 +137,28 @@ public class VoltDBStreamOracle implements TestOracle<VoltDBGlobalState> {
             // an insert a node failure interrupted (IgnoreMeException with --node-failures, --crashes and the like) may
             // or may not have committed, so the stream and its shadow can differ from then on (lab build #44)
             boolean inStream;
+            IN_FLIGHT.incrementAndGet();
             try {
                 inStream = insert("INSERT INTO " + prefix + "_ST VALUES " + values);
             } catch (IgnoreMeException e) {
+                INTERRUPTED.incrementAndGet();
+                IN_FLIGHT.decrementAndGet();
                 OUT_OF_STEP.add(prefix);
                 throw e;
             }
+            if (inStream) {
+                INSERTED.incrementAndGet();
+            } else {
+                INTERRUPTED.incrementAndGet();
+            }
+            IN_FLIGHT.decrementAndGet();
             if (!inStream) {
+                // a stream has no constraints, so an insert into it fails only when something else does (a node
+                // failure the connection did not report as one, say): it may have committed, and been exported
+                System.err.println(
+                        "STREAMS: an insert into " + prefix + "_ST failed, and may have committed: " + lastError);
                 continue;
             }
-            INSERTED.incrementAndGet();
             if (looping) {
                 boolean inLoopback;
                 try {
@@ -147,6 +195,12 @@ public class VoltDBStreamOracle implements TestOracle<VoltDBGlobalState> {
         if (looping) {
             checkLoopback();
         }
+    }
+
+    // the database name's current stream generation: XS_DB0, then XS_DB0G1 and so on
+    private static String generationPrefix(String base) {
+        int g = GENERATION.getOrDefault(base, 0);
+        return g == 0 ? base : base + "G" + g;
     }
 
     // --export-target names one target or several, comma-separated: a database's stream exports to one of them by
@@ -187,10 +241,29 @@ public class VoltDBStreamOracle implements TestOracle<VoltDBGlobalState> {
 
     private void create(String export) {
         String columns = COLUMNS;
-        ddl("CREATE STREAM " + prefix + "_ST PARTITION ON COLUMN k" + export + columns);
-        ddl("CREATE TABLE " + prefix + "_SH" + columns + "; PARTITION TABLE " + prefix + "_SH ON COLUMN k");
+        ddlIfMissing(prefix + "_ST", "CREATE STREAM " + prefix + "_ST PARTITION ON COLUMN k" + export + columns);
+        ddlIfMissing(prefix + "_SH",
+                "CREATE TABLE " + prefix + "_SH" + columns + "; PARTITION TABLE " + prefix + "_SH ON COLUMN k");
         // a view of a partitioned stream groups by the partitioning column
-        ddl("CREATE VIEW " + prefix + "_SV (k, s, n, sv, mn, mx) AS " + String.format(VIEW_QUERY, prefix + "_ST"));
+        ddlIfMissing(prefix + "_SV",
+                "CREATE VIEW " + prefix + "_SV (k, s, n, sv, mn, mx) AS " + String.format(VIEW_QUERY, prefix + "_ST"));
+    }
+
+    // DDL that creates the object NAME, unless the catalog has it already: made for an earlier database of the same
+    // name, or by another thread (XS_LB). With --node-failures the connection reports "object name already exists"
+    // as a node failure (IgnoreMeException), so creating an existing object would end every check (before milestone
+    // 40 the loopback stream of db1 and later was never made in a run with kills, and their streams got no rows)
+    private void ddlIfMissing(String name, String sql) {
+        lastQuery = sql;
+        try (ResultSet rs = ((sqlancer.voltdb.VoltDBConnection) state.getConnection()).getMetaData().getTables(null,
+                null, name, null)) {
+            if (rs.next()) {
+                return;
+            }
+        } catch (SQLException e) {
+            throw new IgnoreMeException();
+        }
+        ddl(sql);
     }
 
     // DDL that may already have been done for this database name earlier in the run
@@ -211,6 +284,7 @@ public class VoltDBStreamOracle implements TestOracle<VoltDBGlobalState> {
             st.execute(sql);
             return true;
         } catch (SQLException e) {
+            lastError = e.getMessage();
             return false;
         }
     }
