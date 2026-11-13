@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 40.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 41.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -52,7 +52,8 @@ snapshot; see [The SNAPSHOT oracle](#the-snapshot-oracle). Since milestone 38 th
 conflicts on purpose and checks that every divergence they leave is reported; see
 [The XCONFLICT oracle](#the-xconflict-oracle). Since milestone 39 the TASK oracle runs scheduled tasks and checks that
 they run as scheduled and stop when disabled; see [The TASK oracle](#the-task-oracle). Since milestone 40 `--export`
-also exports through a JDBC target into a sink cluster; see [The JDBC target](#the-jdbc-target-milestone-40).
+also exports through a JDBC target into a sink cluster; see [The JDBC target](#the-jdbc-target-milestone-40). Since
+milestone 41 the IMPORT oracle sends rows through the pull socket importer; see [The IMPORT oracle](#the-import-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -462,7 +463,7 @@ the kit's runtime JDK and makes seven runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-nine (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP, CONFIG, SNAPSHOT, XCONFLICT, TASK; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all thirty (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP, CONFIG, SNAPSHOT, XCONFLICT, TASK, IMPORT; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
 | `sqlancer-1n-k0-security` | 1 node, 8 sites per host, security on (see [The PERMS oracle](#the-perms-oracle)); `sqlancer-1n-k0` until milestone 28 | the same | 45 minutes |
 | `sqlancer-3n-k2-export-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all; the streams export (see [The STREAMS oracle](#the-streams-oracle)); `sqlancer-3n-k2-s2` until milestone 29 | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
@@ -1154,6 +1155,30 @@ schedule allows, and two more rows per scheduler may follow `ALTER TASK ... DISA
 
 In two 5-minute trials on 3 nodes (k=1, 4 sites per host) with a node killed and rejoined every 45 s: 173 checks, 61 of
 them of a task stopped by an error.
+
+## The IMPORT oracle
+
+Milestone 41. Milestone 30's coverage run found importers never run: the importer framework (`ImportManager`) and the
+distribution of their resources among the nodes (`ChannelDistributer`, 751 lines). With IMPORT among the oracles,
+run-sqlancer.sh configures VoltDB's pull socket importer (`pullsocketimporter.jar`, CSV) to pull lines from four ports
+on this machine (port slot 18), each a resource the nodes share out among themselves and again when one fails, into
+`XI.insert`; the provider gets `--import-ports`. The XDCR peer, the mirror and the JDBC sink import nothing. SQLancer
+listens on those ports, and each IMPORT check:
+
+1. creates `XI (k, v)` (partitioned on `k`) if the catalog lacks it;
+2. sends 1 to 20 lines, each with a key unique in the run, through one port, to the node that has connected to it;
+3. waits up to 60 s until `XI` holds those keys with their values (through both clusters of an XDCR run, as a database
+   may work through either and only the first imports);
+4. checks that `XI` holds no more rows than the run has sent.
+
+The importer delivers at most once: a line in flight when a node fails is lost. So where nodes fail, resize, crash or
+are upgraded, lines that never arrive are counted, not failed; elsewhere each must arrive, and a line put into `XI`
+altered fails the check anywhere. At exit IMPORT prints its checks, the lines sent and the lines lost.
+
+In 2- to 5-minute trials on 3 nodes (k=1, 4 sites per host) beside NoREC: 40,308 lines with no failures; 20,106 with a
+node killed every 45 s; 30,566 with 2 nodes added or removed every minute; 6,020 with every node killed and the cluster
+recovered every 90 s; 22,344 on one node with security; and 16,781 on two 2-node clusters linked by XDCR: none was lost
+or altered.
 
 ## The PERMS oracle
 

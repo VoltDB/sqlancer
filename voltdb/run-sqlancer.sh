@@ -247,9 +247,13 @@ port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 added=0
 [ "$resize_interval" -gt 0 ] && added=$((kfactor + 1))
 added_slot=$((nodes + 1))
-# the XDCR peer's nodes take the slots from 20; with --export, the JDBC target's sink node takes slot 19
+# the XDCR peer's nodes take the slots from 20; with --export, the JDBC target's sink node takes slot 19; with IMPORT
+# among the oracles, the pull socket importer's ports are slot 18's first four
 xdcr_slot=20
 sink_slot=19
+import_slot=18
+importing_oracle=false
+case ",$oracles," in *,IMPORT,*) importing_oracle=true ;; esac
 for ((i = 0; i < added_slot + added; i++)); do
     [ "$i" -eq "$nodes" ] && [ -z "$mirror_home" ] && continue
     for j in 0 1 2 3 4 5; do
@@ -257,6 +261,13 @@ for ((i = 0; i < added_slot + added; i++)); do
         port_in_use "$p" && die "port $p is in use; pick another --port-base"
     done
 done
+if $importing_oracle; then
+    [ $((added_slot + added)) -le "$import_slot" ] || die "IMPORT allows at most $((import_slot - 1 - added)) nodes"
+    for j in 0 1 2 3; do
+        port_in_use "$(port $import_slot $j)" && die "port $(port $import_slot $j) is in use; pick another --port-base"
+    done
+    provider_args+=(--import-ports "$(port $import_slot 0)-$(port $import_slot 3)")
+fi
 if $export; then
     [ $((added_slot + added)) -le "$sink_slot" ] || die "--export allows at most $((sink_slot - 1 - added)) nodes"
     for j in 0 1 2 3 4 5; do
@@ -505,11 +516,23 @@ if $export; then
         </configuration>
     </export>'
 fi
+# with IMPORT among the oracles, the pull socket importer (milestone 41): CSV lines from four ports on this machine, which
+# SQLancer's IMPORT oracle listens on, into XI.insert; the nodes share the ports out among themselves
+importing=
+if $importing_oracle; then
+    importing='
+    <import>
+        <configuration type="custom" module="pullsocketimporter.jar" format="csv" enabled="true">
+            <property name="addresses">localhost:'"$(port $import_slot 0)-$(port $import_slot 3)"'</property>
+            <property name="procedure">XI.insert</property>
+        </configuration>
+    </import>'
+fi
 cat >"$cluster/deployment.xml" <<EOF
 <?xml version="1.0"?>
 <deployment>
     <cluster sitesperhost="$sites" kfactor="$kfactor"/>
-    <httpd enabled="false"/>$durability$dr$users$exporting
+    <httpd enabled="false"/>$durability$dr$users$exporting$importing
 </deployment>
 EOF
 
@@ -577,8 +600,9 @@ log "Cluster ready: $(grep -h -m1 "^Build:" "$cluster/init0.log" 2>/dev/null)"
 
 # a second cluster of the same shape, DR id 2, linked to the first by XDCR; its nodes take the slots from 20
 if $xdcr; then
+    # the peer imports nothing: its nodes would take the importer's ports from the first cluster's
     sed -e 's/<dr id="1"/<dr id="2"/' -e "s|<connection source=\"[^\"]*\"|<connection source=\"$(replication_hosts)\"|" \
-        "$cluster/deployment.xml" >"$cluster/deployment-xdcr.xml"
+        -e '/<import>/,/<\/import>/d' "$cluster/deployment.xml" >"$cluster/deployment-xdcr.xml"
     for ((i = 0; i < nodes; i++)); do
         "$voltdb_home/bin/voltdb" init --force -D "$cluster/xdcr$i" -C "$cluster/deployment-xdcr.xml" \
             ${license_args[@]+"${license_args[@]}"} >"$cluster/init-xdcr$i.log" 2>&1 ||
@@ -614,7 +638,7 @@ if [ -n "$mirror_home" ]; then
     m=$nodes
     # the mirror never crashes: no command log or snapshots
     sed -e "s/kfactor=\"$kfactor\"/kfactor=\"0\"/" -e '/<commandlog /d' -e '/<snapshot /d' \
-        -e '/<dr /d' -e '/<connection /d' -e '/<\/dr>/d' -e '/<export>/,/<\/export>/d' \
+        -e '/<dr /d' -e '/<connection /d' -e '/<\/dr>/d' -e '/<export>/,/<\/export>/d' -e '/<import>/,/<\/import>/d' \
         "$cluster/deployment.xml" >"$cluster/deployment-mirror.xml"
     mirror_cmd "$mirror_home/bin/voltdb" init --force -D "$cluster/mirror" -C "$cluster/deployment-mirror.xml" \
         ${mirror_license_args[@]+"${mirror_license_args[@]}"} >"$cluster/init-mirror.log" 2>&1 ||
@@ -644,7 +668,7 @@ fi
 if $export; then
     sed -e 's/sitesperhost="[0-9]*"/sitesperhost="2"/' -e "s/kfactor=\"$kfactor\"/kfactor=\"0\"/" \
         -e '/<commandlog /d' -e '/<snapshot /d' -e '/<dr /d' -e '/<connection /d' -e '/<\/dr>/d' \
-        -e '/<export>/,/<\/export>/d' "$cluster/deployment.xml" >"$cluster/deployment-sink.xml"
+        -e '/<export>/,/<\/export>/d' -e '/<import>/,/<\/import>/d' "$cluster/deployment.xml" >"$cluster/deployment-sink.xml"
     "$voltdb_home/bin/voltdb" init --force -D "$cluster/sink" -C "$cluster/deployment-sink.xml" \
         ${license_args[@]+"${license_args[@]}"} >"$cluster/init-sink.log" 2>&1 ||
         die "voltdb init failed for the JDBC sink; see $cluster/init-sink.log"
@@ -1325,6 +1349,7 @@ result=PASS
     grep -m1 "^SNAPSHOT restores checked:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^XCONFLICT checks:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^TASK checks:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^IMPORT checks:" "$results/sqlancer/out.log" 2>/dev/null
     $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP, ${jdbc_rows:-0} through JDBC, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)")"
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
