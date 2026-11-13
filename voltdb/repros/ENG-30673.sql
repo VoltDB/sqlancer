@@ -1,5 +1,6 @@
 -- ticket: ENG-30673
 -- summary: After an INSERT fails in a join view's maintenance (DATEADD out of range), the row stays visible to the view, and the next DDL crashes the server ("getStats() called with ... an invalid locator")
+-- platforms: Darwin
 -- bug: crash
 -- fixed: contains: (1 rows)
 CREATE TABLE t0 (a BIGINT);

@@ -1,6 +1,7 @@
 -- ticket: ENG-30664
 -- summary: A unique index duplicating the primary key of a materialized view's join source crashes the server on the next insert ("Could not find Index with name ...")
 -- sites: 8
+-- platforms: Darwin
 -- bug: crash
 -- fixed: contains: (1 rows)
 CREATE TABLE t0 (a BIGINT NOT NULL, PRIMARY KEY (a));

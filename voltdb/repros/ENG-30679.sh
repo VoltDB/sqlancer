@@ -14,7 +14,7 @@ rm -rf "$W"; mkdir -p "$W/classes"
 "$here/../run-sqlancer.sh" --voltdb "$VOLTDB_HOME" ${VOLTDB_LICENSE:+--license "$VOLTDB_LICENSE"} --results "$W/run" \
     --nodes 1 --port-base "$P" --xdcr --oracle SMOKE --duration 5 --keep-cluster >"$W/run.log" 2>&1
 cluster=$(ls -d "$W"/run/sqlancer-*/cluster 2>/dev/null | head -1)
-[ -n "$cluster" ] || { echo "the XDCR pair did not start (run.log)"; exit 2; }
+[ -n "$cluster" ] || { echo "the XDCR pair did not start; run-sqlancer.sh said:"; tail -30 "$W/run.log"; exit 2; }
 cleanup() { pkill -9 -f "$cluster/" 2>/dev/null; }
 trap cleanup EXIT
 cp="$VOLTDB_HOME/voltdb/*:$VOLTDB_HOME/lib/*"
