@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 38.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 39.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -50,7 +50,8 @@ Since milestone 36 the CONFIG oracle changes the configuration while the databas
 [The CONFIG oracle](#the-config-oracle). Since milestone 37 the SNAPSHOT oracle saves and restores a table by
 snapshot; see [The SNAPSHOT oracle](#the-snapshot-oracle). Since milestone 38 the XCONFLICT oracle makes XDCR
 conflicts on purpose and checks that every divergence they leave is reported; see
-[The XCONFLICT oracle](#the-xconflict-oracle).
+[The XCONFLICT oracle](#the-xconflict-oracle). Since milestone 39 the TASK oracle runs scheduled tasks and checks that
+they run as scheduled and stop when disabled; see [The TASK oracle](#the-task-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -460,7 +461,7 @@ the kit's runtime JDK and makes seven runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-eight (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP, CONFIG, SNAPSHOT, XCONFLICT; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-nine (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP, CONFIG, SNAPSHOT, XCONFLICT, TASK; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
 | `sqlancer-1n-k0-security` | 1 node, 8 sites per host, security on (see [The PERMS oracle](#the-perms-oracle)); `sqlancer-1n-k0` until milestone 28 | the same | 45 minutes |
 | `sqlancer-3n-k2-export-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all; the streams export (see [The STREAMS oracle](#the-streams-oracle)); `sqlancer-3n-k2-s2` until milestone 29 | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
@@ -1125,6 +1126,34 @@ unexercised. In an XDCR run (`--xdcr`), each XCONFLICT check:
 converged and how many differing keys were reported as diverged. In a 5-minute trial on two 3-node clusters (k=1,
 4 sites per host), beside XDCR and NoREC: 719 checks, 716 converged.
 
+## The TASK oracle
+
+Milestone 39. Milestone 30's coverage run found scheduled tasks (`CREATE TASK`) little exercised: the scheduler
+(`TaskManager`), its statistics (`TaskStatsSource`) and the CRON schedule. Each TASK check creates a task of its own,
+`XKT_DB0_<n>`, whose procedure inserts a row tagged with the task's name into `XK_DB0` (partitioned on `k`):
+
+- on the database (`XKP_DB0`, a multi-partition insert), or on every partition (`RUN ON PARTITIONS`, through the
+  partitioned `XKQ_DB0`, so that each partition's scheduler calls it);
+- on a schedule of `EVERY` or `DELAY` 200, 500 or 1000 milliseconds, or `CRON * * * * * *` (every second);
+- `ON ERROR LOG` or `IGNORE`.
+
+It lets the task run for 3 s and disables it (`ALTER TASK ... DISABLE`), then checks that:
+
+1. it ran: at least one row, or two on every partition, and no more than the schedule allows in the time it really ran,
+   from `CREATE TASK` until the `ALTER` returned (`ALTER TASK` is DDL, which waits while a node is killed);
+2. after the `ALTER`, at most one more row per scheduler (one in flight), and then none for a few seconds;
+3. `@Statistics TASK` shows it `DISABLED`.
+
+A third of the checks instead run a task whose procedure fails from its second run on (a duplicate primary key in the
+replicated `XKS_DB0`) with `ON ERROR STOP`: it must stop at the first failure, with at most one row, and show `ERROR`
+in `@Statistics TASK`. Every task is dropped at the end of its check. A failure lists the times of the task's rows.
+
+While `--avoid-known-bugs` is true and nodes fail, resize, crash or upgrade, a task may run twice as often as its
+schedule allows, and two more rows per scheduler may follow `ALTER TASK ... DISABLE` (ENG-30680 below).
+
+In two 5-minute trials on 3 nodes (k=1, 4 sites per host) with a node killed and rejoined every 45 s: 173 checks, 61 of
+them of a task stopped by an error.
+
 ## The PERMS oracle
 
 With `--security`, the deployment enables security with three users, `sqlancer` (administrator, whom SQLancer and
@@ -1673,6 +1702,12 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
+The bug below was found in milestone 39.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30680 | A task on the database (`DELAY 20 MILLISECONDS`, a multi-partition procedure, `ON ERROR LOG`) runs in two scheduling chains, about twice as often as its schedule allows, after the node of the multi-partition initiator's leader is killed while one of its calls is in flight; it lasts until the task is disabled or restarted. `@Statistics TASK` counts only one chain, and its `PROCEDURE_*` times go to about ±2.4e18. 16.0.0 too. Found by TASK in a 3-node trial with kills; `repros/ENG-30680.sh` kills the MP leader's node once and finds half the gaps between the task's rows under 20 ms. Extra writes, Blocker for V16.1.0. | While `--avoid-known-bugs` is true and nodes fail, resize, crash or upgrade, TASK allows twice the runs |
 
 The bug below was found in milestone 38.
 
