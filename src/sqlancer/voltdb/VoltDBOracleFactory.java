@@ -25,6 +25,7 @@ import sqlancer.voltdb.oracle.VoltDBStreamOracle;
 import sqlancer.voltdb.oracle.VoltDBSubqueryOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPAggregateOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPOracle;
+import sqlancer.voltdb.oracle.VoltDBTaskOracle;
 import sqlancer.voltdb.oracle.VoltDBTtlOracle;
 import sqlancer.voltdb.oracle.VoltDBViewOracle;
 import sqlancer.voltdb.oracle.VoltDBWindowOracle;
@@ -217,6 +218,16 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBXdcrConflictOracle(globalState);
+        }
+    },
+    /**
+     * Scheduled tasks (milestone 39): a task of each schedule (EVERY, DELAY, CRON; on the database or on every
+     * partition) must run as often as scheduled and stop when disabled, and ON ERROR STOP must stop it.
+     */
+    TASK {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBTaskOracle(globalState);
         }
     },
 
