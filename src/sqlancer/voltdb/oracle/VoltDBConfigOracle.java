@@ -14,6 +14,7 @@ import sqlancer.Randomly;
 import sqlancer.Reproducer;
 import sqlancer.common.oracle.TestOracle;
 import sqlancer.voltdb.VoltDBConnection;
+import sqlancer.voltdb.VoltDBOptions;
 import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 
 /**
@@ -62,6 +63,12 @@ public class VoltDBConfigOracle implements TestOracle<VoltDBGlobalState> {
 
     @Override
     public void check() throws Exception {
+        VoltDBOptions o = state.getDbmsSpecificOptions();
+        if (o.avoidKnownBugs && o.resizes) {
+            // ENG-30682: a node that joins while settings change misses some of them for good, and reports other values
+            // than the rest of the cluster
+            throw new IgnoreMeException();
+        }
         synchronized (LOCK) {
             String before = settings();
             if (Randomly.getBooleanWithRatherLowProbability()) {

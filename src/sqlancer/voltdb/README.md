@@ -1118,11 +1118,12 @@ unexercised. In an XDCR run (`--xdcr`), each XCONFLICT check:
    both clusters; if the clusters do not hold the same rows (a divergence an earlier check left), it empties the table
    through both first;
 2. writes the same few keys through both clusters at once, alternating, without waiting for replication: inserts,
-   upserts and updates by key, and updates by value (multi-partition on the partitioned table); deletes by key and by
-   value too, but only while `--avoid-known-bugs` is false (ENG-30679 below);
+   upserts and updates by key, updates by value (multi-partition on the partitioned table), and deletes by key and by
+   value;
 3. waits up to 60 s for the clusters to agree. VoltDB resolves most conflicts so that they do. Where they still differ
    on a key, XDCR's conflict log (its `xdcr_conflicts` export files under each node's voltdbroot, which the oracle
-   finds through `--cluster-dir`) must have a row for that table and key with `DIVERGENCE` `D`.
+   finds through `--cluster-dir`) must have a row for that table and key with `DIVERGENCE` `D`. While
+   `--avoid-known-bugs` is true, a key left different with no such row is counted (ENG-30679 below), not failed.
 
 `run-sqlancer.sh` does not count conflicts on these tables against the run. At exit the oracle prints how many checks
 converged and how many differing keys were reported as diverged. In a 5-minute trial on two 3-node clusters (k=1,
@@ -1767,6 +1768,12 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
 
+The bugs below were found in lab build #53 and in milestone 41.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30682 | A node that joins elastically while `@SetYamlConfiguration` changes are made misses some of them for good: afterwards it reports, through `@GetYamlConfiguration`, older values of some system settings than the rest of the cluster (in the reproduction, `elastic.throughput` 1 and `flushinterval.minimum` 2000 where the others have 2 and 500). 16.0.0 too. Found by CONFIG in lab build #53's resize run; `repros/ENG-30682.sh` adds 2 nodes to 3 while toggling three settings and compares each node's. Critical. | While `--avoid-known-bugs` is true, CONFIG checks nothing in runs that resize |
+
 The bug below was found in milestone 40.
 
 | Ticket | Issue | Workaround |
@@ -1783,7 +1790,7 @@ The bug below was found in milestone 38.
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
-| ENG-30679 | XDCR silently diverges when a DELETE of a key on one cluster races a write of it (insert, update, upsert) on the other: e.g. `A: INSERT (0, 'a0', 3)`, `B: UPSERT (0, 'b1', 2)`, `B: DELETE k = 0` (twice), sent without waiting for replication, leave cluster A without the row and cluster B with A's, and every conflict in the log says consistent (`C`). Other forms leave each cluster with the other's value. 16.0.0 too. Found by XCONFLICT; `repros/ENG-30679.sh` starts an XDCR pair and replays the sequence with `repros/xdcr/XdcrRepro.java`. Wrong result, Blocker for V16.1.0. | While `--avoid-known-bugs` is true, XCONFLICT's checks delete nothing |
+| ENG-30679 | XDCR silently diverges when a DELETE of a key on one cluster races a write of it (insert, update, upsert) on the other: e.g. `A: INSERT (0, 'a0', 3)`, `B: UPSERT (0, 'b1', 2)`, `B: DELETE k = 0` (twice), sent without waiting for replication, leave cluster A without the row and cluster B with A's, and every conflict in the log says consistent (`C`). Other forms leave each cluster with the other's value. 16.0.0 too. Found by XCONFLICT; `repros/ENG-30679.sh` starts an XDCR pair and replays the sequence with `repros/xdcr/XdcrRepro.java`. Wrong result, Blocker for V16.1.0. | While `--avoid-known-bugs` is true, XCONFLICT counts a key left different with no divergence logged rather than failing (until lab build #53 its checks deleted nothing, but in the lab, on x86, inserts racing upserts diverge silently too) |
 
 The bugs below were found in milestone 37.
 
