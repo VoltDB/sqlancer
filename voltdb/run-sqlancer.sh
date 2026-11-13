@@ -185,7 +185,7 @@ if $security; then
     provider_args=(--security true ${provider_args[@]+"${provider_args[@]}"})
 fi
 if $export; then
-    provider_args=(--export-target sqlancer,sqlancer_http --loopback-target sqlancer_lb ${provider_args[@]+"${provider_args[@]}"})
+    provider_args=(--export-target sqlancer,sqlancer_http --loopback-target sqlancer_lb --ttl-migrate-target sqlancer_lbt ${provider_args[@]+"${provider_args[@]}"})
 fi
 # the administrator's credentials for voltadmin and sqlancer, with --security
 admin_creds=()
@@ -465,6 +465,10 @@ if $export; then
         <configuration target="sqlancer_lb" enabled="true" type="custom"
                 exportconnectorclass="org.voltdb.exportclient.loopback.LoopbackExportClient">
             <property name="procedure">XS_LB.insert</property>
+        </configuration>
+        <configuration target="sqlancer_lbt" enabled="true" type="custom"
+                exportconnectorclass="org.voltdb.exportclient.loopback.LoopbackExportClient">
+            <property name="procedure">XS_LBT.insert</property>
         </configuration>
     </export>'
 fi

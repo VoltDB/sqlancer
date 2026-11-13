@@ -22,6 +22,7 @@ import sqlancer.voltdb.oracle.VoltDBStreamOracle;
 import sqlancer.voltdb.oracle.VoltDBSubqueryOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPAggregateOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPOracle;
+import sqlancer.voltdb.oracle.VoltDBTtlOracle;
 import sqlancer.voltdb.oracle.VoltDBViewOracle;
 import sqlancer.voltdb.oracle.VoltDBWindowOracle;
 import sqlancer.voltdb.oracle.VoltDBXdcrOracle;
@@ -148,6 +149,17 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBStreamOracle(globalState);
+        }
+    },
+
+    /**
+     * Rows VoltDB removes by itself (milestone 34): a TTL table drops its expired rows and keeps the others, and
+     * MIGRATE moves rows out through the loopback target (--loopback-target) or, without one, marks them MIGRATING.
+     */
+    TTL {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBTtlOracle(globalState);
         }
     },
 
