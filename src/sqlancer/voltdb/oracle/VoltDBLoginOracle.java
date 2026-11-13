@@ -212,8 +212,9 @@ public class VoltDBLoginOracle implements TestOracle<VoltDBGlobalState> {
                     lastQuery + " does not list the user " + user + " just added; it lists " + users.keySet());
         }
         String expected = sha256(password);
-        if (!expected.equals(u.get("password")) || !"false".equals(u.get("plaintext")) || !role.equals(u.get("roles"))
-                || expires != null && !expires.equals(u.get("expires"))) {
+        // as given: a digest added in lowercase is listed in lowercase
+        if (!expected.equalsIgnoreCase(u.get("password")) || !"false".equals(u.get("plaintext"))
+                || !role.equals(u.get("roles")) || expires != null && !expires.equals(u.get("expires"))) {
             throw new AssertionError(lastQuery + " lists the user " + user + " as " + u + "; expected the password "
                     + expected + " (masked, plaintext false), the role " + role
                     + (expires == null ? "" : " and the expiry date " + expires));
