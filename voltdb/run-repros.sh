@@ -209,7 +209,27 @@ run_sh() {
     1) verdict=FIXED ;;
     *) verdict=ERROR ;;
     esac
+    settle_ports
     rm -rf "$work"
+}
+
+# after a script reproduction: kill what it left running from its work directory, and wait until its ports (node
+# slots 0 to 29, which take in an XDCR peer's) are free, so the next reproduction can start (lab build #55's ENG-30679
+# found port 31000 still taken in the second ENG-30678 exited)
+settle_ports() {
+    local slot j busy
+    pkill -9 -f "$work/" 2>/dev/null
+    for _ in $(seq 1 60); do
+        busy=
+        for slot in $(seq 0 29); do
+            for j in 0 1 2 3 4 5; do
+                (exec 3<>"/dev/tcp/127.0.0.1/$(port "$slot" "$j")") 2>/dev/null && { busy=$(port "$slot" "$j"); break 2; }
+            done
+        done
+        [ -z "$busy" ] && return
+        sleep 1
+    done
+    echo "port $busy is still in use 60 s after a reproduction" >&2
 }
 
 # a reproduction with a "-- manual: reason" header does not reproduce every time, and one with a "-- platforms: LIST"

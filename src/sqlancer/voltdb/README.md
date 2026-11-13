@@ -1235,6 +1235,10 @@ tables and indexes it checked.
 In 5-minute trials on 3 nodes with k=1, beside NoREC, TLP WHERE, VIEWS and PROCEDURE: 276 calls, 441 tables and 2,422
 primary key indexes checked; with a node killed every minute, 152, 281 and 2,156. No disagreement was found.
 
+Milestone 43's coverage run (`run-coverage.sh`, six runs of 10 minutes on master bf8602e3, every oracle): `SystemInformation`
+223 of 373 lines (from 119), `StatsAgent` 182 of 338 (from 145); system procedures as a whole 53.5% of their lines (from
+46.6%). `SslSetup` stays at 18 of 348: the coverage runs do not use `--ssl`.
+
 ## The PERMS oracle
 
 With `--security`, the deployment enables security with three users, `sqlancer` (administrator, whom SQLancer and
@@ -1801,7 +1805,7 @@ The bugs below were found in milestone 19.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30510 (comment) | The RIGHT JOIN bug through a FULL JOIN: a WHERE clause that rejects the right table's NULLs turns `a FULL JOIN b ON c >= b.k` into a RIGHT JOIN and then a LEFT JOIN that uses the ON condition as b's index range, dropping b's row. Found by TLP WHERE. Wrong result. | A FULL JOIN's ON condition reads the left table only. |
-| ENG-30611 | `DATEADD(YEAR, n, d)` on a DATE February 29 into a non-leap year: with a DATE literal the server aborts (uncaught `boost::gregorian::bad_day_of_month`), with a column it is "Invalid date 'February 29' as '2025' is not a leap year"; a TIMESTAMP and MONTH 12 give February 28. Found by PARAMS, crash found probing it. Critical. | DATEADD has no YEAR unit. |
+| ENG-30611 | `DATEADD(YEAR, n, d)` on a DATE February 29 into a non-leap year: with a DATE literal the server aborts (uncaught `boost::gregorian::bad_day_of_month`), with a column it is "Invalid date 'February 29' as '2025' is not a leap year"; a TIMESTAMP and MONTH 12 give February 28. Found by PARAMS, crash found probing it. Critical. Fixed in V16.1.0 (the reproduction reports FIXED from lab build #55 on); the workaround stays while the mirror and upgrade runs use 16.0.0. | DATEADD has no YEAR unit. |
 
 The bugs below were found in milestone 21.
 
