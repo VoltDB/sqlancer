@@ -52,7 +52,9 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
                      --crash-interval, --xdcr or --upgrade-from.
   --export           add a file export target ("sqlancer", CSV into each node's voltdbroot/sqlancer_export) for the
                      STREAMS oracle's streams, and check at the end, after @Quiesce, that it wrote every row they got;
-                     and a loopback target ("sqlancer_lb", into the table XS_LB) whose rows STREAMS checks as it goes
+                     and a loopback target ("sqlancer_lb", into the table XS_LB) whose rows STREAMS checks as it goes;
+                     an HTTP target ("sqlancer_http") and a JDBC target ("sqlancer_jdbc", into a one-node sink
+                     cluster of the same kit) whose rows are counted with the file target's
   --keep-cluster     leave the cluster running and its data in place after the run
   --mirror-voltdb DIR  also start one node of this other VoltDB kit (normally the last release) and run
                      the provider with --mirror: every change is repeated on it, and the DIFF oracle
@@ -185,7 +187,7 @@ if $security; then
     provider_args=(--security true ${provider_args[@]+"${provider_args[@]}"})
 fi
 if $export; then
-    provider_args=(--export-target sqlancer,sqlancer_http --loopback-target sqlancer_lb --ttl-migrate-target sqlancer_lbt ${provider_args[@]+"${provider_args[@]}"})
+    provider_args=(--export-target sqlancer,sqlancer_http,sqlancer_jdbc --loopback-target sqlancer_lb --ttl-migrate-target sqlancer_lbt ${provider_args[@]+"${provider_args[@]}"})
 fi
 # the administrator's credentials for voltadmin and sqlancer, with --security
 admin_creds=()
@@ -245,8 +247,9 @@ port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 added=0
 [ "$resize_interval" -gt 0 ] && added=$((kfactor + 1))
 added_slot=$((nodes + 1))
-# the XDCR peer's nodes take the slots from 20
+# the XDCR peer's nodes take the slots from 20; with --export, the JDBC target's sink node takes slot 19
 xdcr_slot=20
+sink_slot=19
 for ((i = 0; i < added_slot + added; i++)); do
     [ "$i" -eq "$nodes" ] && [ -z "$mirror_home" ] && continue
     for j in 0 1 2 3 4 5; do
@@ -254,6 +257,12 @@ for ((i = 0; i < added_slot + added; i++)); do
         port_in_use "$p" && die "port $p is in use; pick another --port-base"
     done
 done
+if $export; then
+    [ $((added_slot + added)) -le "$sink_slot" ] || die "--export allows at most $((sink_slot - 1 - added)) nodes"
+    for j in 0 1 2 3 4 5; do
+        port_in_use "$(port $sink_slot $j)" && die "port $(port $sink_slot $j) is in use; pick another --port-base"
+    done
+fi
 if $xdcr; then
     [ "$nodes" -le "$xdcr_slot" ] || die "--xdcr allows at most $xdcr_slot nodes"
     for ((i = xdcr_slot; i < xdcr_slot + nodes; i++)); do
@@ -370,7 +379,7 @@ stop_cluster() {
         sleep 1
     done
     pkill -f "$cluster/" 2>/dev/null
-    for f in "$cluster"/node*.pid "$cluster"/add*.pid "$cluster"/mirror.pid; do
+    for f in "$cluster"/node*.pid "$cluster"/add*.pid "$cluster"/mirror.pid "$cluster"/sink.pid; do
         [ -e "$f" ] && is_server "$(cat "$f")" && kill -9 "$(cat "$f")" 2>/dev/null
     done
 }
@@ -455,6 +464,12 @@ if $security; then
         <user name="writer" password="writer" roles="sqlancer_write"/>
     </users>'
 fi
+# ENG-30681: into VoltDB the JDBC target writes rows with UPSERT, but the tables it creates have no primary key, so
+# VoltDB refuses every row; and its CREATE TABLE gives a FLOAT column the type DOUBLE PRECISION, which VoltDB refuses
+# too. While avoiding known bugs (the provider's default), the sink's tables are created beforehand, with I (unique in
+# the run) as their primary key, and the target creates none; a row exported twice is upserted once
+jdbc_createtable=false
+case " ${provider_args[*]-} " in *" --avoid-known-bugs false "*) jdbc_createtable=true ;; esac
 # with --export, a file target for the STREAMS oracle's streams, one CSV line per row. The outdir is relative, so each
 # node writes into its own voltdbroot, as on separate hosts: in one shared directory two nodes exporting the same
 # stream in the same second name the same file, and the target refuses it and retries the block for good, logging a
@@ -471,6 +486,14 @@ if $export; then
         </configuration>
         <configuration target="sqlancer_http" enabled="true" type="http">
             <property name="endpoint">http://localhost:'"$(port 0 7)"'/%t</property>
+        </configuration>
+        <configuration target="sqlancer_jdbc" enabled="true" type="jdbc">
+            <property name="jdbcurl">jdbc:voltdb://localhost:'"$(port $sink_slot 0)"'</property>
+            <property name="jdbcuser">sqlancer</property>
+            <property name="jdbcpassword">sqlancer</property>
+            <property name="ignoregenerations">true</property>
+            <property name="skipinternals">true</property>
+            <property name="createtable">'"$jdbc_createtable"'</property>
         </configuration>
         <configuration target="sqlancer_lb" enabled="true" type="custom"
                 exportconnectorclass="org.voltdb.exportclient.loopback.LoopbackExportClient">
@@ -612,6 +635,42 @@ if [ -n "$mirror_home" ]; then
         die "the mirror did not start; see $cluster/start-mirror.log: $(tail -1 "$cluster/start-mirror.log" 2>/dev/null)"
     log "Mirror ready: $(grep -h -m1 "^Build:" "$cluster/init-mirror.log" 2>/dev/null), client port $(client_port $m)"
     provider_args+=(--mirror "localhost:$(client_port $m)")
+fi
+
+# --- the JDBC target's sink (--export) ---------------------------------------------------------------------------
+
+# one node of the kit under test, k=0, 2 sites per host, on port slot 19, never killed; the JDBC target (milestone 40)
+# creates a table there for each stream it exports, named after the stream, and inserts each row into it
+if $export; then
+    sed -e 's/sitesperhost="[0-9]*"/sitesperhost="2"/' -e "s/kfactor=\"$kfactor\"/kfactor=\"0\"/" \
+        -e '/<commandlog /d' -e '/<snapshot /d' -e '/<dr /d' -e '/<connection /d' -e '/<\/dr>/d' \
+        -e '/<export>/,/<\/export>/d' "$cluster/deployment.xml" >"$cluster/deployment-sink.xml"
+    "$voltdb_home/bin/voltdb" init --force -D "$cluster/sink" -C "$cluster/deployment-sink.xml" \
+        ${license_args[@]+"${license_args[@]}"} >"$cluster/init-sink.log" 2>&1 ||
+        die "voltdb init failed for the JDBC sink; see $cluster/init-sink.log"
+    (nohup "$voltdb_home/bin/voltdb" start -D "$cluster/sink" -c 1 -H "localhost:$(internal_port $sink_slot)" \
+        --client="$(client_port $sink_slot)" --admin="$(admin_port $sink_slot)" \
+        --internal="$(internal_port $sink_slot)" --zookeeper="$(port $sink_slot 3)" \
+        --replication="$(port $sink_slot 4)" --metrics="$(port $sink_slot 5)" >"$cluster/start-sink.log" 2>&1 &
+        echo $! >"$cluster/sink.pid")
+    for _ in $(seq 1 300); do
+        grep -q "Server completed initialization" "$cluster/sink/voltdbroot/log/volt.log" 2>/dev/null && break
+        kill -0 "$(cat "$cluster/sink.pid")" 2>/dev/null || break
+        sleep 1
+    done
+    grep -q "Server completed initialization" "$cluster/sink/voltdbroot/log/volt.log" 2>/dev/null ||
+        die "the JDBC sink did not start; see $cluster/start-sink.log"
+    if ! $jdbc_createtable; then
+        # the tables the target would create: the STREAMS oracle's stream columns, one table per database name and
+        # stream generation (XS_DB2_ST, then XS_DB2G1_ST up to G8, as streams fall out of step)
+        for ((d = 0; d < 2 * threads; d++)); do
+            for g in "" G1 G2 G3 G4 G5 G6 G7 G8; do
+                echo "CREATE TABLE XS_DB${d}${g}_ST (K INTEGER NOT NULL, V BIGINT, S VARCHAR(16), F FLOAT, I BIGINT NOT NULL, PRIMARY KEY (I));"
+            done
+        done | "$voltdb_home/bin/sqlcmd" --port="$(client_port $sink_slot)" ${admin_creds[@]+--user=sqlancer --password=sqlancer} \
+            >>"$results/run.log" 2>&1
+    fi
+    log "JDBC sink ready, client port $(client_port $sink_slot)$($jdbc_createtable || echo ", tables made beforehand (ENG-30681)")"
 fi
 
 # --- SQLancer ----------------------------------------------------------------------------------------------------
@@ -1075,11 +1134,40 @@ export_failed=false
 exported=0
 duplicates=0
 inserted=0
+stream_interrupted=0
 if $export; then
     within 120 "$voltdb_home/bin/sqlcmd" --port="$(client_port 0)" ${admin_creds[@]+--user=sqlancer --password=sqlancer} \
         <<<"exec @Quiesce;" >>"$results/run.log" 2>&1
     inserted=$(grep -m1 "^STREAMS inserted rows:" "$results/sqlancer/out.log" | sed 's/^STREAMS inserted rows: \([0-9]*\).*/\1/')
+    # inserts a node failure interrupted: each may have committed and been exported, or not
+    stream_interrupted=$(grep -m1 "^STREAMS inserted rows:" "$results/sqlancer/out.log" | sed -n 's/.*; interrupted inserts: \([0-9]*\).*/\1/p')
+    stream_interrupted=${stream_interrupted:-0}
     inserted=${inserted:-0}
+    # the JDBC target's rows, in the sink's tables named after the streams (XS_DB2_ST and so on): once their counts
+    # are the same three times in a row (at most 40 tries), each table's rows and distinct I (unique in the run), into
+    # export/jdbc.csv as TABLE,ROWS,DISTINCT_I
+    jdbc_count() {
+        local t queries=
+        for t in $("$voltdb_home/bin/sqlcmd" --port="$(client_port $sink_slot)" ${admin_creds[@]+--user=sqlancer --password=sqlancer} \
+            --output-format=csv --output-skip-metadata <<<"exec @SystemCatalog TABLES;" 2>/dev/null |
+            awk -F, '{ gsub(/"/, "", $3); if ($3 ~ /^XS_DB[0-9]+(G[0-9]+)?_ST$/) print $3 }'); do
+            queries+="SELECT '$t', COUNT(*), COUNT(DISTINCT i) FROM $t;"$'\n'
+        done
+        [ -n "$queries" ] || return 0
+        "$voltdb_home/bin/sqlcmd" --port="$(client_port $sink_slot)" ${admin_creds[@]+--user=sqlancer --password=sqlancer} \
+            --output-format=csv --output-skip-metadata <<<"$queries" 2>/dev/null | tr -d '"' | sort
+    }
+    last= same=0
+    for _ in $(seq 1 40); do
+        now=$(jdbc_count)
+        [ "$now" = "$last" ] && same=$((same + 1)) || same=0
+        last=$now
+        [ "$same" -ge 3 ] && break
+        sleep 1
+    done
+    mkdir -p "$results/export"
+    printf '%s\n' "$last" | grep -E '^XS_DB[0-9]+(G[0-9]+)?_ST,[0-9]+,[0-9]+$' >"$results/export/jdbc.csv"
+    within 60 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $sink_slot)" ${admin_creds[@]+"${admin_creds[@]}"} >>"$results/run.log" 2>&1
 fi
 
 # --- collect -----------------------------------------------------------------------------------------------------
@@ -1135,13 +1223,18 @@ if $xdcr; then
 fi
 # the JVM error reports of servers that crashed; each names its node's directory in its command line
 save_logs "$results/servers" "$cluster"/hs_err_pid*.log
+if $export; then
+    save_logs "$results/servers/sink" "$cluster/start-sink.log" "$cluster/init-sink.log" "$cluster/sink/voltdbroot/log"
+fi
 if [ -n "$mirror_home" ]; then
     save_logs "$results/servers/mirror" "$cluster/start-mirror.log" "$cluster/init-mirror.log" \
         "$cluster/mirror/voltdbroot/log"
 fi
 cp "$cluster/deployment.xml" "$results/"
-# every row the STREAMS oracle inserted must have been exported; export is at least once, so a row exported twice (an
-# identical line, with the same transaction id and sequence number) counts once, and the duplicates are reported
+# every row the STREAMS oracle inserted must have been exported; export is at least once, so a row exported twice counts
+# once, and the duplicates are reported. A row is told by its I, unique in the run: a row a new partition leader exported
+# again after a failover has the same transaction id and sequence number but another site id (milestone 40), so its
+# line differs
 if $export; then
     for ((i = 0; i < nodes; i++)); do
         mkdir -p "$results/export/node$i"
@@ -1149,15 +1242,19 @@ if $export; then
     done
     cp "$cluster/http-export.log" "$results/export/" 2>/dev/null
     total=$(cat "$cluster"/node*/voltdbroot/sqlancer_export/*.csv 2>/dev/null | wc -l | tr -d ' ')
-    exported=$(cat "$cluster"/node*/voltdbroot/sqlancer_export/*.csv 2>/dev/null | sort -u | wc -l | tr -d ' ')
+    # each line's last column is the row's I
+    exported=$(cat "$cluster"/node*/voltdbroot/sqlancer_export/*.csv 2>/dev/null | awk -F, '{ print $NF }' | sort -u | wc -l | tr -d ' ')
     # the HTTP target's rows: each request is one row, its columns as form fields; the row's I is unique in the run
     http_total=$(grep -c "&I=[0-9]*" "$cluster/http-export.log" 2>/dev/null)
     http_rows=$(grep -o "&I=[0-9]*" "$cluster/http-export.log" 2>/dev/null | sort -u | wc -l | tr -d ' ')
-    total=$((total + ${http_total:-0}))
-    exported=$((exported + ${http_rows:-0}))
+    jdbc_total=$(awk -F, '{ s += $2 } END { print s + 0 }' "$results/export/jdbc.csv" 2>/dev/null)
+    jdbc_rows=$(awk -F, '{ s += $3 } END { print s + 0 }' "$results/export/jdbc.csv" 2>/dev/null)
+    total=$((total + ${http_total:-0} + ${jdbc_total:-0}))
+    exported=$((exported + ${http_rows:-0} + ${jdbc_rows:-0}))
     duplicates=$((total - exported))
-    [ "$exported" -eq "$inserted" ] || export_failed=true
-    log "Export: $exported rows exported (${http_rows:-0} through HTTP; $duplicates exported twice), $inserted inserted into the streams$($export_failed && echo ", MISMATCH")"
+    # every inserted row, and at most the interrupted ones besides
+    [ "$exported" -ge "$inserted" ] && [ "$exported" -le $((inserted + stream_interrupted)) ] || export_failed=true
+    log "Export: $exported rows exported (${http_rows:-0} through HTTP, ${jdbc_rows:-0} through JDBC; $duplicates exported twice), $inserted inserted into the streams ($stream_interrupted inserts interrupted)$($export_failed && echo ", MISMATCH")"
 fi
 # XDCR's conflict log: each database writes through one cluster only, so XDCR has nothing to resolve, and any
 # conflict it logged fails the run; but for XCONFLICT's tables (XCP_..., XCR_...), whose conflicts it makes on purpose
@@ -1228,7 +1325,7 @@ result=PASS
     grep -m1 "^SNAPSHOT restores checked:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^XCONFLICT checks:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^TASK checks:" "$results/sqlancer/out.log" 2>/dev/null
-    $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)")"
+    $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP, ${jdbc_rows:-0} through JDBC, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)")"
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
     [ "$crash_interval" -gt 0 ] && echo "crashes: $crashes crashes, $recoveries recoveries$($crash_failed && echo ", a recovery FAILED (crash.log)")"
