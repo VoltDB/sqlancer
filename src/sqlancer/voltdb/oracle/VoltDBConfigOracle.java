@@ -64,9 +64,10 @@ public class VoltDBConfigOracle implements TestOracle<VoltDBGlobalState> {
     @Override
     public void check() throws Exception {
         VoltDBOptions o = state.getDbmsSpecificOptions();
-        if (o.avoidKnownBugs && o.resizes) {
+        if (o.avoidKnownBugs && (o.resizes || o.upgrades)) {
             // ENG-30682: a node that joins while settings change misses some of them for good, and reports other values
-            // than the rest of the cluster
+            // than the rest of the cluster; ENG-30683: during an in-service upgrade from 16.0.0, a change through an
+            // upgraded node fails ("requires exactly two parameters")
             throw new IgnoreMeException();
         }
         synchronized (LOCK) {

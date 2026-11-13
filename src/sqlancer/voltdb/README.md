@@ -1773,6 +1773,7 @@ The bugs below were found in lab build #53 and in milestone 41.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30682 | A node that joins elastically while `@SetYamlConfiguration` changes are made misses some of them for good: afterwards it reports, through `@GetYamlConfiguration`, older values of some system settings than the rest of the cluster (in the reproduction, `elastic.throughput` 1 and `flushinterval.minimum` 2000 where the others have 2 and 500). 16.0.0 too. Found by CONFIG in lab build #53's resize run; `repros/ENG-30682.sh` adds 2 nodes to 3 while toggling three settings and compares each node's. Critical. | While `--avoid-known-bugs` is true, CONFIG checks nothing in runs that resize |
+| ENG-30683 | During an in-service upgrade from 16.0.0, `@SetYamlConfiguration` through a node already upgraded to 16.1 fails with UNEXPECTED_FAILURE, "The UpdateDeployment system procedure requires exactly two parameters, the deployment as a string, and an operation mode, 'full' or 'sectional'"; through the 16.0.0 nodes it succeeds. Found by CONFIG in lab build #53's upgrade run; `repros/ENG-30683.sh` (manual: it needs a 16.0.0 kit as `OLD_VOLTDB_HOME`) upgrades one of 3 nodes and calls it through each. Major. | While `--avoid-known-bugs` is true, CONFIG checks nothing in runs that upgrade |
 
 The bug below was found in milestone 40.
 
