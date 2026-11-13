@@ -34,7 +34,8 @@ public class VoltDBConfigOracle implements TestOracle<VoltDBGlobalState> {
 
     // a setting under deployment.systemsettings and the values it may take
     private static final Map<String, Object[]> SETTINGS = new LinkedHashMap<>();
-    private static final Object LOCK = new Object();
+    // one change to the deployment at a time: this oracle's and LOGIN's
+    static final Object LOCK = new Object();
     private static final AtomicLong CHANGES = new AtomicLong();
     private static final AtomicLong REFUSALS = new AtomicLong();
 
