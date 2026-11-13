@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 36.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 37.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -47,7 +47,8 @@ Since milestone 34 the TTL oracle checks rows VoltDB removes by itself, time to 
 [The TTL oracle](#the-ttl-oracle). Since milestone 35 the LOAD and SWAP oracles check bulk loads and
 `@SwapTables`, and `@ValidatePartitioning` after each; see [The LOAD and SWAP oracles](#the-load-and-swap-oracles).
 Since milestone 36 the CONFIG oracle changes the configuration while the database runs; see
-[The CONFIG oracle](#the-config-oracle).
+[The CONFIG oracle](#the-config-oracle). Since milestone 37 the SNAPSHOT oracle saves and restores a table by
+snapshot; see [The SNAPSHOT oracle](#the-snapshot-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -457,7 +458,7 @@ the kit's runtime JDK and makes seven runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-six (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP, CONFIG; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-seven (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP, CONFIG, SNAPSHOT; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
 | `sqlancer-1n-k0-security` | 1 node, 8 sites per host, security on (see [The PERMS oracle](#the-perms-oracle)); `sqlancer-1n-k0` until milestone 28 | the same | 45 minutes |
 | `sqlancer-3n-k2-export-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all; the streams export (see [The STREAMS oracle](#the-streams-oracle)); `sqlancer-3n-k2-s2` until milestone 29 | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
@@ -1062,6 +1063,45 @@ Measured with `run-coverage.sh`'s kill run (15 minutes, master bf8602e3, every o
 runs together: `@SetYamlConfiguration` 176 of 404 lines (from 10), `@GetYamlConfiguration` 73 of 155 (from 2),
 `YamlUtils` 86 of 169 (from 0) and `@UpdateDeployment` 168 of 256 (from 3).
 
+## The SNAPSHOT oracle
+
+Milestone 37. Milestone 30's coverage run found the snapshot code little exercised beyond what recovery uses:
+`SnapshotRestore` 802 of 1,518 lines, `SnapshotUtil` 439 of 852, `TableSaveFile` 268 of 518, and none of
+`SavedTableConverter`, `CSVSnapshotWritePlan` or `SnapshotSizeEstimator`. Each SNAPSHOT check uses a table of its own,
+`XNP_DB0` (partitioned) or `XNR_DB0` (replicated), shaped as LOAD's twins:
+
+1. It empties the table, fills it, and saves a native snapshot of it alone with a blocking `@SnapshotSave`.
+   `@SnapshotScan` of a node's snapshot directory must list the snapshot, of that table.
+2. A third of the checks also save a CSV snapshot of it, whose files must hold the table's rows, each once.
+3. It changes the table (deletes, updates, inserts), then restores the table alone with `@SnapshotRestore`, either:
+   - into the emptied table: the table must hold exactly the rows saved; or
+   - into the table as it is, with a duplicates path: each saved row that collides with none there (on the primary key
+     or the unique index on `(k, v)`, where VoltDB counts NULLs as equal) must be added, each that does must go to the
+     duplicates files, and nothing else may change. VoltDB reports such a restore as failed, so the table and the
+     files decide.
+4. `@SnapshotDelete` removes the check's snapshots.
+
+How the oracle fits VoltDB's snapshot handling:
+
+- Snapshots go to each node's own snapshot directory (`pathType` `SNAP_AUTO`): `run-sqlancer.sh`'s nodes all run on one
+  machine, and in a shared directory they find each other's files and refuse the nonce. `--snapshot-path`, which
+  `run-sqlancer.sh` sets to its cluster directory, is where the oracle finds the nodes' files.
+- Every replica of a partition writes its duplicates, and a partitioned table's CSV rows are spread over the hosts, so
+  the oracle counts distinct rows. A replicated table's duplicates reach the files up to a minute after the restore
+  answers, and the oracle waits for them.
+- VoltDB takes one snapshot at a time: a save while another runs (the truncation snapshot that each restore asks for,
+  with the command log on) is answered SNAPSHOT REQUEST QUEUED and taken later, after `USER_SNAPSHOT_RETRY_INTERVAL`
+  seconds, 30 by default. `run-sqlancer.sh` sets it to 1 on the servers (`SQLANCER_USER_SNAPSHOT_RETRY` overrides it;
+  empty keeps VoltDB's default), and the oracle waits for a queued save in `@Statistics SNAPSHOTSTATUS`. Checks take
+  turns across SQLancer's threads.
+- A restore while a node rejoins wedges the cluster (ENG-30676 below), so while `--avoid-known-bugs` is true a restore
+  waits while `--ddl-hold`'s file exists, from before each kill until the node has rejoined.
+- After a node has rejoined, a restore's duplicates can go unwritten (ENG-30678 below), so while `--avoid-known-bugs` is
+  true and nodes fail, resize, crash or upgrade, the duplicates files are not counted; the table still is.
+- A restore while DDL runs makes writes to a join view's replicated table crash the server (ENG-30677 below), so while
+  `--avoid-known-bugs` is true no DDL of SQLancer runs during a restore: every connection's DDL holds a lock shared
+  (`VoltDBConnection`), and a restore holds it exclusive.
+
 ## The PERMS oracle
 
 With `--security`, the deployment enables security with three users, `sqlancer` (administrator, whom SQLancer and
@@ -1610,6 +1650,18 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
+The bugs below were found in milestone 37.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30678 | After a node has been killed and has rejoined (node 0 in the reproduction), `@SnapshotRestore` with a duplicates path leaves the duplicate rows out of the table, as it should, but writes none of them to the duplicates files, and no host logs finding them. 16.0.0 too. Found by SNAPSHOT in a 3-node trial with kills; `repros/ENG-30678.sh` restores a replicated table into itself between kills and finds the files empty after the first host has rejoined. Major. | While `--avoid-known-bugs` is true and nodes fail, resize, crash or upgrade, SNAPSHOT checks the restored table but does not count the duplicates files |
+| ENG-30677 | Writes to the replicated table of a view over a join of a replicated and a (empty) partitioned table crash the server (SIGSEGV in `ReplicatedMaterializedViewHandler`'s maintenance scan, on a stale table) while a `@SnapshotRestore` of another table and DDL on others run at once; either alone does not. 16.0.0 too. Found by SNAPSHOT in a 3-node trial (all three nodes at once, 13 s in); `repros/ENG-30677.sh` (a stress script) crashes it in seconds to minutes. Server crash, Blocker for V16.1.0. | While `--avoid-known-bugs` is true, no DDL of SQLancer runs during a restore: DDL holds a lock shared, a restore exclusive |
+| ENG-30676 | `@SnapshotRestore` of a table while a node rejoins wedges the cluster for good: a site waits in `SnapshotRestore.executePlanFragment` (`SiteMailbox.recvBlocking`) for table data that never comes, the MP site waits for it, nothing else runs on those sites, and the rejoin never completes. 16.0.0 too. Found by SNAPSHOT in a 3-node trial with node kills; `repros/ENG-30676.sh` (two clients restoring a table while a node is killed and rejoined) wedges the cluster at the first kill. Hang, Blocker for V16.1.0. | While `--avoid-known-bugs` is true, a restore waits while `--ddl-hold`'s file exists (from before each kill until the node has rejoined) |
+
+Milestone 37 also met the open ENG-15392: a `@SnapshotRestore` parameter that is not JSON makes the server
+close the client's connection, and JSON without `path` fails with an internal `JSONException` and its stack trace.
+The oracle always sends complete JSON.
 
 The bug below was found in milestone 35.
 

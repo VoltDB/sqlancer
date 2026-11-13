@@ -13,6 +13,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.regex.Pattern;
 
 import sqlancer.IgnoreMeException;
@@ -79,6 +80,12 @@ public class VoltDBConnection extends SQLConnection {
     // the --ddl-hold file, or null
     private Path ddlHold;
 
+    // ENG-30677: writes to a join view's replicated table crash the server while a snapshot restore and DDL run at
+    // once;
+    // DDL, on every connection of this SQLancer, holds this shared, and a restore (VoltDBSnapshotOracle, while
+    // avoiding known bugs) holds it exclusive
+    private static final ReentrantReadWriteLock DDL_OR_RESTORE = new ReentrantReadWriteLock();
+
     public VoltDBConnection(Connection connection, int retrySeconds, boolean nodeFailures) {
         super(connection);
         this.connection = connection;
@@ -114,6 +121,21 @@ public class VoltDBConnection extends SQLConnection {
 
     public void setMirror(VoltDBConnection mirror) {
         this.mirror = mirror;
+    }
+
+    // runs a restore with no DDL running on any connection of this SQLancer
+    public static <T> T withoutDdl(java.util.concurrent.Callable<T> restore) throws Exception {
+        DDL_OR_RESTORE.writeLock().lock();
+        try {
+            return restore.call();
+        } finally {
+            DDL_OR_RESTORE.writeLock().unlock();
+        }
+    }
+
+    private static boolean isDdl(Method method, Object... args) {
+        return method.getName().startsWith("execute") && args != null && args.length == 1 && args[0] instanceof String
+                && DDL.matcher((String) args[0]).matches();
     }
 
     public void setDdlHold(Path ddlHold) {
@@ -268,31 +290,41 @@ public class VoltDBConnection extends SQLConnection {
                     if (method.getName().startsWith("execute")) {
                         holdDdl(args);
                     }
-                    long deadline = System.currentTimeMillis() + retryMillis;
-                    while (true) {
-                        try {
-                            Object result = isNonSelectQuery(method, args) ? adHocQuery((String) args[0])
-                                    : method.invoke(statement, args);
-                            mirrorWrite(method, args, true);
-                            peerDdl(method, args);
-                            return result instanceof ResultSet ? nullReading((ResultSet) result) : result;
-                        } catch (InvocationTargetException e) {
-                            Throwable cause = e.getCause();
-                            if (method.getName().startsWith("execute") && cause instanceof SQLException
-                                    && VoltDBErrors.isRetryable((SQLException) cause)
-                                    && System.currentTimeMillis() < deadline) {
-                                Thread.sleep(ThreadLocalRandom.current().nextLong(20, 100));
-                                continue;
+                    boolean ddl = isDdl(method, args);
+                    if (ddl) {
+                        DDL_OR_RESTORE.readLock().lock();
+                    }
+                    try {
+                        long deadline = System.currentTimeMillis() + retryMillis;
+                        while (true) {
+                            try {
+                                Object result = isNonSelectQuery(method, args) ? adHocQuery((String) args[0])
+                                        : method.invoke(statement, args);
+                                mirrorWrite(method, args, true);
+                                peerDdl(method, args);
+                                return result instanceof ResultSet ? nullReading((ResultSet) result) : result;
+                            } catch (InvocationTargetException e) {
+                                Throwable cause = e.getCause();
+                                if (method.getName().startsWith("execute") && cause instanceof SQLException
+                                        && VoltDBErrors.isRetryable((SQLException) cause)
+                                        && System.currentTimeMillis() < deadline) {
+                                    Thread.sleep(ThreadLocalRandom.current().nextLong(20, 100));
+                                    continue;
+                                }
+                                Throwable thrown = skippedIfNodeFailure(cause);
+                                if (thrown instanceof IgnoreMeException) {
+                                    failureSeen = true;
+                                    // a node failure: a change may or may not have committed; a query changed nothing
+                                    diverged = mirror != null && isWrite(method, args) || diverged;
+                                } else {
+                                    mirrorWrite(method, args, false);
+                                }
+                                throw thrown;
                             }
-                            Throwable thrown = skippedIfNodeFailure(cause);
-                            if (thrown instanceof IgnoreMeException) {
-                                failureSeen = true;
-                                // a node failure: a change may or may not have committed; a query changed nothing
-                                diverged = mirror != null && isWrite(method, args) || diverged;
-                            } else {
-                                mirrorWrite(method, args, false);
-                            }
-                            throw thrown;
+                        }
+                    } finally {
+                        if (ddl) {
+                            DDL_OR_RESTORE.readLock().unlock();
                         }
                     }
                 }));

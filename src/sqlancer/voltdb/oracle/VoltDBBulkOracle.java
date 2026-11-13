@@ -51,9 +51,9 @@ public class VoltDBBulkOracle implements TestOracle<VoltDBGlobalState> {
         LOAD, SWAP
     }
 
-    private static final String COLUMNS = " (k INTEGER NOT NULL, id SMALLINT NOT NULL, v VARCHAR(12), b VARBINARY(6),"
+    static final String COLUMNS = " (k INTEGER NOT NULL, id SMALLINT NOT NULL, v VARCHAR(12), b VARBINARY(6),"
             + " f FLOAT, d DECIMAL, t TIMESTAMP, PRIMARY KEY (k, id))";
-    private static final String SELECT = "SELECT k, id, v, b, f, d, t FROM ";
+    static final String SELECT = "SELECT k, id, v, b, f, d, t FROM ";
     private static final AtomicLong LOADS = new AtomicLong();
     private static final AtomicLong LOADS_REJECTED = new AtomicLong();
     private static final AtomicLong SWAPS = new AtomicLong();
@@ -275,7 +275,7 @@ public class VoltDBBulkOracle implements TestOracle<VoltDBGlobalState> {
         }
     }
 
-    private Object[] row(int k) {
+    static Object[] row(int k) {
         // a batch shares its k when partitioned, so v and id come from ranges wide enough that most batches load
         String v = Randomly.getBooleanWithRatherLowProbability() ? null
                 : Randomly.getBooleanWithRatherLowProbability() ? "" : "s" + Randomly.getNotCachedInteger(0, 60);
@@ -289,7 +289,7 @@ public class VoltDBBulkOracle implements TestOracle<VoltDBGlobalState> {
                 d == null ? null : d.setScale(12), t };
     }
 
-    private static String literal(Object... row) {
+    static String literal(Object... row) {
         StringBuilder sb = new StringBuilder("(").append(row[0]).append(", ").append(row[1]).append(", ");
         sb.append(row[2] == null ? "NULL" : "'" + row[2] + "'").append(", ");
         if (row[3] == null) {

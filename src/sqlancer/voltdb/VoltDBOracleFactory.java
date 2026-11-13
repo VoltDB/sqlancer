@@ -20,6 +20,7 @@ import sqlancer.voltdb.oracle.VoltDBPlanOracle;
 import sqlancer.voltdb.oracle.VoltDBSchemaChangeOracle;
 import sqlancer.voltdb.oracle.VoltDBSetOperationOracle;
 import sqlancer.voltdb.oracle.VoltDBSmokeOracle;
+import sqlancer.voltdb.oracle.VoltDBSnapshotOracle;
 import sqlancer.voltdb.oracle.VoltDBStreamOracle;
 import sqlancer.voltdb.oracle.VoltDBSubqueryOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPAggregateOracle;
@@ -194,6 +195,17 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBConfigOracle(globalState);
+        }
+    },
+    /**
+     * Snapshots (milestone 37): a table saved alone by @SnapshotSave and restored by @SnapshotRestore must get back the
+     * rows saved, or, restored into it as it is now, the saved rows that collide with none there, the others going to
+     * the duplicates files; a CSV snapshot's files must hold the table's rows (--snapshot-path).
+     */
+    SNAPSHOT {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBSnapshotOracle(globalState);
         }
     },
 
