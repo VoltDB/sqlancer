@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 42.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 43.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -55,6 +55,7 @@ they run as scheduled and stop when disabled; see [The TASK oracle](#the-task-or
 also exports through a JDBC target into a sink cluster; see [The JDBC target](#the-jdbc-target-milestone-40). Since
 milestone 41 the IMPORT oracle sends rows through the pull socket importer; see [The IMPORT oracle](#the-import-oracle).
 Since milestone 42 `--ssl` runs the cluster with TLS, and the nightly job's security run uses it; see [TLS](#tls).
+Since milestone 43 the STATS oracle checks the statistics against the tables; see [The STATS oracle](#the-stats-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -464,7 +465,7 @@ the kit's runtime JDK and makes seven runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all thirty (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP, CONFIG, SNAPSHOT, XCONFLICT, TASK, IMPORT; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all thirty-one (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP, CONFIG, SNAPSHOT, XCONFLICT, TASK, IMPORT, STATS; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
 | `sqlancer-1n-k0-security` | 1 node, 8 sites per host, security on (see [The PERMS oracle](#the-perms-oracle)), and since milestone 42 TLS (see [TLS](#tls)); `sqlancer-1n-k0` until milestone 28 | the same | 45 minutes |
 | `sqlancer-3n-k2-export-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all; the streams export (see [The STREAMS oracle](#the-streams-oracle)); `sqlancer-3n-k2-s2` until milestone 29 | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
@@ -1213,6 +1214,31 @@ security, beside 15 other oracles, PERMS checked 53 statements and IMPORT 577 li
 k=1 and a node killed every minute, each rejoin over TLS (TLS 1.3, `Socket Joiner ... TLS/SSL enabled on internal
 connection`) passed.
 
+## The STATS oracle
+
+Milestone 43. Milestone 41's coverage run found about half of the statistics code unexercised (`SystemInformation`,
+119 of 373 lines; `StatsAgent`, 145 of 338; many statistics sources). Each STATS check:
+
+1. calls one selector of `@Statistics` (34 of them, interval 0 or 1), `@SystemInformation` (OVERVIEW, DEPLOYMENT,
+   LICENSE) or `@SystemCatalog` (7 of them), which must succeed;
+2. counts each of the database's tables and views (`COUNT(*)`), and reads `@Statistics TABLE` and `INDEX` until the
+   tuple counts are the same twice in a row (the statistics are refreshed every second or two; at most 15 reads);
+3. checks that each table's tuple count, summed over its partitions (or, for a replicated table, on every site), is its
+   `COUNT(*)`; that every replica of a partition holds the same count; and that on each site a primary key's index has
+   as many entries as the table has tuples there.
+
+Only this thread writes the database's tables, so they do not change during a check. Where nodes fail, resize, crash
+or upgrade, a mismatch is read again up to 3 times, 5 s apart, and one that persists is skipped, as a failing node can
+explain it; views are left out there while `--avoid-known-bugs` is true (ENG-30667). At exit STATS prints the calls,
+tables and indexes it checked.
+
+In 5-minute trials on 3 nodes with k=1, beside NoREC, TLP WHERE, VIEWS and PROCEDURE: 276 calls, 441 tables and 2,422
+primary key indexes checked; with a node killed every minute, 152, 281 and 2,156. No disagreement was found.
+
+Milestone 43's coverage run (`run-coverage.sh`, six runs of 10 minutes on master bf8602e3, every oracle): `SystemInformation`
+223 of 373 lines (from 119), `StatsAgent` 182 of 338 (from 145); system procedures as a whole 53.5% of their lines (from
+46.6%). `SslSetup` stays at 18 of 348: the coverage runs do not use `--ssl`.
+
 ## The PERMS oracle
 
 With `--security`, the deployment enables security with three users, `sqlancer` (administrator, whom SQLancer and
@@ -1779,7 +1805,7 @@ The bugs below were found in milestone 19.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30510 (comment) | The RIGHT JOIN bug through a FULL JOIN: a WHERE clause that rejects the right table's NULLs turns `a FULL JOIN b ON c >= b.k` into a RIGHT JOIN and then a LEFT JOIN that uses the ON condition as b's index range, dropping b's row. Found by TLP WHERE. Wrong result. | A FULL JOIN's ON condition reads the left table only. |
-| ENG-30611 | `DATEADD(YEAR, n, d)` on a DATE February 29 into a non-leap year: with a DATE literal the server aborts (uncaught `boost::gregorian::bad_day_of_month`), with a column it is "Invalid date 'February 29' as '2025' is not a leap year"; a TIMESTAMP and MONTH 12 give February 28. Found by PARAMS, crash found probing it. Critical. | DATEADD has no YEAR unit. |
+| ENG-30611 | `DATEADD(YEAR, n, d)` on a DATE February 29 into a non-leap year: with a DATE literal the server aborts (uncaught `boost::gregorian::bad_day_of_month`), with a column it is "Invalid date 'February 29' as '2025' is not a leap year"; a TIMESTAMP and MONTH 12 give February 28. Found by PARAMS, crash found probing it. Critical. Fixed in V16.1.0 (the reproduction reports FIXED from lab build #55 on); the workaround stays while the mirror and upgrade runs use 16.0.0. | DATEADD has no YEAR unit. |
 
 The bugs below were found in milestone 21.
 
