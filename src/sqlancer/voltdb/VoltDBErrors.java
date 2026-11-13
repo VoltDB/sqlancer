@@ -51,7 +51,12 @@ public final class VoltDBErrors {
             "object name already exists",
             // a call in flight on the connection to a node that was killed (with --servers, the other connections
             // carry the next calls)
-            "was lost before a response was received" };
+            "was lost before a response was received",
+            // a node that voltadmin stop takes out (an in-service upgrade) applies no catalog update after its StopNode
+            // notice, but until it is gone (5 s in lab build #56's upgrade run, on 16.0.0) it still verifies each new
+            // one, and fails any that names an object made since: "@VerifyCatalogAndWriteJar from host 2: ...
+            // Unable to find reference for catalog item"
+            "Unable to find reference for catalog item" };
 
     private VoltDBErrors() {
     }
