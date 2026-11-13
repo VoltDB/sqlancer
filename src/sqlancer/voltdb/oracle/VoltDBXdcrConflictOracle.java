@@ -44,6 +44,8 @@ public class VoltDBXdcrConflictOracle implements TestOracle<VoltDBGlobalState> {
     private static final AtomicLong CHECKS = new AtomicLong();
     private static final AtomicLong CONVERGED = new AtomicLong();
     private static final AtomicLong DIVERGED = new AtomicLong();
+    // keys left different with no divergence logged, while avoiding known bugs (ENG-30679)
+    private static final AtomicLong SILENT = new AtomicLong();
     private static final Set<String> CREATED = ConcurrentHashMap.newKeySet();
     // a conflict log row: "ROW_TYPE","ACTION","TYPE","ON_PK","DECISION","CLUSTER","TIMESTAMP","DIVERGENCE","TABLE",
     // "CURRENT_CLUSTER","CURRENT_TIMESTAMP","{tuple as JSON}"
@@ -52,8 +54,10 @@ public class VoltDBXdcrConflictOracle implements TestOracle<VoltDBGlobalState> {
                     + "\"\"K\"\":\"\"(-?\\d+)\"\".*");
 
     static {
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> System.out.println("XCONFLICT checks: " + CHECKS
-                + " (converged: " + CONVERGED + "; differing keys each reported as diverged: " + DIVERGED + ")")));
+        Runtime.getRuntime()
+                .addShutdownHook(new Thread(() -> System.out.println("XCONFLICT checks: " + CHECKS + " (converged: "
+                        + CONVERGED + "; differing keys each reported as diverged: " + DIVERGED
+                        + "; differing keys with no divergence logged, ENG-30679: " + SILENT + ")")));
     }
 
     private final VoltDBGlobalState state;
@@ -79,11 +83,11 @@ public class VoltDBXdcrConflictOracle implements TestOracle<VoltDBGlobalState> {
         // the rows before the check, and its writes, for the report
         String before = rows(here, table) + " / " + rows(there, table);
         List<String> writes = new ArrayList<>();
-        // ENG-30679: a DELETE of a key on one cluster racing a write of it (insert, update, upsert) on the other leaves
-        // the clusters different with every conflict logged as consistent; while avoiding known bugs, a check deletes
-        // nothing
+        // ENG-30679: racing writes of a key leave the clusters different with every conflict logged as consistent (a
+        // DELETE racing an insert, update or upsert, and in the lab, on x86, inserts racing upserts too); while
+        // avoiding known bugs, such keys are counted, not failed (see below)
         boolean upserts = true;
-        boolean deletes = !state.getDbmsSpecificOptions().avoidKnownBugs;
+        boolean deletes = true;
         for (int round = (int) Randomly.getNotCachedInteger(1, 6); round > 0; round--) {
             for (int side = 0; side < 2; side++) {
                 VoltDBConnection c = side == 0 ? here : there;
@@ -158,6 +162,11 @@ public class VoltDBXdcrConflictOracle implements TestOracle<VoltDBGlobalState> {
                 break;
             }
             Thread.sleep(1000);
+        }
+        if (!unreported.isEmpty() && state.getDbmsSpecificOptions().avoidKnownBugs) {
+            SILENT.addAndGet(unreported.size());
+            DIVERGED.addAndGet(differing.size() - unreported.size());
+            return;
         }
         if (!unreported.isEmpty()) {
             throw new AssertionError("the XDCR clusters still differ on " + table + " after " + CONVERGE_MILLIS / 1000

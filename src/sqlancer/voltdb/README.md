@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 40.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 41.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -52,7 +52,8 @@ snapshot; see [The SNAPSHOT oracle](#the-snapshot-oracle). Since milestone 38 th
 conflicts on purpose and checks that every divergence they leave is reported; see
 [The XCONFLICT oracle](#the-xconflict-oracle). Since milestone 39 the TASK oracle runs scheduled tasks and checks that
 they run as scheduled and stop when disabled; see [The TASK oracle](#the-task-oracle). Since milestone 40 `--export`
-also exports through a JDBC target into a sink cluster; see [The JDBC target](#the-jdbc-target-milestone-40).
+also exports through a JDBC target into a sink cluster; see [The JDBC target](#the-jdbc-target-milestone-40). Since
+milestone 41 the IMPORT oracle sends rows through the pull socket importer; see [The IMPORT oracle](#the-import-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -462,7 +463,7 @@ the kit's runtime JDK and makes seven runs, one after the other, every node on t
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
-| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all twenty-nine (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP, CONFIG, SNAPSHOT, XCONFLICT, TASK; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
+| `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all thirty (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP, CONFIG, SNAPSHOT, XCONFLICT, TASK, IMPORT; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
 | `sqlancer-1n-k0-security` | 1 node, 8 sites per host, security on (see [The PERMS oracle](#the-perms-oracle)); `sqlancer-1n-k0` until milestone 28 | the same | 45 minutes |
 | `sqlancer-3n-k2-export-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all; the streams export (see [The STREAMS oracle](#the-streams-oracle)); `sqlancer-3n-k2-s2` until milestone 29 | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
@@ -992,7 +993,9 @@ Milestone 34. Milestone 30's coverage run found the system procedures behind row
     migrated so far must be `MIGRATING`.
 
 A statement that fails (a node failure's, as with STREAMS) leaves the table out of step, and that name's TTL or
-migration checks stop for the run. At exit TTL prints how many checks of each kind it made.
+migration checks stop for the run. In an XDCR run there are no migration checks: a database name may work through
+either cluster, each with its own `XM_` table, while the rows migrated so far are kept by name. At exit TTL prints how
+many checks of each kind it made.
 
 In a 5-minute trial on 1 node (beside NoREC and TLP WHERE) TTL made 892 TTL checks and 880 migration checks; in one on
 3 nodes with k=2 and `--export` (beside STREAMS and NoREC), 110 and 105, the migrations through the loopback target. With
@@ -1106,6 +1109,11 @@ How the oracle fits VoltDB's snapshot handling:
   `--avoid-known-bugs` is true no DDL of SQLancer runs during a restore: every connection's DDL holds a lock shared
   (`VoltDBConnection`), and a restore holds it exclusive.
 
+In an XDCR run (`--xdcr`) SNAPSHOT checks nothing: a restore is local to one cluster, and milestone 41's coverage run
+found that its restores there stop the replication of other tables for a while (the DR consumer reconnects), so the
+XDCR oracle's databases did not converge. A plain save and restore of a table that is not a DR table did not do it, so
+this is not yet reduced to a reproduction.
+
 ## The XCONFLICT oracle
 
 Milestone 38. The XDCR oracle never makes a conflict: each database writes through one cluster only, and any conflict
@@ -1117,11 +1125,12 @@ unexercised. In an XDCR run (`--xdcr`), each XCONFLICT check:
    both clusters; if the clusters do not hold the same rows (a divergence an earlier check left), it empties the table
    through both first;
 2. writes the same few keys through both clusters at once, alternating, without waiting for replication: inserts,
-   upserts and updates by key, and updates by value (multi-partition on the partitioned table); deletes by key and by
-   value too, but only while `--avoid-known-bugs` is false (ENG-30679 below);
+   upserts and updates by key, updates by value (multi-partition on the partitioned table), and deletes by key and by
+   value;
 3. waits up to 60 s for the clusters to agree. VoltDB resolves most conflicts so that they do. Where they still differ
    on a key, XDCR's conflict log (its `xdcr_conflicts` export files under each node's voltdbroot, which the oracle
-   finds through `--cluster-dir`) must have a row for that table and key with `DIVERGENCE` `D`.
+   finds through `--cluster-dir`) must have a row for that table and key with `DIVERGENCE` `D`. While
+   `--avoid-known-bugs` is true, a key left different with no such row is counted (ENG-30679 below), not failed.
 
 `run-sqlancer.sh` does not count conflicts on these tables against the run. At exit the oracle prints how many checks
 converged and how many differing keys were reported as diverged. In a 5-minute trial on two 3-node clusters (k=1,
@@ -1154,6 +1163,30 @@ schedule allows, and two more rows per scheduler may follow `ALTER TASK ... DISA
 
 In two 5-minute trials on 3 nodes (k=1, 4 sites per host) with a node killed and rejoined every 45 s: 173 checks, 61 of
 them of a task stopped by an error.
+
+## The IMPORT oracle
+
+Milestone 41. Milestone 30's coverage run found importers never run: the importer framework (`ImportManager`) and the
+distribution of their resources among the nodes (`ChannelDistributer`, 751 lines). With IMPORT among the oracles,
+run-sqlancer.sh configures VoltDB's pull socket importer (`pullsocketimporter.jar`, CSV) to pull lines from four ports
+on this machine (port slot 18), each a resource the nodes share out among themselves and again when one fails, into
+`XI.insert`; the provider gets `--import-ports`. The XDCR peer, the mirror and the JDBC sink import nothing. SQLancer
+listens on those ports, and each IMPORT check:
+
+1. creates `XI (k, v)` (partitioned on `k`) if the catalog lacks it;
+2. sends 1 to 20 lines, each with a key unique in the run, through one port, to the node that has connected to it;
+3. waits up to 60 s until `XI` holds those keys with their values (through both clusters of an XDCR run, as a database
+   may work through either and only the first imports);
+4. checks that `XI` holds no more rows than the run has sent.
+
+The importer delivers at most once: a line in flight when a node fails is lost. So where nodes fail, resize, crash or
+are upgraded, lines that never arrive are counted, not failed; elsewhere each must arrive, and a line put into `XI`
+altered fails the check anywhere. At exit IMPORT prints its checks, the lines sent and the lines lost.
+
+In 2- to 5-minute trials on 3 nodes (k=1, 4 sites per host) beside NoREC: 40,308 lines with no failures; 20,106 with a
+node killed every 45 s; 30,566 with 2 nodes added or removed every minute; 6,020 with every node killed and the cluster
+recovered every 90 s; 22,344 on one node with security; and 16,781 on two 2-node clusters linked by XDCR: none was lost
+or altered.
 
 ## The PERMS oracle
 
@@ -1742,6 +1775,13 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
 
+The bugs below were found in lab build #53 and in milestone 41.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30682 | A node that joins elastically while `@SetYamlConfiguration` changes are made misses some of them for good: afterwards it reports, through `@GetYamlConfiguration`, older values of some system settings than the rest of the cluster (in the reproduction, `elastic.throughput` 1 and `flushinterval.minimum` 2000 where the others have 2 and 500). 16.0.0 too. Found by CONFIG in lab build #53's resize run; `repros/ENG-30682.sh` adds 2 nodes to 3 while toggling three settings and compares each node's. Critical. | While `--avoid-known-bugs` is true, CONFIG checks nothing in runs that resize |
+| ENG-30683 | During an in-service upgrade from 16.0.0, `@SetYamlConfiguration` through a node already upgraded to 16.1 fails with UNEXPECTED_FAILURE, "The UpdateDeployment system procedure requires exactly two parameters, the deployment as a string, and an operation mode, 'full' or 'sectional'"; through the 16.0.0 nodes it succeeds. Found by CONFIG in lab build #53's upgrade run; `repros/ENG-30683.sh` (manual: it needs a 16.0.0 kit as `OLD_VOLTDB_HOME`) upgrades one of 3 nodes and calls it through each. Major. | While `--avoid-known-bugs` is true, CONFIG checks nothing in runs that upgrade |
+
 The bug below was found in milestone 40.
 
 | Ticket | Issue | Workaround |
@@ -1758,7 +1798,7 @@ The bug below was found in milestone 38.
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
-| ENG-30679 | XDCR silently diverges when a DELETE of a key on one cluster races a write of it (insert, update, upsert) on the other: e.g. `A: INSERT (0, 'a0', 3)`, `B: UPSERT (0, 'b1', 2)`, `B: DELETE k = 0` (twice), sent without waiting for replication, leave cluster A without the row and cluster B with A's, and every conflict in the log says consistent (`C`). Other forms leave each cluster with the other's value. 16.0.0 too. Found by XCONFLICT; `repros/ENG-30679.sh` starts an XDCR pair and replays the sequence with `repros/xdcr/XdcrRepro.java`. Wrong result, Blocker for V16.1.0. | While `--avoid-known-bugs` is true, XCONFLICT's checks delete nothing |
+| ENG-30679 | XDCR silently diverges when a DELETE of a key on one cluster races a write of it (insert, update, upsert) on the other: e.g. `A: INSERT (0, 'a0', 3)`, `B: UPSERT (0, 'b1', 2)`, `B: DELETE k = 0` (twice), sent without waiting for replication, leave cluster A without the row and cluster B with A's, and every conflict in the log says consistent (`C`). Other forms leave each cluster with the other's value. 16.0.0 too. Found by XCONFLICT; `repros/ENG-30679.sh` starts an XDCR pair and replays the sequence with `repros/xdcr/XdcrRepro.java`. Wrong result, Blocker for V16.1.0. | While `--avoid-known-bugs` is true, XCONFLICT counts a key left different with no divergence logged rather than failing (until lab build #53 its checks deleted nothing, but in the lab, on x86, inserts racing upserts diverge silently too) |
 
 The bugs below were found in milestone 37.
 

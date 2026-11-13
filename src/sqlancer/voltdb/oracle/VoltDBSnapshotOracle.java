@@ -107,6 +107,11 @@ public class VoltDBSnapshotOracle implements TestOracle<VoltDBGlobalState> {
         if (dir == null || dir.isBlank()) {
             throw new IgnoreMeException();
         }
+        // in an XDCR run a restore is local to one cluster: the restored rows of a DR table do not replicate, and the
+        // clusters' tables differ from then on (milestone 41's coverage run)
+        if (((VoltDBConnection) state.getConnection()).getPeer() != null) {
+            throw new IgnoreMeException();
+        }
         boolean partitioned = Randomly.getBoolean();
         String table = "XN" + (partitioned ? "P" : "R") + "_" + state.getDatabaseName().toUpperCase();
         create(table, partitioned);

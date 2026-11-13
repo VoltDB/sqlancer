@@ -12,6 +12,7 @@ import sqlancer.voltdb.oracle.VoltDBDerivedTableOracle;
 import sqlancer.voltdb.oracle.VoltDBDifferentialOracle;
 import sqlancer.voltdb.oracle.VoltDBDurabilityOracle;
 import sqlancer.voltdb.oracle.VoltDBGeographyOracle;
+import sqlancer.voltdb.oracle.VoltDBImportOracle;
 import sqlancer.voltdb.oracle.VoltDBLimitOracle;
 import sqlancer.voltdb.oracle.VoltDBParameterOracle;
 import sqlancer.voltdb.oracle.VoltDBPermissionOracle;
@@ -228,6 +229,16 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBTaskOracle(globalState);
+        }
+    },
+    /**
+     * The pull socket importer (milestone 41): lines sent through the ports the cluster's nodes pull from must arrive
+     * in XI, unaltered, unless a node failure lost them.
+     */
+    IMPORT {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBImportOracle(globalState);
         }
     },
 

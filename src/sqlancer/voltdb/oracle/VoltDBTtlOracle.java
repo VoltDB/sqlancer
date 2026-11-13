@@ -149,6 +149,11 @@ public class VoltDBTtlOracle implements TestOracle<VoltDBGlobalState> {
         if (OUT_OF_STEP.contains(table)) {
             throw new IgnoreMeException();
         }
+        // in an XDCR run a database name may work through either cluster, each with its own XM_ table (not a DR table),
+        // while MIGRATED follows the name: the rows migrated through one cluster are not MIGRATING on the other
+        if (((sqlancer.voltdb.VoltDBConnection) state.getConnection()).getPeer() != null) {
+            throw new IgnoreMeException();
+        }
         String loopback = state.getDbmsSpecificOptions().loopbackTarget;
         boolean looping = loopback != null && !loopback.isBlank();
         // the loopback target's procedure, XS_LB.insert, takes these columns; v is unique in the run
