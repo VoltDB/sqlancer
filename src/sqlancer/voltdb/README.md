@@ -421,6 +421,14 @@ was built with clang's source-based coverage, with the JaCoCo agent on every ser
 coverage per Java package, per engine directory and file, and per area (planner, executors, DR, export, rejoin and
 so on).
 
+The runs' intervals follow `--duration` in the nightly job's proportions (its 2,700 s runs kill a node every 300 s and
+crash the cluster every 600 s): a kill every `duration / 9` s (at least 60) and a crash every `duration / 4` s (at
+least 120); the security run uses TLS (`--ssl`). Until milestone 44 the intervals were fixed, and milestone 43's 10-minute
+runs made one kill and no crash at all. Measured again with crashes (milestone 44: the crash and security runs, 10
+minutes each, master bf8602e3), command log and recovery went from 46.5% of their lines to 58.7%
+(`CommandLogReplayState` 359 of 512 lines, from 88; `CommandLogReinitiatorImpl` 207 of 270, from 95; `ReplaySequencer`
+66 of 97, from 7), and TLS setup (`SslSetup`) to 141 of 348 lines, from 18.
+
 Build the engine with coverage in a clean checkout of VoltDB (macOS; Linux with clang works the same way):
 
 ```

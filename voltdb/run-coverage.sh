@@ -169,17 +169,22 @@ if ! $report_only; then
         done
     fi
     i=0
+    # the kill, export and crash runs' intervals follow --duration as the nightly job's do (2,700 s: a kill every 300 s,
+    # a crash every 600 s), so a short run still kills and crashes: with fixed intervals, milestone 43's 600 s crash run
+    # made no crash at all, and recovery from the command log went unmeasured
+    kill_every=$((duration / 9 > 60 ? duration / 9 : 60))
+    crash_every=$((duration / 4 > 120 ? duration / 4 : 120))
     IFS=, read -ra run_list <<<"$runs"
     for run in "${run_list[@]}"; do
         s=$((seed + i))
         i=$((i + 1))
         case $run in
-        security) args=(--nodes 1 --kfactor 0 --sites 8 --security) ;;
-        kill) args=(--nodes 3 --kfactor 1 --sites 8 --kill-interval 300) ;;
-        export) args=(--nodes 3 --kfactor 2 --sites 2 --export --kill-interval 300) ;;
+        security) args=(--nodes 1 --kfactor 0 --sites 8 --security --ssl) ;;
+        kill) args=(--nodes 3 --kfactor 1 --sites 8 --kill-interval "$kill_every") ;;
+        export) args=(--nodes 3 --kfactor 2 --sites 2 --export --kill-interval "$kill_every") ;;
         resize) args=(--nodes 3 --kfactor 1 --sites 8 --resize-interval 120) ;;
         xdcr) args=(--nodes 3 --kfactor 1 --sites 4 --xdcr) ;;
-        crash) args=(--nodes 3 --kfactor 1 --sites 8 --crash-interval 600) ;;
+        crash) args=(--nodes 3 --kfactor 1 --sites 8 --crash-interval "$crash_every") ;;
         repros | sqlcoverage) args=() ;;
         *) die "unknown run $run (see --runs)" ;;
         esac
