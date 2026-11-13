@@ -59,6 +59,9 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--ttl-migrate-target", description = "A loopback export target (run-sqlancer.sh --export) whose procedure is XS_LBT.insert: the TTL oracle's TTL tables that MIGRATE TO TARGET it move their expired rows into the table XS_LBT")
     public String ttlMigrateTarget;
 
+    @Parameter(names = "--cluster-dir", description = "The directory on this machine that holds every node's voltdbroot, of both clusters with --xdcr (run-sqlancer.sh passes its cluster directory): XCONFLICT reads XDCR's conflict log there")
+    public String clusterDir;
+
     @Parameter(names = "--snapshot-path", description = "A directory on this machine holding every node's voltdbroot (run-sqlancer.sh passes its cluster directory): the SNAPSHOT oracle saves its snapshots to each node's own snapshot directory and reads the files they write there; without it, SNAPSHOT does nothing")
     public String snapshotPath;
 

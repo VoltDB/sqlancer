@@ -302,6 +302,8 @@ user_snapshot_retry=${SQLANCER_USER_SNAPSHOT_RETRY-1}
 # the SNAPSHOT oracle's snapshots go to each node's own snapshot directory, under its voltdbroot here, where SQLancer
 # reads the files they write
 provider_args+=(--snapshot-path "$cluster")
+# XCONFLICT reads XDCR's conflict log under the nodes' voltdbroots here
+provider_args+=(--cluster-dir "$cluster")
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$results/run.log"; }
 
@@ -1158,13 +1160,14 @@ if $export; then
     log "Export: $exported rows exported (${http_rows:-0} through HTTP; $duplicates exported twice), $inserted inserted into the streams$($export_failed && echo ", MISMATCH")"
 fi
 # XDCR's conflict log: each database writes through one cluster only, so XDCR has nothing to resolve, and any
-# conflict it logged fails the run
+# conflict it logged fails the run; but for XCONFLICT's tables (XCP_..., XCR_...), whose conflicts it makes on purpose
+# and checks itself
 conflicts=0
 if $xdcr; then
     mkdir -p "$results/xdcr_conflicts"
     for f in $(find "$cluster" -path "*xdcr_conflicts*" -type f 2>/dev/null); do
         cp "$f" "$results/xdcr_conflicts/$(echo "${f#"$cluster"/}" | tr / _)"
-        conflicts=$((conflicts + $(wc -l <"$f")))
+        conflicts=$((conflicts + $(grep -cv '","XC[PR]_' "$f" || true)))
     done
 fi
 $keep_cluster || rm -rf "$cluster"
@@ -1223,6 +1226,7 @@ result=PASS
     grep -m1 "^LOAD checks:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^CONFIG changes checked:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^SNAPSHOT restores checked:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^XCONFLICT checks:" "$results/sqlancer/out.log" 2>/dev/null
     $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)")"
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
