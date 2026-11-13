@@ -22,6 +22,7 @@ import sqlancer.voltdb.oracle.VoltDBSchemaChangeOracle;
 import sqlancer.voltdb.oracle.VoltDBSetOperationOracle;
 import sqlancer.voltdb.oracle.VoltDBSmokeOracle;
 import sqlancer.voltdb.oracle.VoltDBSnapshotOracle;
+import sqlancer.voltdb.oracle.VoltDBStatsOracle;
 import sqlancer.voltdb.oracle.VoltDBStreamOracle;
 import sqlancer.voltdb.oracle.VoltDBSubqueryOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPAggregateOracle;
@@ -239,6 +240,16 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBImportOracle(globalState);
+        }
+    },
+    /**
+     * Statistics (milestone 43): every selector of {@code @Statistics}, {@code @SystemInformation} and
+     * {@code @SystemCatalog} succeeds, and the TABLE and INDEX statistics agree with the database's tables' counts.
+     */
+    STATS {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBStatsOracle(globalState);
         }
     },
 
