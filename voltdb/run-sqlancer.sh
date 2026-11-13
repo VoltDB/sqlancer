@@ -574,7 +574,7 @@ EOF
 # with --export, the HTTP target's receiver (voltdb/http-receiver.py): one line per request, under $cluster so that
 # stopping the cluster stops it too
 if $export; then
-    python3 -I "$repo_dir/voltdb/http-receiver.py" "$(port 0 7)" "$cluster/http-export.log" \
+    python3 -I "$repo_dir/voltdb/http-receiver.py" "$(port 0 7)" "$cluster/http-export.log" "$cluster/http.hold" \
         >"$cluster/http-receiver.out" 2>&1 &
 fi
 log "Starting $nodes node(s), k=$kfactor, $sites sites per host"
@@ -795,6 +795,11 @@ chaos_loop() {
         # DDL is held (the provider's --ddl-hold) from a few seconds before the kill, letting a catalog update in
         # flight finish, until the node has rejoined ("Node rejoin completed")
         touch "$results/ddl.hold"
+        # with --export, every other kill (the first included) is made while the HTTP target refuses rows (503), until
+        # 20 s after the node has rejoined: the rows written while it was down are still unacknowledged when it comes
+        # back, so the rejoined replica has a gap in each stream that it must fill from the other replicas (E3's gap
+        # fill, milestone 45); the end-of-run count requires every row to arrive all the same
+        $export && [ $((n % 2)) -eq 1 ] && touch "$cluster/http.hold" && echo "$(date '+%H:%M:%S') hold $n: the HTTP target refuses rows" >>"$results/chaos.log"
         sleep 3
         rejoins=$(grep -c "Node rejoin completed" "$cluster/node$i/voltdbroot/log/volt.log" 2>/dev/null)
         kill -9 "$pid"
@@ -804,7 +809,7 @@ chaos_loop() {
         # the survivors must notice the failure before the node comes back
         sleep 5
         if ! rejoin_node "$i" "$n"; then
-            rm -f "$results/ddl.hold"
+            rm -f "$results/ddl.hold" "$cluster/http.hold"
             echo "$(date '+%H:%M:%S') rejoin $n: node$i did not rejoin within 600 s" >>"$results/chaos.log"
             return 1
         fi
@@ -814,6 +819,11 @@ chaos_loop() {
         done
         rm -f "$results/ddl.hold"
         echo "$(date '+%H:%M:%S') rejoin $n: node$i, $(($(date +%s) - t0)) s after the kill" >>"$results/chaos.log"
+        if [ -e "$cluster/http.hold" ]; then
+            sleep 20
+            rm -f "$cluster/http.hold"
+            echo "$(date '+%H:%M:%S') hold $n: the HTTP target takes rows again" >>"$results/chaos.log"
+        fi
     done
 }
 
@@ -1155,6 +1165,7 @@ if [ -n "$chaos_pid" ]; then
     wait "$chaos_pid" || chaos_failed=true
     kills=$(grep -c " kill " "$results/chaos.log")
     rejoins=$(grep -c " rejoin [0-9]*: node[0-9]*, " "$results/chaos.log")
+    rm -f "$cluster/http.hold"
     log "Node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", the last one FAILED")"
 fi
 upgrade_failed=false
@@ -1312,9 +1323,12 @@ if $export; then
     total=$((total + ${http_total:-0} + ${jdbc_total:-0}))
     exported=$((exported + ${http_rows:-0} + ${jdbc_rows:-0}))
     duplicates=$((total - exported))
+    # E3's gap fills (milestone 45): a replica that filled its gaps from others logs "Replica hosts filled gaps"
+    gap_fills=$(cat "$cluster"/node*/voltdbroot/log/volt.log* 2>/dev/null | grep -c "Replica hosts filled gaps")
+    gap_holds=$(grep -c "the HTTP target refuses rows" "$results/chaos.log" 2>/dev/null)
     # every inserted row, and at most the interrupted ones besides
     [ "$exported" -ge "$inserted" ] && [ "$exported" -le $((inserted + stream_interrupted)) ] || export_failed=true
-    log "Export: $exported rows exported (${http_rows:-0} through HTTP, ${jdbc_rows:-0} through JDBC; $duplicates exported twice), $inserted inserted into the streams ($stream_interrupted inserts interrupted)$($export_failed && echo ", MISMATCH")"
+    log "Export: $exported rows exported (${http_rows:-0} through HTTP, ${jdbc_rows:-0} through JDBC; $duplicates exported twice), $inserted inserted into the streams ($stream_interrupted inserts interrupted)$($export_failed && echo ", MISMATCH"); gap fills: ${gap_fills:-0} (HTTP held across ${gap_holds:-0} kills)"
 fi
 # XDCR's conflict log: each database writes through one cluster only, so XDCR has nothing to resolve, and any
 # conflict it logged fails the run; but for XCONFLICT's tables (XCP_..., XCR_...), whose conflicts it makes on purpose
@@ -1387,7 +1401,7 @@ result=PASS
     grep -m1 "^TASK checks:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^IMPORT checks:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^STATS calls checked:" "$results/sqlancer/out.log" 2>/dev/null
-    $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP, ${jdbc_rows:-0} through JDBC, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)")"
+    $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP, ${jdbc_rows:-0} through JDBC, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)"); gap fills: ${gap_fills:-0} (HTTP held across ${gap_holds:-0} kills)"
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
     [ "$crash_interval" -gt 0 ] && echo "crashes: $crashes crashes, $recoveries recoveries$($crash_failed && echo ", a recovery FAILED (crash.log)")"
