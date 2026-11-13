@@ -14,6 +14,7 @@ import sqlancer.voltdb.oracle.VoltDBDurabilityOracle;
 import sqlancer.voltdb.oracle.VoltDBGeographyOracle;
 import sqlancer.voltdb.oracle.VoltDBImportOracle;
 import sqlancer.voltdb.oracle.VoltDBLimitOracle;
+import sqlancer.voltdb.oracle.VoltDBLoginOracle;
 import sqlancer.voltdb.oracle.VoltDBParameterOracle;
 import sqlancer.voltdb.oracle.VoltDBPermissionOracle;
 import sqlancer.voltdb.oracle.VoltDBPivotedQuerySynthesisOracle;
@@ -250,6 +251,16 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBStatsOracle(globalState);
+        }
+    },
+    /**
+     * Logins (milestone 46), with --security: users added, changed and removed through @SetYamlConfiguration log in
+     * with their passwords and are refused with others, once expired, and once removed.
+     */
+    LOGIN {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBLoginOracle(globalState);
         }
     },
 
