@@ -16,6 +16,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -220,8 +221,9 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
         // DIFF (milestone 20): a second cluster, normally the last release, that every change is repeated on
         String mirror = globalState.getDbmsSpecificOptions().mirror;
         if (mirror != null && !mirror.isBlank()) {
+            // the mirror, another kit, runs without TLS
             VoltDBConnection mirrorCon = connect(globalState,
-                    "jdbc:voltdb://" + mirror.trim() + (mirror.contains(",") ? "?topologychangeaware=true" : ""),
+                    "jdbc:voltdb://" + mirror.trim() + (mirror.contains(",") ? "?topologychangeaware=true" : ""), false,
                     false);
             dropLeftovers(globalState, mirrorCon, false);
             sqlCon.setMirror(mirrorCon);
@@ -242,13 +244,34 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
         return sqlCon;
     }
 
+    // the JDBC driver's properties for a connection as USER: with --ssl-truststore and TLS, over TLS (milestone 42),
+    // trusting the cluster's certificate through that truststore
+    public static Properties connectionProperties(VoltDBOptions options, String user, String password, boolean tls) {
+        Properties p = new Properties();
+        p.setProperty("user", user == null ? "" : user);
+        p.setProperty("password", password == null ? "" : password);
+        String truststore = options.sslTruststore;
+        if (tls && truststore != null && !truststore.isBlank()) {
+            p.setProperty("ssl", "true");
+            p.setProperty("truststore", truststore.trim());
+            p.setProperty("truststorepassword", "sqlancer");
+        }
+        return p;
+    }
+
     private static VoltDBConnection connect(VoltDBGlobalState globalState, String url, boolean nodeFailures)
             throws SQLException {
+        return connect(globalState, url, nodeFailures, true);
+    }
+
+    private static VoltDBConnection connect(VoltDBGlobalState globalState, String url, boolean nodeFailures,
+            boolean tls) throws SQLException {
         long deadline = System.currentTimeMillis() + CRASH_CONNECT_MILLIS;
         while (true) {
             try {
-                Connection con = DriverManager.getConnection(url, globalState.getOptions().getUserName(),
-                        globalState.getOptions().getPassword());
+                Connection con = DriverManager.getConnection(url,
+                        connectionProperties(globalState.getDbmsSpecificOptions(),
+                                globalState.getOptions().getUserName(), globalState.getOptions().getPassword(), tls));
                 return new VoltDBConnection(con, globalState.getDbmsSpecificOptions().retrySeconds, nodeFailures);
             } catch (SQLException e) {
                 if (!globalState.getDbmsSpecificOptions().crashes || System.currentTimeMillis() >= deadline) {

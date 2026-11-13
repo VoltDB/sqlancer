@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 41.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 42.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -54,6 +54,7 @@ conflicts on purpose and checks that every divergence they leave is reported; se
 they run as scheduled and stop when disabled; see [The TASK oracle](#the-task-oracle). Since milestone 40 `--export`
 also exports through a JDBC target into a sink cluster; see [The JDBC target](#the-jdbc-target-milestone-40). Since
 milestone 41 the IMPORT oracle sends rows through the pull socket importer; see [The IMPORT oracle](#the-import-oracle).
+Since milestone 42 `--ssl` runs the cluster with TLS, and the nightly job's security run uses it; see [TLS](#tls).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -464,7 +465,7 @@ the kit's runtime JDK and makes seven runs, one after the other, every node on t
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
 | `sqlancer-3n-k1-kill300` | 3 nodes, k=1, 8 sites per host; a node is killed and rejoined every 5 minutes | all thirty (NoREC, TLP WHERE, DISTINCT, HAVING, AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SUBQUERY, WINDOW, SETOPS, DERIVED, PROCEDURE, SCHEMA, GEO, DIFF, DURABLE, XDCR, PLANS, PERMS, STREAMS, TTL, LOAD, SWAP, CONFIG, SNAPSHOT, XCONFLICT, TASK, IMPORT; DURABLE checks across crashes in the crash run, XDCR only in the XDCR run) | 45 minutes |
-| `sqlancer-1n-k0-security` | 1 node, 8 sites per host, security on (see [The PERMS oracle](#the-perms-oracle)); `sqlancer-1n-k0` until milestone 28 | the same | 45 minutes |
+| `sqlancer-1n-k0-security` | 1 node, 8 sites per host, security on (see [The PERMS oracle](#the-perms-oracle)), and since milestone 42 TLS (see [TLS](#tls)); `sqlancer-1n-k0` until milestone 28 | the same | 45 minutes |
 | `sqlancer-3n-k2-export-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all; the streams export (see [The STREAMS oracle](#the-streams-oracle)); `sqlancer-3n-k2-s2` until milestone 29 | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
 | `sqlancer-3n-k1-xdcr-s4` | Two clusters of 3 nodes, k=1, 4 sites per host, linked by XDCR (see [XDCR](#xdcr)) | the same | 45 minutes |
@@ -1187,6 +1188,30 @@ In 2- to 5-minute trials on 3 nodes (k=1, 4 sites per host) beside NoREC: 40,308
 node killed every 45 s; 30,566 with 2 nodes added or removed every minute; 6,020 with every node killed and the cluster
 recovered every 90 s; 22,344 on one node with security; and 16,781 on two 2-node clusters linked by XDCR: none was lost
 or altered.
+
+## TLS
+
+Milestone 42. Milestone 41's coverage run found the server's TLS setup (`SslSetup`, 18 of 348 lines) and its encrypted
+network paths (`TLSPicoNetwork`, `TLSDecryptionAdapter`) never run. With `--ssl`, run-sqlancer.sh makes a self-signed
+certificate for localhost with `keytool` (a keystore and a truststore in the cluster's `tls/`, password `sqlancer`) and
+deploys
+
+```
+<ssl enabled="true" external="true" internal="true">
+    <keystore path=".../keystore.jks" password="sqlancer"/>
+    <truststore path=".../truststore.jks" password="sqlancer"/>
+</ssl>
+```
+
+so the client and admin ports, and the nodes' connections to each other, use TLS. SQLancer connects through the JDBC
+driver with `ssl=true` and the truststore (`--ssl-truststore`), the PERMS oracle's users too; sqlcmd gets an `--ssl` file
+naming the truststore, and voltadmin `--ssl=nocheck`. The mirror and the JDBC sink, which run without it, are reached
+in the clear. Not with `--xdcr`.
+
+The nightly job's security run (`sqlancer-1n-k0-security`) adds `--ssl`. In a 4-minute trial on one node with
+security, beside 15 other oracles, PERMS checked 53 statements and IMPORT 577 lines; in a 5-minute one on 3 nodes with
+k=1 and a node killed every minute, each rejoin over TLS (TLS 1.3, `Socket Joiner ... TLS/SSL enabled on internal
+connection`) passed.
 
 ## The PERMS oracle
 

@@ -20,6 +20,7 @@ import sqlancer.common.oracle.TestOracle;
 import sqlancer.common.oracle.TestOracleUtils;
 import sqlancer.common.query.ExpectedErrors;
 import sqlancer.voltdb.VoltDBErrors;
+import sqlancer.voltdb.VoltDBProvider;
 import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 import sqlancer.voltdb.VoltDBSchema.VoltDBTable;
 import sqlancer.voltdb.ast.VoltDBExpression;
@@ -356,7 +357,8 @@ public class VoltDBPermissionOracle implements TestOracle<VoltDBGlobalState> {
             String url = servers == null || servers.isBlank()
                     ? "jdbc:voltdb://" + state.getOptions().getHost() + ":" + state.getOptions().getPort()
                     : "jdbc:voltdb://" + servers.trim();
-            c = DriverManager.getConnection(url, user.name, user.name);
+            c = DriverManager.getConnection(url,
+                    VoltDBProvider.connectionProperties(state.getDbmsSpecificOptions(), user.name, user.name, true));
             CONNECTIONS[user.ordinal()] = c;
         }
         return c;

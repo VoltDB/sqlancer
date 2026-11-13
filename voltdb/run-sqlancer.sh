@@ -50,6 +50,9 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
                      --security true, for the PERMS oracle's users "reader" (role sqlancer_read, SQLREAD) and
                      "writer" (role sqlancer_write, SQL). Not with --kill-interval, --resize-interval,
                      --crash-interval, --xdcr or --upgrade-from.
+  --ssl              TLS (milestone 42): the cluster's client, admin and internal connections use TLS, with a
+                     self-signed certificate made for the run (keytool); SQLancer, sqlcmd and voltadmin connect over
+                     it. Not with --xdcr. The mirror and the JDBC sink run without it.
   --export           add a file export target ("sqlancer", CSV into each node's voltdbroot/sqlancer_export) for the
                      STREAMS oracle's streams, and check at the end, after @Quiesce, that it wrote every row they got;
                      and a loopback target ("sqlancer_lb", into the table XS_LB) whose rows STREAMS checks as it goes;
@@ -96,6 +99,7 @@ kill_interval=0
 crash_interval=0
 xdcr=false
 security=false
+ssl=false
 export=false
 upgrade_from=
 upgrade_java_home=
@@ -127,6 +131,7 @@ while [ $# -gt 0 ]; do
     --crash-interval) crash_interval=$2; shift 2 ;;
     --xdcr) xdcr=true; shift ;;
     --security) security=true; shift ;;
+    --ssl) ssl=true; shift ;;
     --export) export=true; shift ;;
     --upgrade-from) upgrade_from=$2; shift 2 ;;
     --upgrade-java-home) upgrade_java_home=$2; shift 2 ;;
@@ -186,12 +191,18 @@ if $security; then
         die "--security does not mix with --kill-interval, --resize-interval, --crash-interval, --xdcr or --upgrade-from"
     provider_args=(--security true ${provider_args[@]+"${provider_args[@]}"})
 fi
+if $ssl; then
+    ! $xdcr || die "--ssl does not mix with --xdcr"
+fi
 if $export; then
     provider_args=(--export-target sqlancer,sqlancer_http,sqlancer_jdbc --loopback-target sqlancer_lb --ttl-migrate-target sqlancer_lbt ${provider_args[@]+"${provider_args[@]}"})
 fi
 # the administrator's credentials for voltadmin and sqlancer, with --security
 admin_creds=()
 $security && admin_creds=(-u sqlancer -p sqlancer)
+# with --ssl, how sqlcmd (a truststore, below) and voltadmin (no certificate check) reach the cluster over TLS
+ssl_sqlcmd=()
+ssl_voltadmin=()
 if $xdcr; then
     [ "$kill_interval" -eq 0 ] && [ "$resize_interval" -eq 0 ] && [ "$crash_interval" -eq 0 ] ||
         die "--xdcr does not mix with --kill-interval, --resize-interval or --crash-interval"
@@ -374,8 +385,8 @@ stop_cluster() {
     # at most 120 s: on a wedged cluster (ENG-30612) the shutdown never returns, and the processes are killed below
     if grep -q "Server completed initialization" "$cluster/node0/voltdbroot/log/volt.log" 2>/dev/null; then
         # with --export, a graceful shutdown first, which drains and closes the export files
-        if ! { $export && within 180 "$voltdb_home/bin/voltadmin" shutdown -H "localhost:$(admin_port 0)" ${admin_creds[@]+"${admin_creds[@]}"} >>"$results/run.log" 2>&1; }; then
-            within 120 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port 0)" ${admin_creds[@]+"${admin_creds[@]}"} >>"$results/run.log" 2>&1
+        if ! { $export && within 180 "$voltdb_home/bin/voltadmin" shutdown -H "localhost:$(admin_port 0)" ${admin_creds[@]+"${admin_creds[@]}"} ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} >>"$results/run.log" 2>&1; }; then
+            within 120 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port 0)" ${admin_creds[@]+"${admin_creds[@]}"} ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} >>"$results/run.log" 2>&1
         fi
     fi
     if [ -n "$mirror_home" ] && grep -q "Server completed initialization" "$cluster/mirror/voltdbroot/log/volt.log" 2>/dev/null; then
@@ -439,6 +450,7 @@ sqlancer_dirty=$(git -C "$repo_dir" status --porcelain 2>/dev/null | grep -v '^?
     echo "xdcr:             $($xdcr && echo "a second cluster of $nodes node(s), k=$kfactor, client ports $(xdcr_hosts client)" || echo no)"
     echo "upgrade:          $([ -n "$upgrade_from" ] && echo "from $upgrade_from ($(upgrade_cmd "$upgrade_from/bin/voltdb" --version 2>&1 | tail -1)) at $upgrade_at s" || echo no)"
     echo "security:         $($security && echo "on: users sqlancer (administrator), reader (sqlancer_read), writer (sqlancer_write)" || echo off)"
+    echo "tls:              $($ssl && echo "on: client, admin and internal connections, a self-signed certificate (cluster/tls)" || echo off)"
     echo "export:           $($export && echo "file target sqlancer, CSV" || echo no)"
     echo "crash interval:   $([ "$crash_interval" -gt 0 ] && echo "$crash_interval s, every node killed and recovered" || echo never)"
     echo "resize interval:  $([ "$resize_interval" -gt 0 ] && echo "$resize_interval s, $added nodes added and removed by turns" || echo never)"
@@ -516,6 +528,29 @@ if $export; then
         </configuration>
     </export>'
 fi
+# with --ssl, a self-signed certificate for localhost in a keystore, the same certificate in a truststore, and
+# sqlcmd's file naming the truststore; the cluster uses TLS for its client, admin and internal connections
+tls=
+if $ssl; then
+    mkdir -p "$cluster/tls"
+    keytool -genkeypair -alias voltdb -keyalg RSA -keysize 2048 -validity 30 -dname "CN=localhost" \
+        -ext "SAN=dns:localhost,ip:127.0.0.1" -keystore "$cluster/tls/keystore.jks" -storetype JKS \
+        -storepass sqlancer -keypass sqlancer >"$cluster/tls/keytool.log" 2>&1 &&
+        keytool -exportcert -alias voltdb -keystore "$cluster/tls/keystore.jks" -storepass sqlancer \
+            -file "$cluster/tls/voltdb.cer" >>"$cluster/tls/keytool.log" 2>&1 &&
+        keytool -importcert -noprompt -alias voltdb -file "$cluster/tls/voltdb.cer" \
+            -keystore "$cluster/tls/truststore.jks" -storetype JKS -storepass sqlancer >>"$cluster/tls/keytool.log" 2>&1 ||
+        die "keytool failed; see $cluster/tls/keytool.log"
+    printf 'trustStore=%s\ntrustStorePassword=sqlancer\n' "$cluster/tls/truststore.jks" >"$cluster/tls/ssl.properties"
+    ssl_sqlcmd=(--ssl="$cluster/tls/ssl.properties")
+    ssl_voltadmin=(--ssl=nocheck)
+    provider_args+=(--ssl-truststore "$cluster/tls/truststore.jks")
+    tls='
+    <ssl enabled="true" external="true" internal="true">
+        <keystore path="'"$cluster/tls/keystore.jks"'" password="sqlancer"/>
+        <truststore path="'"$cluster/tls/truststore.jks"'" password="sqlancer"/>
+    </ssl>'
+fi
 # with IMPORT among the oracles, the pull socket importer (milestone 41): CSV lines from four ports on this machine, which
 # SQLancer's IMPORT oracle listens on, into XI.insert; the nodes share the ports out among themselves
 importing=
@@ -532,7 +567,7 @@ cat >"$cluster/deployment.xml" <<EOF
 <?xml version="1.0"?>
 <deployment>
     <cluster sitesperhost="$sites" kfactor="$kfactor"/>
-    <httpd enabled="false"/>$durability$dr$users$exporting$importing
+    <httpd enabled="false"/>$durability$dr$users$tls$exporting$importing
 </deployment>
 EOF
 
@@ -639,7 +674,7 @@ if [ -n "$mirror_home" ]; then
     # the mirror never crashes: no command log or snapshots
     sed -e "s/kfactor=\"$kfactor\"/kfactor=\"0\"/" -e '/<commandlog /d' -e '/<snapshot /d' \
         -e '/<dr /d' -e '/<connection /d' -e '/<\/dr>/d' -e '/<export>/,/<\/export>/d' -e '/<import>/,/<\/import>/d' \
-        "$cluster/deployment.xml" >"$cluster/deployment-mirror.xml"
+        -e '/<ssl /,/<\/ssl>/d' "$cluster/deployment.xml" >"$cluster/deployment-mirror.xml"
     mirror_cmd "$mirror_home/bin/voltdb" init --force -D "$cluster/mirror" -C "$cluster/deployment-mirror.xml" \
         ${mirror_license_args[@]+"${mirror_license_args[@]}"} >"$cluster/init-mirror.log" 2>&1 ||
         die "voltdb init failed for the mirror; see $cluster/init-mirror.log"
@@ -668,7 +703,8 @@ fi
 if $export; then
     sed -e 's/sitesperhost="[0-9]*"/sitesperhost="2"/' -e "s/kfactor=\"$kfactor\"/kfactor=\"0\"/" \
         -e '/<commandlog /d' -e '/<snapshot /d' -e '/<dr /d' -e '/<connection /d' -e '/<\/dr>/d' \
-        -e '/<export>/,/<\/export>/d' -e '/<import>/,/<\/import>/d' "$cluster/deployment.xml" >"$cluster/deployment-sink.xml"
+        -e '/<export>/,/<\/export>/d' -e '/<import>/,/<\/import>/d' -e '/<ssl /,/<\/ssl>/d' \
+        "$cluster/deployment.xml" >"$cluster/deployment-sink.xml"
     "$voltdb_home/bin/voltdb" init --force -D "$cluster/sink" -C "$cluster/deployment-sink.xml" \
         ${license_args[@]+"${license_args[@]}"} >"$cluster/init-sink.log" 2>&1 ||
         die "voltdb init failed for the JDBC sink; see $cluster/init-sink.log"
@@ -877,7 +913,7 @@ upgrade_loop() {
         t0=$(date +%s)
         other=$(((i + 1) % nodes))
         # voltadmin stop names the node by the address VoltDB reports for it, which need not be localhost
-        info=$(echo "exec @SystemInformation OVERVIEW;" | "$voltdb_home/bin/sqlcmd" --port="$(client_port $other)" 2>/dev/null)
+        info=$(echo "exec @SystemInformation OVERVIEW;" | "$voltdb_home/bin/sqlcmd" --port="$(client_port $other)" ${ssl_sqlcmd[@]+"${ssl_sqlcmd[@]}"} 2>/dev/null)
         hid=$(echo "$info" | awk -v p="$(internal_port $i)" '$2 == "INTERNALPORT" && $3 == p { print $1 }')
         ip=$(echo "$info" | awk -v h="$hid" '$1 == h && $2 == "IPADDRESS" { print $3 }')
         if [ -z "$ip" ]; then
@@ -887,7 +923,7 @@ upgrade_loop() {
         pid=$(cat "$cluster/node$i.pid" 2>/dev/null)
         # done once the node's server has exited; a refusal leaves it running, and is retried
         for j in $(seq 1 20); do
-            out=$("$voltdb_home/bin/voltadmin" stop -H "localhost:$(admin_port $other)" "$ip:$(internal_port $i)" 2>&1 |
+            out=$("$voltdb_home/bin/voltadmin" stop -H "localhost:$(admin_port $other)" ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} "$ip:$(internal_port $i)" 2>&1 |
                 grep -v '^ *$' | tail -1)
             for _ in $(seq 1 30); do
                 kill -0 "$pid" 2>/dev/null || break
@@ -943,7 +979,7 @@ shrinks=0
 # resize while such a "disabled export target" may hold rows (lab build #43: every grow timed out); a stream with no
 # target discards its rows, so there is nothing to drain
 resize_hosts() {
-    "$voltdb_home/bin/voltadmin" resize --test --ignore=disabled_export -H "localhost:$(admin_port 0)" 2>&1 | tail -1
+    "$voltdb_home/bin/voltadmin" resize --test --ignore=disabled_export -H "localhost:$(admin_port 0)" ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} 2>&1 | tail -1
 }
 # start_added N: starts the k+1 nodes of grow N, each initialized afresh in $cluster/add<N>-<j>
 start_added() {
@@ -1029,7 +1065,7 @@ shrink() {
 }
 shrink_steps() {
     local n=$1 j alive deadline=$((SECONDS + 600)) out
-    out=$("$voltdb_home/bin/voltadmin" resize --ignore=disabled_export -H "localhost:$(admin_port 0)" 2>&1 | tail -1)
+    out=$("$voltdb_home/bin/voltadmin" resize --ignore=disabled_export -H "localhost:$(admin_port 0)" ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} 2>&1 | tail -1)
     echo "$(date '+%H:%M:%S') shrink $n: $out" >>"$results/resize.log"
     echo "$out" | grep -q "^INFO" || return 1
     while [ $SECONDS -lt $deadline ]; do
@@ -1160,7 +1196,7 @@ duplicates=0
 inserted=0
 stream_interrupted=0
 if $export; then
-    within 120 "$voltdb_home/bin/sqlcmd" --port="$(client_port 0)" ${admin_creds[@]+--user=sqlancer --password=sqlancer} \
+    within 120 "$voltdb_home/bin/sqlcmd" --port="$(client_port 0)" ${admin_creds[@]+--user=sqlancer --password=sqlancer} ${ssl_sqlcmd[@]+"${ssl_sqlcmd[@]}"} \
         <<<"exec @Quiesce;" >>"$results/run.log" 2>&1
     inserted=$(grep -m1 "^STREAMS inserted rows:" "$results/sqlancer/out.log" | sed 's/^STREAMS inserted rows: \([0-9]*\).*/\1/')
     # inserts a node failure interrupted: each may have committed and been exported, or not
