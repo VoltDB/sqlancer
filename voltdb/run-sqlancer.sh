@@ -58,6 +58,9 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
                      and a loopback target ("sqlancer_lb", into the table XS_LB) whose rows STREAMS checks as it goes;
                      an HTTP target ("sqlancer_http") and a JDBC target ("sqlancer_jdbc", into a one-node sink
                      cluster of the same kit) whose rows are counted with the file target's
+  --http-mode MODE   how the HTTP target sends rows (milestone 47): form (one row per request as form pairs, by POST,
+                     PUT or GET), signed (form, signed with HmacSHA1 or HmacSHA256, which the receiver checks) or
+                     batch (CSV batches every 10 s, by POST or PUT); default: chosen from the seed, as is the method
   --keep-cluster     leave the cluster running and its data in place after the run
   --mirror-voltdb DIR  also start one node of this other VoltDB kit (normally the last release) and run
                      the provider with --mirror: every change is repeated on it, and the DIFF oracle
@@ -101,6 +104,7 @@ xdcr=false
 security=false
 ssl=false
 export=false
+http_mode=
 upgrade_from=
 upgrade_java_home=
 upgrade_at=
@@ -133,6 +137,7 @@ while [ $# -gt 0 ]; do
     --security) security=true; shift ;;
     --ssl) ssl=true; shift ;;
     --export) export=true; shift ;;
+    --http-mode) http_mode=$2; shift 2 ;;
     --upgrade-from) upgrade_from=$2; shift 2 ;;
     --upgrade-java-home) upgrade_java_home=$2; shift 2 ;;
     --upgrade-at) upgrade_at=$2; shift 2 ;;
@@ -172,6 +177,16 @@ if [ -z "$kfactor" ]; then
 fi
 [ "$kfactor" -lt "$nodes" ] || die "--kfactor must be less than --nodes"
 [ -n "$seed" ] || seed=$(date +%s)
+# the HTTP target's mode and method, from the seed unless --http-mode names the mode (milestone 47)
+http_modes=(form signed batch)
+[ -n "$http_mode" ] || http_mode=${http_modes[$((seed % 3))]}
+case "$http_mode" in
+    form|signed) http_methods=(POST PUT GET) ;;
+    batch) http_methods=(POST PUT) ;;
+    *) die "--http-mode must be form, signed or batch" ;;
+esac
+http_method=${http_methods[$((seed / 3 % ${#http_methods[@]}))]}
+http_sig_alg=$([ $((seed / 7 % 2)) -eq 0 ] && echo HmacSHA1 || echo HmacSHA256)
 [ "$kill_interval" -eq 0 ] || [ "$resize_interval" -eq 0 ] || die "--kill-interval and --resize-interval do not mix"
 [ "$crash_interval" -eq 0 ] || { [ "$kill_interval" -eq 0 ] && [ "$resize_interval" -eq 0 ]; } ||
     die "--crash-interval does not mix with --kill-interval or --resize-interval"
@@ -451,7 +466,7 @@ sqlancer_dirty=$(git -C "$repo_dir" status --porcelain 2>/dev/null | grep -v '^?
     echo "upgrade:          $([ -n "$upgrade_from" ] && echo "from $upgrade_from ($(upgrade_cmd "$upgrade_from/bin/voltdb" --version 2>&1 | tail -1)) at $upgrade_at s" || echo no)"
     echo "security:         $($security && echo "on: users sqlancer (administrator), reader (sqlancer_read), writer (sqlancer_write)" || echo off)"
     echo "tls:              $($ssl && echo "on: client, admin and internal connections, a self-signed certificate (cluster/tls)" || echo off)"
-    echo "export:           $($export && echo "file target sqlancer, CSV" || echo no)"
+    echo "export:           $($export && echo "file target sqlancer, CSV; HTTP target $http_mode by $http_method$([ "$http_mode" = signed ] && echo ", $http_sig_alg")" || echo no)"
     echo "crash interval:   $([ "$crash_interval" -gt 0 ] && echo "$crash_interval s, every node killed and recovered" || echo never)"
     echo "resize interval:  $([ "$resize_interval" -gt 0 ] && echo "$resize_interval s, $added nodes added and removed by turns" || echo never)"
     echo "provider options: ${provider_args[*]:-}"
@@ -498,6 +513,29 @@ case " ${provider_args[*]-} " in *" --avoid-known-bugs false "*) jdbc_createtabl
 # stream in the same second name the same file, and the target refuses it and retries the block for good, logging a
 # stack trace each time (lab build #43: 60 GB of volt.log per node in 45 minutes, and the rows it held never written)
 exporting=
+# the HTTP target (milestone 47): form pairs, signed or not, or CSV batches, whose endpoint must name the table, the
+# partition and the generation; a batch is sent when the target rolls it, every period
+http_properties='
+            <property name="endpoint">http://localhost:'"$(port 0 7)"'/%t</property>
+            <property name="method">'"$http_method"'</property>'
+case "$http_mode" in
+    signed) http_properties+='
+            <property name="secret">sqlancer-secret</property>
+            <property name="signatureMethod">'"$http_sig_alg"'</property>
+            <property name="signatureName">Signature</property>' ;;
+    # BATCH_HTTP_BUG: in batch mode the client reads the endpoint's query string without checking that it has one, and
+    # with none it fails every batch after sending it (a NullPointerException) and sends it again, for good: the stream
+    # exports nothing more. While avoiding known bugs the endpoint has a query string
+    batch)
+        http_query='?sqlancer=1'
+        case " ${provider_args[*]-} " in *" --avoid-known-bugs false "*) http_query= ;; esac
+        http_properties='
+            <property name="endpoint">http://localhost:'"$(port 0 7)"'/%t/%p/%g'"$http_query"'</property>
+            <property name="method">'"$http_method"'</property>
+            <property name="batch.mode">true</property>
+            <property name="type">csv</property>
+            <property name="period">10s</property>' ;;
+esac
 if $export; then
     exporting='
     <export>
@@ -507,8 +545,7 @@ if $export; then
             <property name="outdir">sqlancer_export</property>
             <property name="period">1</property>
         </configuration>
-        <configuration target="sqlancer_http" enabled="true" type="http">
-            <property name="endpoint">http://localhost:'"$(port 0 7)"'/%t</property>
+        <configuration target="sqlancer_http" enabled="true" type="http">'"$http_properties"'
         </configuration>
         <configuration target="sqlancer_jdbc" enabled="true" type="jdbc">
             <property name="jdbcurl">jdbc:voltdb://localhost:'"$(port $sink_slot 0)"'</property>
@@ -575,7 +612,7 @@ EOF
 # stopping the cluster stops it too
 if $export; then
     python3 -I "$repo_dir/voltdb/http-receiver.py" "$(port 0 7)" "$cluster/http-export.log" "$cluster/http.hold" \
-        >"$cluster/http-receiver.out" 2>&1 &
+        "$http_mode" sqlancer-secret "$http_sig_alg" Signature >"$cluster/http-receiver.out" 2>&1 &
 fi
 log "Starting $nodes node(s), k=$kfactor, $sites sites per host"
 for ((i = 0; i < nodes; i++)); do
@@ -1209,6 +1246,18 @@ stream_interrupted=0
 if $export; then
     within 120 "$voltdb_home/bin/sqlcmd" --port="$(client_port 0)" ${admin_creds[@]+--user=sqlancer --password=sqlancer} ${ssl_sqlcmd[@]+"${ssl_sqlcmd[@]}"} \
         <<<"exec @Quiesce;" >>"$results/run.log" 2>&1
+    # a batch reaches the HTTP target when the target rolls it, every 10 s: wait until the receiver's rows are the same
+    # for 25 s (at most 120 s)
+    if [ "$http_mode" = batch ]; then
+        last= same=0
+        for _ in $(seq 1 120); do
+            now=$(wc -l <"$cluster/http-export.log" 2>/dev/null | tr -d ' ')
+            [ "$now" = "$last" ] && same=$((same + 1)) || same=0
+            last=$now
+            [ "$same" -ge 25 ] && break
+            sleep 1
+        done
+    fi
     inserted=$(grep -m1 "^STREAMS inserted rows:" "$results/sqlancer/out.log" | sed 's/^STREAMS inserted rows: \([0-9]*\).*/\1/')
     # inserts a node failure interrupted: each may have committed and been exported, or not
     stream_interrupted=$(grep -m1 "^STREAMS inserted rows:" "$results/sqlancer/out.log" | sed -n 's/.*; interrupted inserts: \([0-9]*\).*/\1/p')
@@ -1316,8 +1365,12 @@ if $export; then
     # each line's last column is the row's I
     exported=$(cat "$cluster"/node*/voltdbroot/sqlancer_export/*.csv 2>/dev/null | awk -F, '{ print $NF }' | sort -u | wc -l | tr -d ' ')
     # the HTTP target's rows: each request is one row, its columns as form fields; the row's I is unique in the run
-    http_total=$(grep -c "&I=[0-9]*" "$cluster/http-export.log" 2>/dev/null)
-    http_rows=$(grep -o "&I=[0-9]*" "$cluster/http-export.log" 2>/dev/null | sort -u | wc -l | tr -d ' ')
+    # (with --http-mode batch, the receiver writes each CSV line of a batch as such a line; a signed request whose
+    # signature does not match is a BADSIG line, not a row, and fails the run)
+    http_total=$(grep -v "^BADSIG" "$cluster/http-export.log" 2>/dev/null | grep -c "&I=[0-9]*")
+    http_rows=$(grep -v "^BADSIG" "$cluster/http-export.log" 2>/dev/null | grep -o "&I=[0-9]*" | sort -u | wc -l | tr -d ' ')
+    bad_signatures=$(grep -c "^BADSIG" "$cluster/http-export.log" 2>/dev/null)
+    [ "${bad_signatures:-0}" -eq 0 ] || export_failed=true
     jdbc_total=$(awk -F, '{ s += $2 } END { print s + 0 }' "$results/export/jdbc.csv" 2>/dev/null)
     jdbc_rows=$(awk -F, '{ s += $3 } END { print s + 0 }' "$results/export/jdbc.csv" 2>/dev/null)
     total=$((total + ${http_total:-0} + ${jdbc_total:-0}))
@@ -1328,7 +1381,7 @@ if $export; then
     gap_holds=$(grep -c "the HTTP target refuses rows" "$results/chaos.log" 2>/dev/null)
     # every inserted row, and at most the interrupted ones besides
     [ "$exported" -ge "$inserted" ] && [ "$exported" -le $((inserted + stream_interrupted)) ] || export_failed=true
-    log "Export: $exported rows exported (${http_rows:-0} through HTTP, ${jdbc_rows:-0} through JDBC; $duplicates exported twice), $inserted inserted into the streams ($stream_interrupted inserts interrupted)$($export_failed && echo ", MISMATCH"); gap fills: ${gap_fills:-0} (HTTP held across ${gap_holds:-0} kills)"
+    log "Export: $exported rows exported (${http_rows:-0} through HTTP, ${jdbc_rows:-0} through JDBC; $duplicates exported twice), $inserted inserted into the streams ($stream_interrupted inserts interrupted)$([ "${bad_signatures:-0}" -eq 0 ] || echo ", $bad_signatures requests with a bad signature")$($export_failed && echo ", MISMATCH"); gap fills: ${gap_fills:-0} (HTTP held across ${gap_holds:-0} kills)"
 fi
 # XDCR's conflict log: each database writes through one cluster only, so XDCR has nothing to resolve, and any
 # conflict it logged fails the run; but for XCONFLICT's tables (XCP_..., XCR_...), whose conflicts it makes on purpose
@@ -1402,7 +1455,7 @@ result=PASS
     grep -m1 "^IMPORT checks:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^STATS calls checked:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^LOGIN checks:" "$results/sqlancer/out.log" 2>/dev/null
-    $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP, ${jdbc_rows:-0} through JDBC, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)"); gap fills: ${gap_fills:-0} (HTTP held across ${gap_holds:-0} kills)"
+    $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP $http_mode by $http_method$([ "${bad_signatures:-0}" -eq 0 ] || echo ", $bad_signatures BAD SIGNATURES"), ${jdbc_rows:-0} through JDBC, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)"); gap fills: ${gap_fills:-0} (HTTP held across ${gap_holds:-0} kills)"
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
     [ "$crash_interval" -gt 0 ] && echo "crashes: $crashes crashes, $recoveries recoveries$($crash_failed && echo ", a recovery FAILED (crash.log)")"
