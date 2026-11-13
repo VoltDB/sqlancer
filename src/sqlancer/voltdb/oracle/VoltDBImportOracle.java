@@ -158,6 +158,10 @@ public class VoltDBImportOracle implements TestOracle<VoltDBGlobalState> {
                 while (rs.next()) {
                     rows.put(rs.getLong(1), rs.getString(2) == null ? "" : rs.getString(2));
                 }
+            } catch (SQLException e) {
+                if (c == connection() || !notYetCreated(e)) {
+                    throw e;
+                }
             }
         }
         return rows;
@@ -170,9 +174,18 @@ public class VoltDBImportOracle implements TestOracle<VoltDBGlobalState> {
             try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) {
                 rs.next();
                 n += rs.getLong(1);
+            } catch (SQLException e) {
+                if (c == connection() || !notYetCreated(e)) {
+                    throw e;
+                }
             }
         }
         return n;
+    }
+
+    // XI's DDL reaches the XDCR peer after this cluster: until then the peer's XI is missing, so as good as empty
+    private static boolean notYetCreated(SQLException e) {
+        return String.valueOf(e.getMessage()).contains("object not found: XI");
     }
 
     private List<VoltDBConnection> clusters() {

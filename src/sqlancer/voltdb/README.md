@@ -993,7 +993,9 @@ Milestone 34. Milestone 30's coverage run found the system procedures behind row
     migrated so far must be `MIGRATING`.
 
 A statement that fails (a node failure's, as with STREAMS) leaves the table out of step, and that name's TTL or
-migration checks stop for the run. At exit TTL prints how many checks of each kind it made.
+migration checks stop for the run. In an XDCR run there are no migration checks: a database name may work through
+either cluster, each with its own `XM_` table, while the rows migrated so far are kept by name. At exit TTL prints how
+many checks of each kind it made.
 
 In a 5-minute trial on 1 node (beside NoREC and TLP WHERE) TTL made 892 TTL checks and 880 migration checks; in one on
 3 nodes with k=2 and `--export` (beside STREAMS and NoREC), 110 and 105, the migrations through the loopback target. With
@@ -1106,6 +1108,11 @@ How the oracle fits VoltDB's snapshot handling:
 - A restore while DDL runs makes writes to a join view's replicated table crash the server (ENG-30677 below), so while
   `--avoid-known-bugs` is true no DDL of SQLancer runs during a restore: every connection's DDL holds a lock shared
   (`VoltDBConnection`), and a restore holds it exclusive.
+
+In an XDCR run (`--xdcr`) SNAPSHOT checks nothing: a restore is local to one cluster, and milestone 41's coverage run
+found that its restores there stop the replication of other tables for a while (the DR consumer reconnects), so the
+XDCR oracle's databases did not converge. A plain save and restore of a table that is not a DR table did not do it, so
+this is not yet reduced to a reproduction.
 
 ## The XCONFLICT oracle
 
