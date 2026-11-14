@@ -523,7 +523,7 @@ case "$http_mode" in
             <property name="secret">sqlancer-secret</property>
             <property name="signatureMethod">'"$http_sig_alg"'</property>
             <property name="signatureName">Signature</property>' ;;
-    # BATCH_HTTP_BUG: in batch mode the client reads the endpoint's query string without checking that it has one, and
+    # ENG-30694: in batch mode the client reads the endpoint's query string without checking that it has one, and
     # with none it fails every batch after sending it (a NullPointerException) and sends it again, for good: the stream
     # exports nothing more. While avoiding known bugs the endpoint has a query string
     batch)

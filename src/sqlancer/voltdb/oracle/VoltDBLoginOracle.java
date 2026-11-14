@@ -159,7 +159,7 @@ public class VoltDBLoginOracle implements TestOracle<VoltDBGlobalState> {
         case 1:
             String digest = sha256(password);
             if (!avoidKnownBugs && Randomly.getBoolean()) {
-                // a masked password in lowercase: a user that never logs in (MASKED_CASE_BUG)
+                // a masked password in lowercase: a user that never logs in (ENG-30695)
                 digest = digest.toLowerCase(Locale.ROOT);
             }
             set("deployment:\n  users:\n  - name: " + user + "\n    password: \"" + digest

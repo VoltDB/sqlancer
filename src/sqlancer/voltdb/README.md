@@ -1296,7 +1296,7 @@ turns with CONFIG's. At exit LOGIN prints its checks, the logins accepted and re
 the summary has the line. Without `--security` it skips every check.
 
 A masked password in lowercase hex, as `shasum` prints it, gives a user that is refused with every password: VoltDB
-keeps the digest as given and compares it with the client's in uppercase (MASKED_CASE_BUG). While avoiding known bugs,
+keeps the digest as given and compares it with the client's in uppercase (ENG-30695). While avoiding known bugs,
 LOGIN masks passwords in uppercase; otherwise half of the masked ones are in lowercase, and the login fails.
 
 In a 5-minute trial on 1 node with TLS, beside NoREC, PERMS and CONFIG: 167 checks, 334 logins accepted, 574 refused
@@ -1436,7 +1436,7 @@ arrive, through every target, none twice. `run-coverage.sh`'s export run uses `s
 k=1, no kills) uses `batch`.
 
 In batch mode the client reads the endpoint's query string without checking that it has one; with none it fails each
-batch after sending it (a NullPointerException), sends it again, and the stream exports nothing more (BATCH_HTTP_BUG).
+batch after sending it (a NullPointerException), sends it again, and the stream exports nothing more (ENG-30694).
 While avoiding known bugs, the endpoint has a query string (`?sqlancer=1`).
 
 In run-coverage.sh's 10-minute export (signed, by POST, a kill every 66 s) and batch (by PUT) runs: 658 and 1,088 rows
@@ -1913,6 +1913,14 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
+The bugs below were found in milestones 43, 46 and 47.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30694 | An HTTP export target in batch mode whose endpoint has no query string fails every batch after sending it (`getQuery().contains(...)` on null, a NullPointerException), sends it again on every retry, and the stream exports nothing more. Found by milestone 47's batch mode; `repros/ENG-30694.sh`. A hang, Blocker for V16.1.0. | While `--avoid-known-bugs` is true, the batch endpoint has a query string (`?sqlancer=1`). |
+| ENG-30695 | A user whose masked password (`plaintext: false`) is given in lowercase hex is refused with every password, with no warning: the catalog keeps the digest as given and logins compare it with the client's in uppercase. Found by LOGIN (milestone 46); `repros/ENG-30695.sh`. Major. | While `--avoid-known-bugs` is true, LOGIN masks passwords in uppercase. |
+| ENG-30696 | DDL fails with "Unable to find reference for catalog item" while `voltadmin stop` takes a node out: the stopping node verifies catalog updates it no longer applies. Lab build #56's upgrade run, on 16.0.0; not reproduced locally. Major. | The error counts as a node failure (VoltDBErrors). |
 
 The bugs below were found in lab build #53 and in milestone 41.
 
