@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 46.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 47.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -60,6 +60,8 @@ Since milestone 45 export runs hold the HTTP target across every other kill, so 
 [Gap fills](#gap-fills-milestone-45).
 Since milestone 46 the LOGIN oracle adds, changes and removes users while the database runs and checks who may log
 in; see [The LOGIN oracle](#the-login-oracle).
+Since milestone 47 the HTTP target sends form pairs by POST, PUT or GET, signed or not, or CSV batches; see
+[HTTP target modes](#http-target-modes-milestone-47).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -1294,7 +1296,7 @@ turns with CONFIG's. At exit LOGIN prints its checks, the logins accepted and re
 the summary has the line. Without `--security` it skips every check.
 
 A masked password in lowercase hex, as `shasum` prints it, gives a user that is refused with every password: VoltDB
-keeps the digest as given and compares it with the client's in uppercase (MASKED_CASE_BUG). While avoiding known bugs,
+keeps the digest as given and compares it with the client's in uppercase (ENG-30695). While avoiding known bugs,
 LOGIN masks passwords in uppercase; otherwise half of the masked ones are in lowercase, and the login fails.
 
 In a 5-minute trial on 1 node with TLS, beside NoREC, PERMS and CONFIG: 167 checks, 334 logins accepted, 574 refused
@@ -1414,6 +1416,32 @@ In an 8-minute local run (3 nodes, k=2, a kill a minute, NoREC, TLP WHERE and ST
 3,553 of 3,553 rows exported, none twice. In run-coverage.sh's 10-minute export run: 2 gap fills, 754 of 754 rows;
 the gap fill's classes went from 13 to 322 of 537 lines (`E3ClientGapSession` 61 of 105, `E3ServerGapSession` 71 of
 132, `GapFillResponse` 72 of 88).
+
+### HTTP target modes (milestone 47)
+
+Milestone 45's coverage run found most of the HTTP export client never run (`HttpExportDecoder` 57 of 245 lines):
+the target only ever sent one row per POST, unsigned. `run-sqlancer.sh --http-mode` now picks how it sends rows, from
+the seed unless given:
+
+- `form`: one row per request as form pairs, by POST, PUT or GET (the method from the seed too);
+- `signed`: the same, signed with `HmacSHA1` or `HmacSHA256` (`secret`, `signatureMethod`, `signatureName`).
+  `voltdb/http-receiver.py` computes each request's signature itself (over the method, host, path and the sorted pairs
+  as sent) and refuses one that does not match with 403, recording it as a `BADSIG` line, which fails the run;
+- `batch`: `batch.mode` with `type` csv and `period` 10s, by POST or PUT, to an endpoint naming the table, the
+  partition and the generation (`/%t/%p/%g`). The receiver writes each CSV line of a batch as a row, and after
+  `@Quiesce` the run waits until the receiver's rows are the same for 25 s before counting.
+
+The manifest and the summary name the mode and the method. The count at the end is unchanged: every inserted row must
+arrive, through every target, none twice. `run-coverage.sh`'s export run uses `signed`, and a new `batch` run (3 nodes,
+k=1, no kills) uses `batch`.
+
+In batch mode the client reads the endpoint's query string without checking that it has one; with none it fails each
+batch after sending it (a NullPointerException), sends it again, and the stream exports nothing more (ENG-30694).
+While avoiding known bugs, the endpoint has a query string (`?sqlancer=1`).
+
+In run-coverage.sh's 10-minute export (signed, by POST, a kill every 66 s) and batch (by PUT) runs: 658 and 1,088 rows
+exported, none twice, no bad signature; `HttpExportClient` 155 of 260 lines (from 115), `HttpExportDecoder` 85 of 245
+(from 57); export and streams 35.2% of their lines (from 33.0%).
 
 The bugs below were found in milestone 29.
 
@@ -1885,6 +1913,14 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
+The bugs below were found in milestones 43, 46 and 47.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30694 | An HTTP export target in batch mode whose endpoint has no query string fails every batch after sending it (`getQuery().contains(...)` on null, a NullPointerException), sends it again on every retry, and the stream exports nothing more. Found by milestone 47's batch mode; `repros/ENG-30694.sh`. A hang, Blocker for V16.1.0. | While `--avoid-known-bugs` is true, the batch endpoint has a query string (`?sqlancer=1`). |
+| ENG-30695 | A user whose masked password (`plaintext: false`) is given in lowercase hex is refused with every password, with no warning: the catalog keeps the digest as given and logins compare it with the client's in uppercase. Found by LOGIN (milestone 46); `repros/ENG-30695.sh`. Major. | While `--avoid-known-bugs` is true, LOGIN masks passwords in uppercase. |
+| ENG-30696 | DDL fails with "Unable to find reference for catalog item" while `voltadmin stop` takes a node out: the stopping node verifies catalog updates it no longer applies. Lab build #56's upgrade run, on 16.0.0; not reproduced locally. Major. | The error counts as a node failure (VoltDBErrors). |
 
 The bugs below were found in lab build #53 and in milestone 41.
 

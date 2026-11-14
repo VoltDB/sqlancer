@@ -21,8 +21,8 @@ Usage: voltdb/run-coverage.sh --voltdb <instrumented build> --results <dir> [opt
   --license FILE     license for voltdb init (default: none)
   --results DIR      where to put the runs and the report (created; must not exist)
   --duration SECS    how long each run's SQLancer runs (default 1200)
-  --runs LIST        comma-separated runs to make, in order (default: security, kill, export, resize, xdcr,
-                     crash, repros). Also sqlcoverage: "ant sqlcoverage" in --voltdb (VoltDB's own
+  --runs LIST        comma-separated runs to make, in order (default: security, kill, export, batch, resize,
+                     xdcr, crash, repros). Also sqlcoverage: "ant sqlcoverage" in --voltdb (VoltDB's own
                      randomized SQL suite, against HSQL), for a baseline to compare with (coverage/compare.py)
   --coverage-port N  port of the JaCoCo collector (default 36300)
   --compare-with DIR the results of another run-coverage.sh (normally --runs sqlcoverage) to compare with: also
@@ -58,7 +58,7 @@ voltdb_home=
 license=
 results=
 duration=1200
-runs=security,kill,export,resize,xdcr,crash,repros
+runs=security,kill,export,batch,resize,xdcr,crash,repros
 jacoco_agent=$m2/org/jacoco/org.jacoco.agent/0.8.12/org.jacoco.agent-0.8.12-runtime.jar
 jacoco_lib=
 seed=$(date +%s)
@@ -181,7 +181,9 @@ if ! $report_only; then
         case $run in
         security) args=(--nodes 1 --kfactor 0 --sites 8 --security --ssl) ;;
         kill) args=(--nodes 3 --kfactor 1 --sites 8 --kill-interval "$kill_every") ;;
-        export) args=(--nodes 3 --kfactor 2 --sites 2 --export --kill-interval "$kill_every") ;;
+        export) args=(--nodes 3 --kfactor 2 --sites 2 --export --http-mode signed --kill-interval "$kill_every") ;;
+        # the HTTP target's batch mode (milestone 47), without kills
+        batch) args=(--nodes 3 --kfactor 1 --sites 4 --export --http-mode batch) ;;
         resize) args=(--nodes 3 --kfactor 1 --sites 8 --resize-interval 120) ;;
         xdcr) args=(--nodes 3 --kfactor 1 --sites 4 --xdcr) ;;
         crash) args=(--nodes 3 --kfactor 1 --sites 8 --crash-interval "$crash_every") ;;

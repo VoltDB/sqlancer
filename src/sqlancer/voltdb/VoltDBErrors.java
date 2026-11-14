@@ -55,7 +55,7 @@ public final class VoltDBErrors {
             // a node that voltadmin stop takes out (an in-service upgrade) applies no catalog update after its StopNode
             // notice, but until it is gone (5 s in lab build #56's upgrade run, on 16.0.0) it still verifies each new
             // one, and fails any that names an object made since: "@VerifyCatalogAndWriteJar from host 2: ...
-            // Unable to find reference for catalog item"
+            // Unable to find reference for catalog item" (ENG-30696)
             "Unable to find reference for catalog item" };
 
     private VoltDBErrors() {
