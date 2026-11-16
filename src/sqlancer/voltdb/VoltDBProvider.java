@@ -196,16 +196,17 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
                 peerUrl = here;
             }
         }
-        VoltDBConnection sqlCon = connect(globalState, url,
-                globalState.getDbmsSpecificOptions().nodeFailures || globalState.getDbmsSpecificOptions().resizes
-                        || globalState.getDbmsSpecificOptions().crashes
-                        || globalState.getDbmsSpecificOptions().upgrades);
+        boolean failures = globalState.getDbmsSpecificOptions().nodeFailures
+                || globalState.getDbmsSpecificOptions().resizes || globalState.getDbmsSpecificOptions().crashes
+                || globalState.getDbmsSpecificOptions().upgrades;
+        VoltDBConnection sqlCon = connect(globalState, url, failures);
         String hold = globalState.getDbmsSpecificOptions().ddlHold;
         if (hold != null && !hold.isBlank() && globalState.getDbmsSpecificOptions().avoidKnownBugs) {
             sqlCon.setDdlHold(Paths.get(hold));
         }
         if (peerUrl != null) {
-            VoltDBConnection peerCon = connect(globalState, peerUrl, false);
+            // with --xdcr and node failures (milestone 49), the cluster whose nodes fail may be either side
+            VoltDBConnection peerCon = connect(globalState, peerUrl, failures);
             // ENG-30630: the earlier database of this name may have written through the other cluster, and rows still
             // on their way to this one when it drops and recreates the tables pause that DR stream for good; so
             // everything either cluster has queued for the other is applied first

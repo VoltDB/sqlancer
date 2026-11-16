@@ -29,6 +29,8 @@ import sqlancer.voltdb.VoltDBSchema.VoltDBTable;
 public class VoltDBXdcrOracle implements TestOracle<VoltDBGlobalState> {
 
     private static final long CONVERGE_MILLIS = 60_000;
+    // where nodes fail (milestone 49), a rejoining node's partitions catch up on DR only once it has rejoined
+    private static final long CONVERGE_MILLIS_NODE_FAILURES = 180_000;
     private static final String ERROR = "error: ";
 
     private final VoltDBGlobalState state;
@@ -51,7 +53,8 @@ public class VoltDBXdcrOracle implements TestOracle<VoltDBGlobalState> {
             names.add(table.getName());
         }
         names.addAll(state.getViews().keySet());
-        long deadline = System.currentTimeMillis() + CONVERGE_MILLIS;
+        long converge = state.getDbmsSpecificOptions().nodeFailures ? CONVERGE_MILLIS_NODE_FAILURES : CONVERGE_MILLIS;
+        long deadline = System.currentTimeMillis() + converge;
         List<String> differences;
         while (true) {
             differences = new ArrayList<>();
@@ -78,7 +81,7 @@ public class VoltDBXdcrOracle implements TestOracle<VoltDBGlobalState> {
             Thread.sleep(1000);
         }
         if (!differences.isEmpty()) {
-            throw new AssertionError("the XDCR clusters did not converge within " + CONVERGE_MILLIS / 1000 + " s: "
+            throw new AssertionError("the XDCR clusters did not converge within " + converge / 1000 + " s: "
                     + String.join(" | ", differences));
         }
         // run-sqlancer.sh counts these

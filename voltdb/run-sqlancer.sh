@@ -41,8 +41,9 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
                      shutdown --save", whose restart recovers from the shutdown snapshot (default true)
   --xdcr             also start a second cluster of the same shape, linked to the first by XDCR (active-active
                      DR), and run the provider with --xdcr: each database writes through one of the two, its DDL
-                     runs on both, and the XDCR oracle compares their rows. Not with --kill-interval,
-                     --resize-interval or --crash-interval.
+                     runs on both, and the XDCR oracle compares their rows. With --kill-interval, the first
+                     cluster's nodes are killed and rejoined (milestone 49). Not with --resize-interval or
+                     --crash-interval.
   --upgrade-from DIR start the cluster on this older VoltDB kit (normally the last release) and, at
                      --upgrade-at, upgrade it in service to --voltdb: one node at a time, voltadmin stop, then
                      voltdb start on the new kit, which rejoins. Needs --kfactor 1 or more. Not with
@@ -224,8 +225,9 @@ $security && admin_creds=(-u sqlancer -p sqlancer)
 ssl_sqlcmd=()
 ssl_voltadmin=()
 if $xdcr; then
-    [ "$kill_interval" -eq 0 ] && [ "$resize_interval" -eq 0 ] && [ "$crash_interval" -eq 0 ] ||
-        die "--xdcr does not mix with --kill-interval, --resize-interval or --crash-interval"
+    # with --kill-interval (milestone 49), the nodes killed and rejoined are the first cluster's; the second stays up
+    [ "$resize_interval" -eq 0 ] && [ "$crash_interval" -eq 0 ] ||
+        die "--xdcr does not mix with --resize-interval or --crash-interval"
 fi
 if [ "$crash_interval" -gt 0 ]; then
     # a crash drops every call in flight and every connection; the provider skips what it interrupted and waits for

@@ -185,7 +185,8 @@ if ! $report_only; then
         # the HTTP target's batch mode (milestone 47), without kills
         batch) args=(--nodes 3 --kfactor 1 --sites 4 --export --http-mode batch) ;;
         resize) args=(--nodes 3 --kfactor 1 --sites 8 --resize-interval 120) ;;
-        xdcr) args=(--nodes 3 --kfactor 1 --sites 4 --xdcr) ;;
+        # with kills of the first cluster's nodes (milestone 49)
+        xdcr) args=(--nodes 3 --kfactor 1 --sites 4 --xdcr --kill-interval "$kill_every") ;;
         crash) args=(--nodes 3 --kfactor 1 --sites 8 --crash-interval "$crash_every") ;;
         repros | sqlcoverage) args=() ;;
         *) die "unknown run $run (see --runs)" ;;
