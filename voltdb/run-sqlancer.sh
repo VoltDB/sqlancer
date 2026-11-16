@@ -36,6 +36,9 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
   --crash-interval S every S seconds, kill every node at once with kill -9 and restart them all, which
                      recovers the database from its snapshots and synchronous command log (default 0:
                      never). Not with --kill-interval or --resize-interval.
+  --graceful B       (milestone 48) with --kill-interval, every other node failure (the second, fourth, ...) is
+                     "voltadmin stop" instead of kill -9; with --crash-interval, every other crash is "voltadmin
+                     shutdown --save", whose restart recovers from the shutdown snapshot (default true)
   --xdcr             also start a second cluster of the same shape, linked to the first by XDCR (active-active
                      DR), and run the provider with --xdcr: each database writes through one of the two, its DDL
                      runs on both, and the XDCR oracle compares their rows. Not with --kill-interval,
@@ -100,6 +103,7 @@ use_reducer=false
 keep_cluster=false
 kill_interval=0
 crash_interval=0
+graceful=true
 xdcr=false
 security=false
 ssl=false
@@ -133,6 +137,7 @@ while [ $# -gt 0 ]; do
     --keep-cluster) keep_cluster=true; shift ;;
     --kill-interval) kill_interval=$2; shift 2 ;;
     --crash-interval) crash_interval=$2; shift 2 ;;
+    --graceful) graceful=$2; shift 2 ;;
     --xdcr) xdcr=true; shift ;;
     --security) security=true; shift ;;
     --ssl) ssl=true; shift ;;
@@ -789,6 +794,36 @@ $use_reducer && sqlancer_args+=(--use-reducer)
 # because a port is taken ("Address already in use", by another process's outgoing connection) is tried again, up
 # to 5 times, 10 s apart. The FATAL lines such an attempt writes to volt.log are listed in chaos.excluded and not
 # counted against the run.
+# stop_node I LOG: stops node I with "voltadmin stop" through another node, which VoltDB refuses for a few seconds
+# after a rejoin and so is retried, up to 20 times, 10 s apart; returns once the node's server has exited, 1 if it
+# never does. voltadmin names the node by the address VoltDB reports for it, which need not be localhost. Each refusal
+# is a line of LOG
+stop_node() {
+    local i=$1 slog=$2 other info hid ip out pid j
+    other=$(((i + 1) % nodes))
+    info=$(echo "exec @SystemInformation OVERVIEW;" | "$voltdb_home/bin/sqlcmd" --port="$(client_port $other)" \
+        ${admin_creds[@]+--user=sqlancer --password=sqlancer} ${ssl_sqlcmd[@]+"${ssl_sqlcmd[@]}"} 2>/dev/null)
+    hid=$(echo "$info" | awk -v p="$(internal_port $i)" '$2 == "INTERNALPORT" && $3 == p { print $1 }')
+    ip=$(echo "$info" | awk -v h="$hid" '$1 == h && $2 == "IPADDRESS" { print $3 }')
+    if [ -z "$ip" ]; then
+        echo "$(date '+%H:%M:%S') node$i not found in @SystemInformation" >>"$slog"
+        return 1
+    fi
+    pid=$(cat "$cluster/node$i.pid" 2>/dev/null)
+    for j in $(seq 1 20); do
+        out=$("$voltdb_home/bin/voltadmin" stop -H "localhost:$(admin_port $other)" ${admin_creds[@]+"${admin_creds[@]}"} \
+            ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} "$ip:$(internal_port $i)" 2>&1 | grep -v '^ *$' | tail -1)
+        for _ in $(seq 1 30); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        kill -0 "$pid" 2>/dev/null || return 0
+        echo "$(date '+%H:%M:%S') stopping node$i refused (attempt $j): $out" >>"$slog"
+        sleep 10
+    done
+    return 1
+}
+
 rejoin_node() {
     local log=$cluster/restart$1-$2.log attempt deadline=$((SECONDS + 600)) before
     local vlog=$cluster/node$1/voltdbroot/log/volt.log
@@ -812,7 +847,7 @@ rejoin_node() {
 }
 
 chaos_loop() {
-    local n=0 i pid t0 rejoins
+    local n=0 i pid t0 rejoins vlog line
     while true; do
         for _ in $(seq 1 "$kill_interval"); do
             [ -e "$results/chaos.stop" ] && return 0
@@ -839,9 +874,28 @@ chaos_loop() {
         $export && [ $((n % 2)) -eq 1 ] && touch "$cluster/http.hold" && echo "$(date '+%H:%M:%S') hold $n: the HTTP target refuses rows" >>"$results/chaos.log"
         sleep 3
         rejoins=$(grep -c "Node rejoin completed" "$cluster/node$i/voltdbroot/log/volt.log" 2>/dev/null)
-        kill -9 "$pid"
-        t0=$(date +%s)
-        echo "$(date '+%H:%M:%S') kill $n: node$i (pid $pid)" >>"$results/chaos.log"
+        # with --graceful, every other failure (the second, fourth, ...) is a graceful stop (voltadmin stop: VoltDB
+        # moves the node's partition leaders away first, @PrepareStopNode and @StopNode; milestone 48)
+        if $graceful && [ $((n % 2)) -eq 0 ]; then
+            t0=$(date +%s)
+            if ! stop_node "$i" "$results/chaos.log"; then
+                rm -f "$results/ddl.hold" "$cluster/http.hold"
+                echo "$(date '+%H:%M:%S') stop $n: node$i did not stop" >>"$results/chaos.log"
+                return 1
+            fi
+            echo "$(date '+%H:%M:%S') stop $n: node$i (pid $pid), voltadmin stop" >>"$results/chaos.log"
+            # once a stopped node has shut down ("The database node has been shutdown"), it sometimes sees the
+            # survivors hang up on it before its JVM exits, and partition detection logs FATAL ("fewer than half of
+            # the previous servers", ENG-30704): seen in 5 of 6 stops of two loaded coverage runs, never in 20 stops of
+            # an idle cluster. Those lines, after its shutdown, are about a node that left on purpose, and are not counted
+            vlog=$cluster/node$i/voltdbroot/log/volt.log
+            line=$(grep -n "The database node has been shutdown" "$vlog" 2>/dev/null | tail -1 | cut -d: -f1)
+            [ -n "$line" ] && echo "node$i $line $(wc -l <"$vlog")" >>"$results/chaos.excluded"
+        else
+            kill -9 "$pid"
+            t0=$(date +%s)
+            echo "$(date '+%H:%M:%S') kill $n: node$i (pid $pid)" >>"$results/chaos.log"
+        fi
         while port_in_use "$(client_port $i)"; do sleep 1; done
         # the survivors must notice the failure before the node comes back
         sleep 5
@@ -855,7 +909,7 @@ chaos_loop() {
             sleep 1
         done
         rm -f "$results/ddl.hold"
-        echo "$(date '+%H:%M:%S') rejoin $n: node$i, $(($(date +%s) - t0)) s after the kill" >>"$results/chaos.log"
+        echo "$(date '+%H:%M:%S') rejoin $n: node$i, $(($(date +%s) - t0)) s after it went down" >>"$results/chaos.log"
         if [ -e "$cluster/http.hold" ]; then
             sleep 20
             rm -f "$cluster/http.hold"
@@ -878,7 +932,7 @@ fi
 # rejoin_node. Each event is a line of crash.log; a recovery that does not complete ends the loop and fails the run. The
 # loop stops when $results/crash.stop exists, after the recovery it is waiting for, so the run ends with every node up.
 crash_loop() {
-    local n=0 i pid t0 up deadline log vlog pids attempts befores
+    local n=0 i pid t0 up deadline log vlog pids attempts befores out
     while true; do
         for _ in $(seq 1 "$crash_interval"); do
             [ -e "$results/crash.stop" ] && return 0
@@ -894,9 +948,29 @@ crash_loop() {
             fi
             pids+=("$pid")
         done
-        kill -9 "${pids[@]}"
-        t0=$(date +%s)
-        echo "$(date '+%H:%M:%S') crash $n: every node killed (pids ${pids[*]})" >>"$results/crash.log"
+        # with --graceful, every other crash (the second, fourth, ...) is "voltadmin shutdown --save": VoltDB pauses,
+        # drains, takes a final snapshot and stops every node, and the restart recovers from that snapshot
+        # (@Shutdown's save, the shutdown snapshot's restore; milestone 48); if it fails, the nodes are killed after all
+        if $graceful && [ $((n % 2)) -eq 0 ]; then
+            t0=$(date +%s)
+            out=$(within 300 "$voltdb_home/bin/voltadmin" shutdown --save -H "localhost:$(admin_port 0)" ${admin_creds[@]+"${admin_creds[@]}"} \
+                ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} 2>&1 | grep -v '^ *$' | tail -1)
+            for _ in $(seq 1 120); do
+                up=0
+                for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && up=$((up + 1)); done
+                [ "$up" -eq 0 ] && break
+                sleep 1
+            done
+            if [ "$up" -ne 0 ]; then
+                echo "$(date '+%H:%M:%S') shutdown $n: voltadmin shutdown --save left $up nodes running: $out" >>"$results/crash.log"
+                return 1
+            fi
+            echo "$(date '+%H:%M:%S') crash $n: every node shut down, voltadmin shutdown --save" >>"$results/crash.log"
+        else
+            kill -9 "${pids[@]}"
+            t0=$(date +%s)
+            echo "$(date '+%H:%M:%S') crash $n: every node killed (pids ${pids[*]})" >>"$results/crash.log"
+        fi
         for ((i = 0; i < nodes; i++)); do
             while port_in_use "$(client_port $i)"; do sleep 1; done
         done
@@ -1200,10 +1274,11 @@ rejoins=0
 if [ -n "$chaos_pid" ]; then
     touch "$results/chaos.stop"
     wait "$chaos_pid" || chaos_failed=true
-    kills=$(grep -c " kill " "$results/chaos.log")
+    kills=$(grep -c " kill [0-9]*: node[0-9]* (pid" "$results/chaos.log")
+    stops=$(grep -c " stop [0-9]*: node[0-9]* (pid" "$results/chaos.log")
     rejoins=$(grep -c " rejoin [0-9]*: node[0-9]*, " "$results/chaos.log")
     rm -f "$cluster/http.hold"
-    log "Node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", the last one FAILED")"
+    log "Node failures: $kills kills, ${stops:-0} graceful stops, $rejoins rejoins$($chaos_failed && echo ", the last one FAILED")"
 fi
 upgrade_failed=false
 upgraded=0
@@ -1222,8 +1297,9 @@ if [ -n "$crash_pid" ]; then
     touch "$results/crash.stop"
     wait "$crash_pid" || crash_failed=true
     crashes=$(grep -c " crash [0-9]*: every node killed" "$results/crash.log")
+    shutdowns=$(grep -c " crash [0-9]*: every node shut down" "$results/crash.log")
     recoveries=$(grep -c " recover [0-9]*: every node up" "$results/crash.log")
-    log "Crashes: $crashes, recoveries: $recoveries$($crash_failed && echo ", the last one FAILED")"
+    log "Crashes: $crashes, shutdowns with --save: ${shutdowns:-0}, recoveries: $recoveries$($crash_failed && echo ", the last one FAILED")"
 fi
 resize_failed=false
 if [ -n "$resize_pid" ]; then
@@ -1407,7 +1483,8 @@ done
 for f in "$results"/sqlancer/logs/voltdb/reduce/*.log; do
     [ -s "$f" ] && cp "$f" "$results/reproductions/"
 done
-# FATAL lines in the server logs, but for those of restarts that could not bind a port (chaos.excluded)
+# FATAL lines in the server logs, but for those of restarts that could not bind a port and those a gracefully stopped
+# node logged after its shutdown (chaos.excluded)
 fatal=0
 for ((i = 0; i < nodes; i++)); do
     n=$(awk -v node="node$i" -v excluded="$results/chaos.excluded" '
@@ -1457,8 +1534,8 @@ result=PASS
     grep -m1 "^LOGIN checks:" "$results/sqlancer/out.log" 2>/dev/null
     $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP $http_mode by $http_method$([ "${bad_signatures:-0}" -eq 0 ] || echo ", $bad_signatures BAD SIGNATURES"), ${jdbc_rows:-0} through JDBC, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)"); gap fills: ${gap_fills:-0} (HTTP held across ${gap_holds:-0} kills)"
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
-    [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
-    [ "$crash_interval" -gt 0 ] && echo "crashes: $crashes crashes, $recoveries recoveries$($crash_failed && echo ", a recovery FAILED (crash.log)")"
+    [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, ${stops:-0} graceful stops, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
+    [ "$crash_interval" -gt 0 ] && echo "crashes: $crashes crashes, ${shutdowns:-0} shutdowns with --save, $recoveries recoveries$($crash_failed && echo ", a recovery FAILED (crash.log)")"
     [ -n "$upgrade_from" ] && echo "upgrade: $upgraded of $nodes nodes upgraded$($upgrade_failed && echo ", FAILED (upgrade.log)")"
     $xdcr && echo "XDCR conflicts logged: $conflicts$([ "$conflicts" -eq 0 ] || echo " (xdcr_conflicts/)")"
     $xdcr && echo "databases XDCR compared after convergence: $(grep -c "^XDCR converged:" "$results/sqlancer/out.log" 2>/dev/null || true)"

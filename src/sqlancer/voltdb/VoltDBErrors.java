@@ -56,7 +56,10 @@ public final class VoltDBErrors {
             // notice, but until it is gone (5 s in lab build #56's upgrade run, on 16.0.0) it still verifies each new
             // one, and fails any that names an object made since: "@VerifyCatalogAndWriteJar from host 2: ...
             // Unable to find reference for catalog item" (ENG-30696)
-            "Unable to find reference for catalog item" };
+            "Unable to find reference for catalog item",
+            // voltadmin shutdown --save (milestone 48) pauses the cluster, which refuses writes, and then refuses every
+            // call while it takes the shutdown snapshot and stops
+            "Server is paused", "Server is shutting down" };
 
     private VoltDBErrors() {
     }
