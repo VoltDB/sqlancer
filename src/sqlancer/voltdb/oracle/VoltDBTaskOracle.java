@@ -137,6 +137,13 @@ public class VoltDBTaskOracle implements TestOracle<VoltDBGlobalState> {
             Thread.sleep(1500);
             long later = count("XKS_" + db, task);
             String status = status(task);
+            // ENG-30705: when the node that ran a task fails after ON ERROR STOP stopped it, the node that takes over
+            // starts it again (RUNNING) and runs the procedure once more, which fails again; while avoiding known bugs,
+            // where nodes fail, the state is not checked (the row counts still are)
+            VoltDBOptions o = state.getDbmsSpecificOptions();
+            if (o.avoidKnownBugs && (o.nodeFailures || o.resizes || o.crashes || o.upgrades)) {
+                status = null;
+            }
             if (rows > 1 || later != rows || status != null && !"ERROR".equals(status)) {
                 throw new AssertionError("task " + task + " ON ERROR STOP, whose procedure fails from its second run "
                         + "on, should stop: " + rows + " rows after 3 s, " + later + " after 4.5 s, @Statistics TASK "
