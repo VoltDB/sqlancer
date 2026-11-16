@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 48.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 49.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -64,6 +64,7 @@ Since milestone 47 the HTTP target sends form pairs by POST, PUT or GET, signed 
 [HTTP target modes](#http-target-modes-milestone-47).
 Since milestone 48 every other node failure is a graceful `voltadmin stop`, and every other crash a `voltadmin shutdown
 --save`; see [Graceful stops and shutdowns](#graceful-stops-and-shutdowns-milestone-48).
+Since milestone 49 `--xdcr` runs can kill nodes too; see [XDCR with node failures](#xdcr-with-node-failures-milestone-49).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -349,6 +350,22 @@ The script passes the provider `--xdcr` with the second cluster's client ports, 
    and VoltDB flushes them every second by default, so the wait starts 1.5 s in; read at once, it missed the last
    rows and the stream paused (lab build #46). A wait that runs out says so on standard error. With
    `--avoid-known-bugs false` it does not wait.
+
+### XDCR with node failures (milestone 49)
+
+Milestone 44's coverage run found the consumer side of XDCR's multi-partition replication barely run
+(`DRConsumerMpCoordinatorImpl` 216 of 880 lines, its failover, `becomeLeader`, not at all): no XDCR run killed a node.
+`--xdcr` now combines with `--kill-interval` (and `--graceful`): the first cluster's nodes are killed or stopped and
+rejoined as in any kill run, while the second cluster stays up. Each database writes through either cluster, so the
+provider handles node failures on both connections, and the XDCR oracle allows 180 s, not 60, for the clusters to
+converge, as a rejoined node's partitions catch up on DR only once it has rejoined. The nightly job's XDCR run is
+`3:1:x300:4` (a node of the first cluster every 300 s).
+
+In a 10-minute local run (3 + 3 nodes, k=1, a failure every 90 s, NoREC, TLP WHERE, VIEWS, XDCR and XCONFLICT): 3
+kills, 2 graceful stops, 5 rejoins, 12 databases converged, 215 XCONFLICT checks, no conflict logged. In run-coverage.sh's
+10-minute XDCR run, now with kills (4 kills, 3 stops): DR and XDCR 57.6% of their lines (from 52.6%),
+`DRConsumerMpCoordinatorImpl` 379 of 880 (from 216), `ConsumerDRGatewayImpl` 497 of 856 (from 400), `DRConsumerDispatcher`
+551 of 849 (from 413), `DRNormalPartitionBufferReceiver` 460 of 863 (from 388).
 
 ### The XDCR oracle
 
