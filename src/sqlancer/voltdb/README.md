@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 47.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 48.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -62,6 +62,8 @@ Since milestone 46 the LOGIN oracle adds, changes and removes users while the da
 in; see [The LOGIN oracle](#the-login-oracle).
 Since milestone 47 the HTTP target sends form pairs by POST, PUT or GET, signed or not, or CSV batches; see
 [HTTP target modes](#http-target-modes-milestone-47).
+Since milestone 48 every other node failure is a graceful `voltadmin stop`, and every other crash a `voltadmin shutdown
+--save`; see [Graceful stops and shutdowns](#graceful-stops-and-shutdowns-milestone-48).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -285,6 +287,28 @@ The script passes the provider `--crashes true`. A crash fails every call in fli
 flight may or may not have it after the recovery, so it is marked diverged and DIFF and DURABLE skip it; a query in
 flight changes nothing, so its database is not. New connections are retried for up to 11 minutes while the cluster
 is down. The JDBC driver reconnects the open ones (`topologychangeaware`) once the nodes are back.
+
+### Graceful stops and shutdowns (milestone 48)
+
+Every failure above is a `kill -9`, so milestone 44's coverage run found the graceful ways down never run: `voltadmin
+stop` (`@PrepareStopNode`, `@StopNode`, which move a node's partition leaders away before it goes), `voltadmin shutdown
+--save` (`@Shutdown` with a final snapshot) and the restart that recovers from that snapshot. With `--graceful true`
+(the default), every other node failure of `--kill-interval` (the second, fourth, ...) is a `voltadmin stop` through
+another node, retried while VoltDB refuses it (it does for a few seconds after a rejoin), and the node is rejoined as
+after a kill; and every other crash of `--crash-interval` is a `voltadmin shutdown --save` (bounded at 300 s), after
+which every node is restarted with the same command and recovers from the shutdown snapshot and the command log. The
+logs have `stop N` and `crash N: every node shut down` lines, and the summary counts graceful stops and shutdowns apart
+from kills and crashes. While the cluster shuts down, calls fail with "Server is paused" or "Server is shutting down",
+which the provider treats as a node failure's. `--graceful false` keeps every failure a kill.
+
+A stopped node sometimes sees the survivors hang up on it after it has shut down and before its JVM exits, and
+partition detection then logs FATAL ("fewer than half of the previous servers", ENG-30704, Minor): in 5 of 6 stops of
+two loaded coverage runs, never in 20 stops of an idle cluster. The FATAL lines a stopped node logs after its "The
+database node has been shutdown" line are not counted (`chaos.excluded`).
+
+In run-coverage.sh's 10-minute kill run (4 kills, 3 graceful stops, 7 rejoins) and crash run (2 crashes, 1 shutdown
+with `--save`, 3 recoveries), against milestone 44's: `InvocationDispatcher` 357 of 1,028 lines (from 284; `@StopNode`
+13 of 18, `@PrepareStopNode` 19 of 24, the shutdown snapshot 33 of 54), `ClientInterface` 528 of 824 (from 493).
 
 ### The DURABLE oracle
 
@@ -1914,13 +1938,14 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
 
-The bugs below were found in milestones 43, 46 and 47.
+The bugs below were found in milestones 43, 46, 47 and 48.
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30694 | An HTTP export target in batch mode whose endpoint has no query string fails every batch after sending it (`getQuery().contains(...)` on null, a NullPointerException), sends it again on every retry, and the stream exports nothing more. Found by milestone 47's batch mode; `repros/ENG-30694.sh`. A hang, Blocker for V16.1.0. | While `--avoid-known-bugs` is true, the batch endpoint has a query string (`?sqlancer=1`). |
 | ENG-30695 | A user whose masked password (`plaintext: false`) is given in lowercase hex is refused with every password, with no warning: the catalog keeps the digest as given and logins compare it with the client's in uppercase. Found by LOGIN (milestone 46); `repros/ENG-30695.sh`. Major. | While `--avoid-known-bugs` is true, LOGIN masks passwords in uppercase. |
 | ENG-30696 | DDL fails with "Unable to find reference for catalog item" while `voltadmin stop` takes a node out: the stopping node verifies catalog updates it no longer applies. Lab build #56's upgrade run, on 16.0.0; not reproduced locally. Major. | The error counts as a node failure (VoltDBErrors). |
+| ENG-30704 | A node stopped with `voltadmin stop` sometimes logs FATAL partition detection ("fewer than half of the previous servers") after it has shut down, as the survivors hang up on it before its JVM exits. Milestone 48's graceful stops, under load only; no reliable reproduction. Minor. | FATAL lines a stopped node logs after its shutdown are not counted (`chaos.excluded`). |
 
 The bugs below were found in lab build #53 and in milestone 41.
 
