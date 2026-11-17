@@ -1399,11 +1399,16 @@ DDL; the calls and their rows are on this cluster only. At exit JAVAPROC prints 
 the failures checked, the calls a node failure interrupted, the classes replaced and the class changes refused; the
 summary has the line. Without `--procedure-classpath`, or on a JRE without a compiler, it skips every check.
 
+A user change by `@SetYamlConfiguration` that races an `@UpdateClasses` reaches the deployment but not the catalog, so
+a removed user still logs in (ENG-30710). While avoiding known bugs, JAVAPROC's `@UpdateClasses` calls hold the lock
+that LOGIN's and CONFIG's checks hold, so classes change only between them.
+
 In local 90- to 300-second trials (JAVAPROC alone on 1 node; with TASK and STATS on 3 nodes with a kill every 60 s;
 beside XDCR; beside DIFF with a 16.0.0 mirror) every check passed: 48 to 78 checks and 191 to 309 calls per trial, the
 mirror and the XDCR peer creating the same procedures. In lab build #64's 30-minute kill run: 213 checks, 833 calls
 (362 single-partition, 240 multi-partition, 231 compound), 346 failures checked, 38 classes replaced, 137 class changes
-refused. In run-coverage.sh's 10-minute kill run, against the best of milestones 44 to 49: `CompoundProcedureRunner`
+refused; in its upgrade run, from 16.0.0 in service: 243 checks, 970 calls. Its security run found ENG-30710 (LOGIN's
+removed users logging in), which JAVAPROC now avoids. In run-coverage.sh's 10-minute kill run, against the best of milestones 44 to 49: `CompoundProcedureRunner`
 143 of 183 lines (from 0), `VoltCompoundProcedure` 31 of 35 (from 0), `ProcedureCompiler` 296 of 477 (from 108),
 `UpdateApplicationBase` 249 of 378 (from 193), `NTProcedureService` 187 of 236 (from 137), `ClassMatcher` 32 of 84
 (from 7), `CreateProcedureFromClass` 27 of 39 (from 5), `UpdateClassesAcceptancePolicy` 16 of 23 (from 2),
@@ -2028,6 +2033,7 @@ The bugs below were found in milestones 43, 46, 47 and 48.
 | ENG-30704 | A node stopped with `voltadmin stop` sometimes logs FATAL partition detection ("fewer than half of the previous servers") after it has shut down, as the survivors hang up on it before its JVM exits. Milestone 48's graceful stops, under load only; no reliable reproduction. Minor. | FATAL lines a stopped node logs after its shutdown are not counted (`chaos.excluded`). |
 | ENG-30705 | A task that `ON ERROR STOP` has stopped runs again after the node that ran it fails: the node that takes over starts its scheduler again (RUNNING) and runs the procedure once more. Found by TASK in lab build #61's kill run; `repros/ENG-30705.sh`; 16.0.0 too. Major. | While `--avoid-known-bugs` is true and nodes fail, TASK does not check the state of a task stopped by an error (the row counts still are). |
 | ENG-30708 | During an elastic join, the join's own index snapshot failed on some partitions ("Elastic streaming was invoked without proper activation", "Table streamer has no streams to serialize more"), and the join stayed at "Building index for data migration"; the next command-log truncation snapshot was refused by the engine ("COW context activation is not allowed while elastic indexing is in progress") and every original node crashed ("Failed to activate snapshot stream"), losing the cluster. Found by run-coverage.sh's resize run (milestone 50), once in two runs of the same seed; not reduced: snapshot saves, truncation snapshots and table swaps during a join did not reproduce it alone. Blocker. | None: a resize run can fail with FATAL lines. |
+| ENG-30710 | A user removed by `@SetYamlConfiguration` (`.users[name]=null`) still logs in when an `@UpdateClasses` runs at the same time: `@GetYamlConfiguration` no longer lists the user, but the update applies with the catalog unchanged (`securityChange=false`), so authentication keeps the user until the next catalog change. 16.0.0 too. Found by LOGIN beside JAVAPROC (milestone 50) in lab build #64's security run; `repros/ENG-30710.sh` (with `repros/users/RemovedUserRepro.java`) reproduces it at the first user. Critical. | While `--avoid-known-bugs` is true, JAVAPROC's `@UpdateClasses` calls hold the lock LOGIN and CONFIG share. |
 
 The bugs below were found in lab build #53 and in milestone 41.
 

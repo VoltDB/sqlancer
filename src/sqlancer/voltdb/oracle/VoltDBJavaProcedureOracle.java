@@ -485,7 +485,17 @@ public class VoltDBJavaProcedureOracle implements TestOracle<VoltDBGlobalState> 
     private String updateClasses(byte[] jar, String deletes, boolean mustSucceed) throws SQLException {
         lastQuery = "@UpdateClasses(" + (jar == null ? "null" : "a jar of " + jar.length + " bytes") + ", " + deletes
                 + ")";
-        String why = updateClasses(connection(), jar, deletes);
+        String why;
+        // ENG-30710: a user change by @SetYamlConfiguration that races @UpdateClasses reaches the deployment but not
+        // the catalog, so a removed user still logs in; while avoiding known bugs, classes change only between
+        // LOGIN's and CONFIG's checks, under their lock
+        if (state.getDbmsSpecificOptions().avoidKnownBugs) {
+            synchronized (VoltDBConfigOracle.LOCK) {
+                why = updateClasses(connection(), jar, deletes);
+            }
+        } else {
+            why = updateClasses(connection(), jar, deletes);
+        }
         if (why != null) {
             if (mustSucceed) {
                 throw new AssertionError(lastQuery + " should succeed; it failed: " + why);
