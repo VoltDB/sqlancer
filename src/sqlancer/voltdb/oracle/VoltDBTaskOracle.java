@@ -7,6 +7,8 @@ import java.sql.Statement;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import sqlancer.IgnoreMeException;
 import sqlancer.Randomly;
@@ -40,6 +42,9 @@ public class VoltDBTaskOracle implements TestOracle<VoltDBGlobalState> {
     private static final AtomicLong CHECKS = new AtomicLong();
     private static final AtomicLong STOPS = new AtomicLong();
     private static final Set<String> CREATED = ConcurrentHashMap.newKeySet();
+    // ENG-30711: @UpdateClasses restarts a task that ON ERROR STOP stopped, which runs its procedure again; while
+    // avoiding known bugs, TASK's checks hold this shared and JAVAPROC's @UpdateClasses calls exclusive
+    static final ReentrantReadWriteLock CLASSES = new ReentrantReadWriteLock(true);
 
     static {
         Runtime.getRuntime().addShutdownHook(new Thread(
@@ -55,6 +60,20 @@ public class VoltDBTaskOracle implements TestOracle<VoltDBGlobalState> {
 
     @Override
     public void check() throws Exception {
+        Lock classes = state.getDbmsSpecificOptions().avoidKnownBugs ? CLASSES.readLock() : null;
+        if (classes != null) {
+            classes.lock();
+        }
+        try {
+            checkWithoutClassChanges();
+        } finally {
+            if (classes != null) {
+                classes.unlock();
+            }
+        }
+    }
+
+    private void checkWithoutClassChanges() throws Exception {
         String db = state.getDatabaseName().toUpperCase();
         String table = "XK_" + db;
         create(table, db);

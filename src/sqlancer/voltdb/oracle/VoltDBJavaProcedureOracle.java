@@ -490,8 +490,14 @@ public class VoltDBJavaProcedureOracle implements TestOracle<VoltDBGlobalState> 
         // the catalog, so a removed user still logs in; while avoiding known bugs, classes change only between
         // LOGIN's and CONFIG's checks, under their lock
         if (state.getDbmsSpecificOptions().avoidKnownBugs) {
+            // ENG-30711: and not during a TASK check, as a classes change restarts tasks ON ERROR STOP stopped
             synchronized (VoltDBConfigOracle.LOCK) {
-                why = updateClasses(connection(), jar, deletes);
+                VoltDBTaskOracle.CLASSES.writeLock().lock();
+                try {
+                    why = updateClasses(connection(), jar, deletes);
+                } finally {
+                    VoltDBTaskOracle.CLASSES.writeLock().unlock();
+                }
             }
         } else {
             why = updateClasses(connection(), jar, deletes);
