@@ -86,7 +86,7 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--procedure-classpath", description = "The VoltDB jars (colon-separated) that Java stored procedures compile against (run-sqlancer.sh passes the kit's): the JAVAPROC oracle compiles its procedure classes with them; without it, JAVAPROC does nothing")
     public String procedureClasspath;
 
-    @Parameter(names = "--servers",description = "Comma-separated host:port client addresses of every node; SQLancer connects to all of them, so it keeps working while any one node is down (used instead of --host and --port)")
+    @Parameter(names = "--servers", description = "Comma-separated host:port client addresses of every node; SQLancer connects to all of them, so it keeps working while any one node is down (used instead of --host and --port)")
     public String servers;
 
     @Override

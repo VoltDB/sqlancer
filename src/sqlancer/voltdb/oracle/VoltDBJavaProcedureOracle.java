@@ -19,7 +19,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
-
 import javax.tools.DiagnosticCollector;
 import javax.tools.FileObject;
 import javax.tools.ForwardingJavaFileManager;
@@ -45,12 +44,12 @@ import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 /**
  * Java stored procedures (milestone 50). Every procedure the other oracles make is one SQL statement in DDL, so
  * milestone 49's coverage found the rest of VoltDB's procedure support unexercised: compound procedures
- * ({@code CompoundProcedureRunner}, none of it), {@code @UpdateClasses} and its checks, the procedure compiler's
- * class paths, and the multi-batch, abort and expectation paths of {@code ProcedureRunnerImpl}.
+ * ({@code CompoundProcedureRunner}, none of it), {@code @UpdateClasses} and its checks, the procedure compiler's class
+ * paths, and the multi-batch, abort and expectation paths of {@code ProcedureRunnerImpl}.
  * <p>
- * Each check writes the Java source of four classes over {@code XJ_<db>} (partitioned on k), compiles them
- * in SQLancer's JVM against the kit's jars (--procedure-classpath), loads them with {@code @UpdateClasses} and creates
- * the procedures {@code FROM CLASS}:
+ * Each check writes the Java source of four classes over {@code XJ_<db>} (partitioned on k), compiles them in
+ * SQLancer's JVM against the kit's jars (--procedure-classpath), loads them with {@code @UpdateClasses} and creates the
+ * procedures {@code FROM CLASS}:
  * <ul>
  * <li>single-partition (JPS): inserts n rows for its key in batches, reads them back, and returns its class's version,
  * the count and the sum; or, by its mode, then aborts ({@code VoltAbortException}), throws, fails an expectation
@@ -58,20 +57,20 @@ import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
  * <li>multi-partition (JPM): the same over several keys, so across partitions;</li>
  * <li>compound (JPC, {@code CREATE COMPOUND PROCEDURE}): calls JPS for several keys in its first stage, and in its
  * second completes (with a number or a table), aborts, throws, never completes, queues calls it completes before
- * sending, or sets the response's app status; or calls itself (refused), queues more calls than a stage may, or sets
- * up no stages;</li>
+ * sending, or sets the response's app status; or calls itself (refused), queues more calls than a stage may, or sets up
+ * no stages;</li>
  * </ul>
- * and a non-transactional procedure class (JPN), which VoltDB creates procedures from only in its own tests.
- * Every key a call writes is new, so the rows a call leaves are known: all of them when it succeeds, none when it
- * fails. A compound procedure is not one transaction: the rows of each JPS call it made that succeeded stay, whatever
- * it returns. When a node failure interrupts a call (with --node-failures and the like) the call may or may not have
+ * and a non-transactional procedure class (JPN), which VoltDB creates procedures from only in its own tests. Every key
+ * a call writes is new, so the rows a call leaves are known: all of them when it succeeds, none when it fails. A
+ * compound procedure is not one transaction: the rows of each JPS call it made that succeeded stay, whatever it
+ * returns. When a node failure interrupts a call (with --node-failures and the like) the call may or may not have
  * committed, but it must have committed whole: all its rows, on every partition, or none.
  * <p>
  * Then one of: the classes replaced by a new version, which the next call must run; the class of a procedure in use
  * removed, which must be refused; a class whose static initializer throws loaded, which must be refused; a procedure
  * created from a class of the wrong kind (CREATE PROCEDURE from JPN or JPC, CREATE COMPOUND PROCEDURE from JPS), or
- * with a partition parameter it does not have, which must be refused. In the end the procedures are dropped
- * and the classes removed, and {@code @SystemCatalog CLASSES} must no longer list them.
+ * with a partition parameter it does not have, which must be refused. In the end the procedures are dropped and the
+ * classes removed, and {@code @SystemCatalog CLASSES} must no longer list them.
  * <p>
  * The classes are also loaded into the mirror (--mirror) and the XDCR peer (--xdcr), where the DDL is repeated; the
  * calls and their rows are on this cluster only, and XJ tables are no database's.
@@ -170,37 +169,38 @@ public class VoltDBJavaProcedureOracle implements TestOracle<VoltDBGlobalState> 
                 updateClasses(jar(compile(sources(table, n, next, batch))), null, true);
                 version = next;
                 REPLACED.incrementAndGet();
-                sp(table, n, version, Mode.OK);
+                singlePartition(table, n, version, Mode.OK);
                 break;
             case REMOVE_IN_USE:
                 String why = updateClasses(null, PACKAGE + "." + n.sp, false);
                 mustBeRefused(why, "removing the class of " + n.sp + ", a procedure in use");
-                sp(table, n, version, Mode.OK);
+                singlePartition(table, n, version, Mode.OK);
                 break;
             case BAD_CLASS:
                 Map<String, String> bad = new LinkedHashMap<>();
-                bad.put(n.bad, "package " + PACKAGE + ";\npublic class " + n.bad + " extends org.voltdb.VoltProcedure {\n"
-                        + "    static { if (true) { throw new IllegalStateException(\"JAVAPROC: no\"); } }\n"
-                        + "    public long run() { return 1; }\n}\n");
+                bad.put(n.bad,
+                        "package " + PACKAGE + ";\npublic class " + n.bad + " extends org.voltdb.VoltProcedure {\n"
+                                + "    static { if (true) { throw new IllegalStateException(\"JAVAPROC: no\"); } }\n"
+                                + "    public long run() { return 1; }\n}\n");
                 why = updateClasses(jar(compile(bad)), null, false);
                 mustBeRefused(why, "loading " + n.bad + ", whose static initializer throws");
                 if (!failures && listed(n).contains(n.bad.toUpperCase())) {
                     throw new AssertionError("@SystemCatalog CLASSES lists " + n.bad + ", whose loading was refused");
                 }
-                sp(table, n, version, Mode.OK);
+                singlePartition(table, n, version, Mode.OK);
                 break;
             case BAD_BASE:
                 String[] wrong = Randomly.fromOptions(
-                        new String[] { "CREATE PROCEDURE", n.nt, "a non-transactional procedure class (VoltDB's own "
-                                + "only)" },
+                        new String[] { "CREATE PROCEDURE", n.nt,
+                                "a non-transactional procedure class (VoltDB's own " + "only)" },
                         new String[] { "CREATE PROCEDURE", n.cp, "a compound procedure class" },
                         new String[] { "CREATE COMPOUND PROCEDURE", n.sp, "a plain procedure class" });
                 why = tryDdl(wrong[0] + " " + n.sp + "X FROM CLASS " + PACKAGE + "." + wrong[1]);
                 mustBeRefused(why, wrong[0] + " from " + wrong[2]);
                 break;
             case BAD_PARTITION:
-                why = tryDdl("CREATE PROCEDURE " + n.sp + "X PARTITION ON TABLE " + table + " COLUMN k PARAMETER 7 FROM "
-                        + "CLASS " + PACKAGE + "." + n.sp);
+                why = tryDdl("CREATE PROCEDURE " + n.sp + "X PARTITION ON TABLE " + table
+                        + " COLUMN k PARAMETER 7 FROM " + "CLASS " + PACKAGE + "." + n.sp);
                 mustBeRefused(why, "a procedure partitioned on a parameter its class does not have");
                 break;
             default:
@@ -225,10 +225,10 @@ public class VoltDBJavaProcedureOracle implements TestOracle<VoltDBGlobalState> 
     private void randomCall(String table, Names n, long version) throws SQLException {
         switch ((int) Randomly.getNotCachedInteger(0, 3)) {
         case 0:
-            sp(table, n, version, mode());
+            singlePartition(table, n, version, mode());
             break;
         case 1:
-            mp(table, n, version, mode());
+            multiPartition(table, n, version, mode());
             break;
         default:
             compound(table, n, Randomly.fromOptions(Compound.values()));
@@ -242,7 +242,7 @@ public class VoltDBJavaProcedureOracle implements TestOracle<VoltDBGlobalState> 
     }
 
     // JPS(k, rows, mode)
-    private void sp(String table, Names n, long version, Mode mode) throws SQLException {
+    private void singlePartition(String table, Names n, long version, Mode mode) throws SQLException {
         long k = nextKey++;
         int rows = 1 + (int) Randomly.getNotCachedInteger(0, 20);
         Outcome r = call(n.sp, k, rows, mode.ordinal());
@@ -251,7 +251,7 @@ public class VoltDBJavaProcedureOracle implements TestOracle<VoltDBGlobalState> 
     }
 
     // JPM(k0, keys, rows, mode): rows for each of keys keys from k0
-    private void mp(String table, Names n, long version, Mode mode) throws SQLException {
+    private void multiPartition(String table, Names n, long version, Mode mode) throws SQLException {
         long k0 = nextKey;
         int keys = 2 + (int) Randomly.getNotCachedInteger(0, 6);
         nextKey += keys;
@@ -314,7 +314,8 @@ public class VoltDBJavaProcedureOracle implements TestOracle<VoltDBGlobalState> 
         int calls = 1 + (int) Randomly.getNotCachedInteger(0, 4);
         nextKey += 10;
         // the last JPS call fails, by its own mode, in a third of the calls
-        Mode last = Randomly.fromOptions(Mode.OK, Mode.OK, Randomly.fromOptions(Mode.ABORT, Mode.THROW, Mode.CONSTRAINT));
+        Mode last = Randomly.fromOptions(Mode.OK, Mode.OK,
+                Randomly.fromOptions(Mode.ABORT, Mode.THROW, Mode.CONSTRAINT));
         String what = "JPC " + n.cp + "(" + k0 + ", " + calls + ", " + last + ", " + mode + ")";
         Outcome r = call(n.cp, k0, calls, last.ordinal(), mode.ordinal());
         COMPOUND_CALLS.incrementAndGet();
@@ -434,8 +435,8 @@ public class VoltDBJavaProcedureOracle implements TestOracle<VoltDBGlobalState> 
         return r;
     }
 
-    private static ClientResponse response(Throwable t) {
-        for (; t != null; t = t.getCause()) {
+    private static ClientResponse response(Throwable thrown) {
+        for (Throwable t = thrown; t != null; t = t.getCause()) {
             if (t instanceof ProcCallException) {
                 return ((ProcCallException) t).getClientResponse();
             }
@@ -590,7 +591,8 @@ public class VoltDBJavaProcedureOracle implements TestOracle<VoltDBGlobalState> 
     // the four classes' sources, by simple name
     private static Map<String, String> sources(String table, Names n, long version, int batch) {
         Map<String, String> s = new LinkedHashMap<>();
-        String header = "package " + PACKAGE + ";\n\nimport org.voltdb.*;\nimport org.voltdb.client.ClientResponse;\n\n";
+        String header = "package " + PACKAGE
+                + ";\n\nimport org.voltdb.*;\nimport org.voltdb.client.ClientResponse;\n\n";
         String result = "        VoltTable t = new VoltTable(new VoltTable.ColumnInfo(\"V\", VoltType.BIGINT),\n"
                 + "                new VoltTable.ColumnInfo(\"N\", VoltType.BIGINT), new VoltTable.ColumnInfo(\"S\", VoltType.BIGINT),\n"
                 + "                new VoltTable.ColumnInfo(\"U\", VoltType.BIGINT));\n"
@@ -603,40 +605,33 @@ public class VoltDBJavaProcedureOracle implements TestOracle<VoltDBGlobalState> 
                 + "        case 3: voltQueueSQL(sel, EXPECT_EMPTY, k, k); voltExecuteSQL(true); break;\n"
                 + "        case 4: voltQueueSQL(ins, k, 0, 0L, 0L); voltExecuteSQL(true); break;\n"
                 + "        default: break;\n        }\n";
-        s.put(n.sp, header + "public class " + n.sp + " extends VoltProcedure {\n"
-                + "    public static final long V = " + version + "L;\n"
-                + "    public final SQLStmt ins = new SQLStmt(\"INSERT INTO " + table + " (k, i, v, r) VALUES (?, ?, ?, ?)\");\n"
-                + "    public final SQLStmt sel = new SQLStmt(\"SELECT COUNT(*), SUM(v) FROM " + table + " WHERE k BETWEEN ? AND ?\");\n\n"
-                + "    public VoltTable[] run(long k, int n, int mode) {\n"
+        s.put(n.sp, header + "public class " + n.sp + " extends VoltProcedure {\n" + "    public static final long V = "
+                + version + "L;\n" + "    public final SQLStmt ins = new SQLStmt(\"INSERT INTO " + table
+                + " (k, i, v, r) VALUES (?, ?, ?, ?)\");\n"
+                + "    public final SQLStmt sel = new SQLStmt(\"SELECT COUNT(*), SUM(v) FROM " + table
+                + " WHERE k BETWEEN ? AND ?\");\n\n" + "    public VoltTable[] run(long k, int n, int mode) {\n"
                 + "        java.util.Random random = getSeededRandomNumberGenerator();\n"
                 + "        for (int i = 0; i < n; i++) {\n"
                 + "            voltQueueSQL(ins, EXPECT_SCALAR_MATCH(1), k, i, k * 1000 + i, random.nextLong());\n"
                 + "            if ((i + 1) % " + batch + " == 0) {\n                voltExecuteSQL();\n            }\n"
-                + "        }\n"
-                + "        voltQueueSQL(sel, EXPECT_ONE_ROW, k, k);\n"
+                + "        }\n" + "        voltQueueSQL(sel, EXPECT_ONE_ROW, k, k);\n"
                 + "        VoltTable[] results = voltExecuteSQL(mode == 0);\n"
-                + "        VoltTable count = results[results.length - 1];\n"
-                + "        count.advanceRow();\n"
-                + modes
-                + "        setAppStatusCode((byte) (k % 100));\n"
-                + "        setAppStatusString(\"V\" + V);\n"
-                + result + "    }\n}\n");
-        s.put(n.mp, header + "public class " + n.mp + " extends VoltProcedure {\n"
-                + "    public static final long V = " + version + "L;\n"
-                + "    public final SQLStmt ins = new SQLStmt(\"INSERT INTO " + table + " (k, i, v, r) VALUES (?, ?, ?, ?)\");\n"
-                + "    public final SQLStmt sel = new SQLStmt(\"SELECT COUNT(*), SUM(v) FROM " + table + " WHERE k BETWEEN ? AND ?\");\n\n"
+                + "        VoltTable count = results[results.length - 1];\n" + "        count.advanceRow();\n" + modes
+                + "        setAppStatusCode((byte) (k % 100));\n" + "        setAppStatusString(\"V\" + V);\n" + result
+                + "    }\n}\n");
+        s.put(n.mp, header + "public class " + n.mp + " extends VoltProcedure {\n" + "    public static final long V = "
+                + version + "L;\n" + "    public final SQLStmt ins = new SQLStmt(\"INSERT INTO " + table
+                + " (k, i, v, r) VALUES (?, ?, ?, ?)\");\n"
+                + "    public final SQLStmt sel = new SQLStmt(\"SELECT COUNT(*), SUM(v) FROM " + table
+                + " WHERE k BETWEEN ? AND ?\");\n\n"
                 + "    public VoltTable[] run(long k, int keys, int n, int mode) {\n"
-                + "        for (int j = 0; j < keys; j++) {\n"
-                + "            for (int i = 0; i < n; i++) {\n"
+                + "        for (int j = 0; j < keys; j++) {\n" + "            for (int i = 0; i < n; i++) {\n"
                 + "                voltQueueSQL(ins, EXPECT_SCALAR_MATCH(1), k + j, i, (k + j) * 1000 + i, (long) (j * n + i));\n"
-                + "            }\n"
-                + "            if ((j + 1) % " + batch + " == 0) {\n                voltExecuteSQL();\n            }\n"
-                + "        }\n"
+                + "            }\n" + "            if ((j + 1) % " + batch
+                + " == 0) {\n                voltExecuteSQL();\n            }\n" + "        }\n"
                 + "        voltQueueSQL(sel, EXPECT_ONE_ROW, k, k + keys - 1);\n"
                 + "        VoltTable[] results = voltExecuteSQL(mode == 0);\n"
-                + "        VoltTable count = results[results.length - 1];\n"
-                + "        count.advanceRow();\n"
-                + modes
+                + "        VoltTable count = results[results.length - 1];\n" + "        count.advanceRow();\n" + modes
                 + result + "    }\n}\n");
         // modes: Compound's order
         s.put(n.cp, header + "public class " + n.cp + " extends VoltCompoundProcedure {\n"
@@ -644,59 +639,38 @@ public class VoltDBJavaProcedureOracle implements TestOracle<VoltDBGlobalState> 
                 + "    private long k;\n    private int calls;\n    private int last;\n    private int mode;\n\n"
                 + "    public long run(long k, int calls, int last, int mode) {\n"
                 + "        this.k = k;\n        this.calls = calls;\n        this.last = last;\n        this.mode = mode;\n"
-                + "        if (mode != 4) {\n"
-                + "            newStageList(this::first).then(this::second).build();\n"
-                + "        }\n"
-                + "        return 0L;\n"
-                + "    }\n\n"
+                + "        if (mode != 4) {\n" + "            newStageList(this::first).then(this::second).build();\n"
+                + "        }\n" + "        return 0L;\n" + "    }\n\n"
                 + "    private void first(ClientResponse[] none) {\n"
                 + "        if (mode == 6) {\n            queueProcedureCall(\"" + n.cp + "\", k, 1, 0, 0);\n        }\n"
-                + "        int c = mode == 7 ? 1000 : calls;\n"
-                + "        for (int j = 0; j < c; j++) {\n"
+                + "        int c = mode == 7 ? 1000 : calls;\n" + "        for (int j = 0; j < c; j++) {\n"
                 + "            queueProcedureCall(\"" + n.sp + "\", k + j, j + 1, j == calls - 1 ? last : 0);\n"
-                + "        }\n"
-                + "    }\n\n"
-                + "    private void second(ClientResponse[] responses) {\n"
+                + "        }\n" + "    }\n\n" + "    private void second(ClientResponse[] responses) {\n"
                 + "        long sum = 0;\n"
                 + "        VoltTable t = new VoltTable(new VoltTable.ColumnInfo(\"N\", VoltType.BIGINT),\n"
                 + "                new VoltTable.ColumnInfo(\"STATUS\", VoltType.TINYINT));\n"
                 + "        for (ClientResponse r : responses) {\n"
-                + "            if (r.getStatus() != ClientResponse.SUCCESS) {\n"
-                + "                if (mode == 0) {\n"
+                + "            if (r.getStatus() != ClientResponse.SUCCESS) {\n" + "                if (mode == 0) {\n"
                 + "                    abortProcedure(\"JAVAPROC call failed: \" + r.getStatusString());\n"
-                + "                    return;\n"
-                + "                }\n"
-                + "                t.addRow(-1L, r.getStatus());\n"
-                + "                continue;\n"
-                + "            }\n"
-                + "            VoltTable c = r.getResults()[0];\n"
-                + "            c.advanceRow();\n"
-                + "            sum += c.getLong(1);\n"
-                + "            t.addRow(c.getLong(1), r.getStatus());\n"
-                + "        }\n"
-                + "        switch (mode) {\n"
-                + "        case 0: completeProcedure(sum); return;\n"
+                + "                    return;\n" + "                }\n"
+                + "                t.addRow(-1L, r.getStatus());\n" + "                continue;\n" + "            }\n"
+                + "            VoltTable c = r.getResults()[0];\n" + "            c.advanceRow();\n"
+                + "            sum += c.getLong(1);\n" + "            t.addRow(c.getLong(1), r.getStatus());\n"
+                + "        }\n" + "        switch (mode) {\n" + "        case 0: completeProcedure(sum); return;\n"
                 + "        case 1: completeProcedure(t); return;\n"
                 + "        case 2: throw new CompoundProcAbortException(\"JAVAPROC abort \" + k);\n"
                 + "        case 3: throw new IllegalStateException(\"JAVAPROC failure \" + k);\n"
-                + "        case 5: return;\n"
-                + "        case 8:\n"
-                + "            queueProcedureCall(\"" + n.sp + "\", k + 9, 1, 0);\n"
-                + "            completeProcedure(sum);\n"
-                + "            return;\n"
-                + "        case 9:\n"
-                + "            setAppStatusCode((byte) 7);\n"
+                + "        case 5: return;\n" + "        case 8:\n" + "            queueProcedureCall(\"" + n.sp
+                + "\", k + 9, 1, 0);\n" + "            completeProcedure(sum);\n" + "            return;\n"
+                + "        case 9:\n" + "            setAppStatusCode((byte) 7);\n"
                 + "            setAppStatusString(\"V\" + V);\n"
-                + "            completeProcedure(new VoltTable[] { t });\n"
-                + "            return;\n"
-                + "        default: completeProcedure(sum);\n"
-                + "        }\n"
-                + "    }\n}\n");
-        s.put(n.nt, header + "public class " + n.nt + " extends VoltNonTransactionalProcedure {\n"
-                + "    public static final long V = " + version + "L;\n\n"
-                + "    public java.util.concurrent.CompletableFuture<ClientResponse> run(long k, int n) {\n"
-                + "        return callProcedure(\"" + n.sp + "\", k, n, 0);\n"
-                + "    }\n}\n");
+                + "            completeProcedure(new VoltTable[] { t });\n" + "            return;\n"
+                + "        default: completeProcedure(sum);\n" + "        }\n" + "    }\n}\n");
+        s.put(n.nt,
+                header + "public class " + n.nt + " extends VoltNonTransactionalProcedure {\n"
+                        + "    public static final long V = " + version + "L;\n\n"
+                        + "    public java.util.concurrent.CompletableFuture<ClientResponse> run(long k, int n) {\n"
+                        + "        return callProcedure(\"" + n.sp + "\", k, n, 0);\n" + "    }\n}\n");
         return s;
     }
 
@@ -720,8 +694,8 @@ public class VoltDBJavaProcedureOracle implements TestOracle<VoltDBGlobalState> 
                     StandardCharsets.UTF_8);
             JavaFileManager files = new ForwardingJavaFileManager<JavaFileManager>(standard) {
                 @Override
-                public JavaFileObject getJavaFileForOutput(Location location, String className, JavaFileObject.Kind kind,
-                        FileObject sibling) {
+                public JavaFileObject getJavaFileForOutput(Location location, String className,
+                        JavaFileObject.Kind kind, FileObject sibling) {
                     return new SimpleJavaFileObject(URI.create("bytes:///" + className.replace('.', '/') + ".class"),
                             kind) {
                         @Override
@@ -741,7 +715,8 @@ public class VoltDBJavaProcedureOracle implements TestOracle<VoltDBGlobalState> 
                     "--release", "17", "-proc:none", "-nowarn", "-g");
             Boolean ok = compiler.getTask(null, files, diagnostics, options, null, units).call();
             if (!Boolean.TRUE.equals(ok)) {
-                throw new AssertionError("JAVAPROC's procedure classes do not compile: " + diagnostics.getDiagnostics());
+                throw new AssertionError(
+                        "JAVAPROC's procedure classes do not compile: " + diagnostics.getDiagnostics());
             }
         }
         return out;
