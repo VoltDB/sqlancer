@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 49.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 50.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -65,6 +65,8 @@ Since milestone 47 the HTTP target sends form pairs by POST, PUT or GET, signed 
 Since milestone 48 every other node failure is a graceful `voltadmin stop`, and every other crash a `voltadmin shutdown
 --save`; see [Graceful stops and shutdowns](#graceful-stops-and-shutdowns-milestone-48).
 Since milestone 49 `--xdcr` runs can kill nodes too; see [XDCR with node failures](#xdcr-with-node-failures-milestone-49).
+Since milestone 50 the JAVAPROC oracle compiles Java stored procedures, compound ones included, loads them with
+`@UpdateClasses` and checks what they return and leave; see [The JAVAPROC oracle](#the-javaproc-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -1345,6 +1347,57 @@ and 32 user changes refused. In run-coverage.sh's 10-minute security run, agains
 `AuthFailedBecause` 14 of 14 lines (from 0), `AuthUser` 36 of 46 (from 28), `HashAuthenticationRequest` 23 of 31
 (from 19), `SetYamlConfiguration` 294 of 396 (from 173), `YamlUtils.PropertyParser` 56 of 68 (from 34); security as a
 whole 26.3% of its lines (from 23.4%). The rest is mostly LDAP and Kerberos, which need servers of their own.
+
+## The JAVAPROC oracle
+
+Milestone 50. Every procedure the other oracles create is one SQL statement in DDL, so milestone 49's coverage found
+the rest of VoltDB's procedure support never run: compound procedures (`CompoundProcedureRunner`, 0 of 180 lines),
+`@UpdateClasses` and its checks (`UpdateClassesAcceptancePolicy`, 2 of 23), the procedure compiler's class paths
+(`ProcedureCompiler`, 103 of 467), and the multi-batch, abort and expectation paths of `ProcedureRunnerImpl`.
+
+Each JAVAPROC check writes the Java source of four classes over its own table, `XJ_<db>` (partitioned on k, no
+database's), compiles them in SQLancer's JVM (`javax.tools`) against the kit's jars, which run-sqlancer.sh passes as
+`--procedure-classpath` (`lib/volt-procedure-api-*.jar`, `voltdb/voltdb-*.jar`, `voltdb/voltdbclient-*.jar`), loads them
+with `@UpdateClasses`, and creates the procedures `FROM CLASS`:
+
+- `JPS_<db>_<n>`, single-partition on k: inserts its rows for k in batches of 1 to 5 (`voltExecuteSQL()` per batch,
+  `EXPECT_SCALAR_MATCH(1)` on each insert, a column from `getSeededRandomNumberGenerator()`, which k-safe replicas must
+  agree on), reads them back (`EXPECT_ONE_ROW`), and returns its class's version, the count, the sum and
+  `getUniqueId()`, with an app status; or, by its mode, then aborts (`VoltAbortException`, USER_ABORT), throws
+  (UNEXPECTED_FAILURE), fails an expectation (`EXPECT_EMPTY`, USER_ABORT), or inserts a duplicate key
+  (GRACEFUL_FAILURE);
+- `JPM_<db>_<n>`, multi-partition: the same over 2 to 7 keys, so on several partitions in one transaction;
+- `JPC_<db>_<n>`, compound (`CREATE COMPOUND PROCEDURE`): its first stage calls JPS for 1 to 4 keys, the last one
+  failing in a third of the calls, and its second stage, by its mode, completes with the sum of the counts (or aborts
+  if a call failed), completes with a table, throws `CompoundProcAbortException` (COMPOUND_PROC_USER_ABORT) or another
+  exception (UNEXPECTED_FAILURE), returns without completing ("end of stage list reached"), queues one more call and
+  completes, so that the call is never sent, or sets the app status and completes; or the procedure sets up no stages,
+  calls itself (refused: "nested call"), or queues more calls than a stage may (10);
+- `JPN_<db>_<n>`, a non-transactional procedure class (`VoltNonTransactionalProcedure`), which VoltDB creates procedures
+  from only in its own tests.
+
+Each call writes keys no other call wrote, so the rows it must leave are known: all of them when it succeeds, none when
+it fails, its transaction rolled back whole. A compound procedure is not one transaction: the rows of each JPS call it
+made that succeeded stay, whatever the compound procedure returns, and a call queued in the stage that completed must
+leave no row. When a node failure interrupts a call (in a kill, crash, resize or upgrade run), it may or may not have
+committed, but it must have committed whole: all its rows, on every partition, or none; JAVAPROC checks that, then
+skips the rest of the check.
+
+Then one of:
+
+1. the classes replaced by a new version (`@UpdateClasses` again), which the next call must run;
+2. the class of a procedure in use removed, which must be refused ("cannot be removed, it is being used by procedure");
+3. a class whose static initializer throws loaded, which must be refused, and not listed by `@SystemCatalog CLASSES`;
+4. a procedure created from a class of the wrong kind, which must be refused: `CREATE PROCEDURE` from JPN or JPC, or
+   `CREATE COMPOUND PROCEDURE` from JPS;
+5. a procedure partitioned on a parameter its class does not have, which must be refused;
+6. nothing.
+
+In the end the procedures are dropped and the classes removed, and `@SystemCatalog CLASSES` must no longer list them.
+`@UpdateClasses` also loads and removes the classes on the mirror and the XDCR peer, where the provider repeats the
+DDL; the calls and their rows are on this cluster only. At exit JAVAPROC prints its checks, the calls checked by kind,
+the failures checked, the calls a node failure interrupted, the classes replaced and the class changes refused; the
+summary has the line. Without `--procedure-classpath`, or on a JRE without a compiler, it skips every check.
 
 ## The STREAMS oracle
 

@@ -357,6 +357,10 @@ user_snapshot_retry=${SQLANCER_USER_SNAPSHOT_RETRY-1}
 provider_args+=(--snapshot-path "$cluster")
 # XCONFLICT reads XDCR's conflict log under the nodes' voltdbroots here
 provider_args+=(--cluster-dir "$cluster")
+# JAVAPROC (milestone 50) compiles its procedure classes against the kit's procedure API, server and client jars
+procedure_classpath=$(ls "$voltdb_home"/lib/volt-procedure-api-*.jar "$voltdb_home"/voltdb/voltdb-*.jar \
+    "$voltdb_home"/voltdb/voltdbclient-*.jar 2>/dev/null | paste -sd: -)
+[ -n "$procedure_classpath" ] && provider_args+=(--procedure-classpath "$procedure_classpath")
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$results/run.log"; }
 
@@ -1534,6 +1538,7 @@ result=PASS
     grep -m1 "^IMPORT checks:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^STATS calls checked:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^LOGIN checks:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^JAVAPROC checks:" "$results/sqlancer/out.log" 2>/dev/null
     $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP $http_mode by $http_method$([ "${bad_signatures:-0}" -eq 0 ] || echo ", $bad_signatures BAD SIGNATURES"), ${jdbc_rows:-0} through JDBC, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)"); gap fills: ${gap_fills:-0} (HTTP held across ${gap_holds:-0} kills)"
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, ${stops:-0} graceful stops, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"

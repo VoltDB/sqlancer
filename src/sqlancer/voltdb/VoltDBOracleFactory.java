@@ -13,6 +13,7 @@ import sqlancer.voltdb.oracle.VoltDBDifferentialOracle;
 import sqlancer.voltdb.oracle.VoltDBDurabilityOracle;
 import sqlancer.voltdb.oracle.VoltDBGeographyOracle;
 import sqlancer.voltdb.oracle.VoltDBImportOracle;
+import sqlancer.voltdb.oracle.VoltDBJavaProcedureOracle;
 import sqlancer.voltdb.oracle.VoltDBLimitOracle;
 import sqlancer.voltdb.oracle.VoltDBLoginOracle;
 import sqlancer.voltdb.oracle.VoltDBParameterOracle;
@@ -261,6 +262,17 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBLoginOracle(globalState);
+        }
+    },
+    /**
+     * Java stored procedures (milestone 50): single-partition, multi-partition and compound procedure classes compiled
+     * and loaded with @UpdateClasses return what they wrote, roll back whole when they fail, run the new version once
+     * replaced, and are refused what VoltDB must refuse.
+     */
+    JAVAPROC {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBJavaProcedureOracle(globalState);
         }
     },
 
