@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 50.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 51.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -67,6 +67,8 @@ Since milestone 48 every other node failure is a graceful `voltadmin stop`, and 
 Since milestone 49 `--xdcr` runs can kill nodes too; see [XDCR with node failures](#xdcr-with-node-failures-milestone-49).
 Since milestone 50 the JAVAPROC oracle compiles Java stored procedures, compound ones included, loads them with
 `@UpdateClasses` and checks what they return and leave; see [The JAVAPROC oracle](#the-javaproc-oracle).
+Since milestone 51 the STREAMSNAP oracle streams snapshots to the client (`Client2Impl.streamSnapshotAsync`) and checks
+the rows each table sends; see [The STREAMSNAP oracle](#the-streamsnap-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -306,8 +308,10 @@ which the provider treats as a node failure's. `--graceful false` keeps every fa
 
 A stopped node sometimes sees the survivors hang up on it after it has shut down and before its JVM exits, and
 partition detection then logs FATAL ("fewer than half of the previous servers", ENG-30704, Minor): in 5 of 6 stops of
-two loaded coverage runs, never in 20 stops of an idle cluster. The FATAL lines a stopped node logs after its "The
-database node has been shutdown" line are not counted (`chaos.excluded`).
+two loaded coverage runs, never in 20 stops of an idle cluster. A stop whose orderly shutdown stalls (in milestone 51's
+coverage run, because a snapshot was starting) ends instead with "Forcing the database node to exit", followed by the same
+FATAL. The FATAL lines a stopped node logs after its "The database node has been shutdown" or "Forcing the database node
+to exit" line are not counted (`chaos.excluded`).
 
 In run-coverage.sh's 10-minute kill run (4 kills, 3 graceful stops, 7 rejoins) and crash run (2 crashes, 1 shutdown
 with `--save`, 3 recoveries), against milestone 44's: `InvocationDispatcher` 357 of 1,028 lines (from 284; `@StopNode`
@@ -1416,6 +1420,76 @@ tasks restarted), which it avoids as well. In run-coverage.sh's 10-minute kill r
 (from 7), `CreateProcedureFromClass` 27 of 39 (from 5), `UpdateClassesAcceptancePolicy` 16 of 23 (from 2),
 `InMemoryJarfile` 173 of 269 (from 146); 813 lines more in 38 classes.
 
+## The STREAMSNAP oracle
+
+Milestone 51. Milestone 50's runs left VoltDB's streaming snapshots unreached: `org.voltdb.streamingsnapshots` had 9 of
+708 lines covered. In a streaming snapshot the client asks for a snapshot, the cluster takes one, and each host
+streams the chunks of its partitions to the client. The client calls are `@InitiateStreamingSnapshot` on every host,
+then `@StartStreamingSnapshot`. snapshot-transfer is built on it.
+
+Each STREAMSNAP check works on its own two tables, which are shaped like LOAD's twins (see
+[The LOAD and SWAP oracles](#the-load-and-swap-oracles)): `XQP_<db>`, partitioned on k, and `XQR_<db>`, replicated.
+The check fills them with up to 30 rows each, sometimes none and sometimes a few hundred, and reads them back. Then it
+streams a snapshot through `Client2Impl.streamSnapshotAsync`, from a client connected to every node. It asks for one
+of:
+
+- both tables;
+- one of them;
+- every table of the cluster but one of its own (`skipTables`);
+- both tables less one (a table list and `skipTables` together).
+
+The stream must end, and its catalog metadata must list the tables asked for. Each table asked for must send exactly
+the table's rows (compared as `VoltTable` values, decoded with `VoltTable.fromBuffer`), and no table outside the list
+may send rows. Some checks then do one more thing:
+
+- stream again under the same name, which must be refused ("already exists");
+- start two streams at once from two clients; each must stream the right rows, or be refused because a stream is
+  already in progress.
+
+Every stream also writes a snapshot to each node's snapshot directory. The check deletes it with `@SnapshotDelete`,
+which is why `--snapshot-path` is needed; without it STREAMSNAP does nothing. Streams and SNAPSHOT's saves take turns.
+In an XDCR run STREAMSNAP skips, as SNAPSHOT does. While nodes fail, a stream a failure broke is given up after
+120 s. At exit STREAMSNAP prints the streams checked, the rows and chunks streamed, the refusals checked, and the
+streams given up, with the reasons; the summary has the line.
+
+The released Java client prints its streaming debug lines (`... `) to stderr on every stream (ENG-30721), so a run's
+SQLancer log holds them.
+
+These bugs are avoided while `--avoid-known-bugs` is true; without it, STREAMSNAP finds them:
+
+- **ENG-30720:** a stream can complete before the client has handed its last chunks to the consumer. STREAMSNAP waits
+  up to 10 s for them, and counts the streams that needed it.
+- **ENG-30722:** a stream also sends the files of every snapshot whose name begins with its own. STREAMSNAP's names
+  have a fixed width and a final letter, and their snapshots are deleted at once. Without the option, the names are
+  `sqlstream1`, `sqlstream2` and so on, and ten are kept.
+- **ENG-30723:** a stream whose table lists match no table never ends. Without the option, some checks ask for a table
+  that does not exist, and the stream must be refused.
+- **ENG-30725:** a client that disconnects after its stream has ended breaks the stream then in progress. STREAMSNAP's
+  checks share two clients that stay connected; a client is replaced only after it fails.
+
+A client keeps a request outstanding for 60 s after each stream, and `close()` waits for it (ENG-30724), so clients are
+always closed in the background.
+
+Results:
+- **Local trials:** STREAMSNAP passed in 5-minute runs on 3 nodes, alongside SNAPSHOT and NOREC: 47 to 57 streams per
+  run, 2,300 to 3,900 rows, ENG-30720's late chunks waited for 2 or 3 times. A run without `--avoid-known-bugs` found
+  ENG-30723 twice and ENG-30720 once (a stream that completed holding 0 of its table's 7 rows).
+- **Coverage:** in run-coverage.sh's 10-minute kill run, `org.voltdb.streamingsnapshots` reached 463 of 708 lines
+  (from 9). By class, against the best of milestones 44 to 50:
+
+| Class | Lines covered (before) | Lines covered (now) |
+| --- | --- | --- |
+| `SingleHostSnapshotTableProcessor` | 0 | 92 of 122 |
+| `SingleHostSnapshotDataProcessor` | 0 | 77 of 88 |
+| `StreamingSnapshotUtils` | 4 | 73 of 147 |
+| `SingleHostCatalogReader` | 0 | 50 of 88 |
+| `SingleHostCatalogSender` | 0 | 48 of 57 |
+| `ExternalSnapshotStreamWorkerNTProc` | 4 | 35 of 45 |
+| `SnapshotStreamWorker` | 0 | 26 of 54 |
+| `InvocationDispatcher` | 357 | 471 of 1028 |
+
+In all, 642 more lines are covered, in 25 classes.
+
 ## The STREAMS oracle
 
 A stream cannot be read, so STREAMS puts each row into a stream and into a shadow table with the same columns, and
@@ -2025,6 +2099,17 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
 
+The bugs below were found in milestone 51.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30720 | `Client2Impl.streamSnapshotAsync` completes before its chunk consumer has every chunk. Each host sends its chunks, then an end-of-tables message, but the client handles incoming messages on a thread pool, so the end message can overtake the chunks before it. The future completes; the remaining chunks are handed over later, or dropped once the stream's hook is cleared. snapshot-transfer writes its `_SUCCESS` markers when the future completes. Released client 16.0.0 too. `repros/ENG-30720.sh` (with `repros/streaming/EarlyCompletionRepro.java`): 24 of 30 streams on one node with no throttle. Blocker. | While `--avoid-known-bugs` is true, STREAMSNAP waits up to 10 s for late chunks. |
+| ENG-30721 | The Java client prints its streaming debug lines to stderr on every stream (`debugActive = STREAMING_SNAPSHOT_DEBUG \| true`). Released client 16.0.0 too. Minor. | None. |
+| ENG-30722 | A streaming snapshot named `s1` also streams the files of every snapshot in the directory whose name begins with `s1`, such as `s10`, so a table can send another snapshot's (older) rows. `repros/ENG-30722.sh`. Blocker. | While `--avoid-known-bugs` is true, STREAMSNAP's names have a fixed width and a final letter, and its snapshots are deleted at once. |
+| ENG-30723 | A streaming snapshot whose table lists match no table never ends: each host finds no file and returns without sending its end-of-tables message, and the client waits forever (and cannot stream again). `repros/ENG-30723.sh`. Blocker. | While `--avoid-known-bugs` is true, STREAMSNAP asks only for tables that exist. |
+| ENG-30724 | After a streaming snapshot, `Client2` keeps one request (apparently `@StartStreamingSnapshot`'s) outstanding for 60 s, so `close()` and `drain()` take 60 s. `repros/ENG-30724.sh`. Minor. | STREAMSNAP closes its clients in the background. |
+| ENG-30725 | A client that disconnects after its stream has ended deletes the participant nodes of the stream then in progress: hosts other than the last participant leave the client's connection marked, and the reset its disconnect causes deletes every participant node. That stream's state is then never removed, and every later stream is refused until its own client disconnects; in the run that found it, the stream's client also stopped receiving chunks. `repros/ENG-30725.sh` (3 nodes). Blocker. | While `--avoid-known-bugs` is true, STREAMSNAP's checks share two clients that stay connected. |
+
 The bugs below were found in milestones 43, 46, 47 and 48.
 
 | Ticket | Issue | Workaround |
@@ -2032,7 +2117,7 @@ The bugs below were found in milestones 43, 46, 47 and 48.
 | ENG-30694 | An HTTP export target in batch mode whose endpoint has no query string fails every batch after sending it (`getQuery().contains(...)` on null, a NullPointerException), sends it again on every retry, and the stream exports nothing more. Found by milestone 47's batch mode; `repros/ENG-30694.sh`. A hang, Blocker for V16.1.0. | While `--avoid-known-bugs` is true, the batch endpoint has a query string (`?sqlancer=1`). |
 | ENG-30695 | A user whose masked password (`plaintext: false`) is given in lowercase hex is refused with every password, with no warning: the catalog keeps the digest as given and logins compare it with the client's in uppercase. Found by LOGIN (milestone 46); `repros/ENG-30695.sh`. Major. | While `--avoid-known-bugs` is true, LOGIN masks passwords in uppercase. |
 | ENG-30696 | DDL fails with "Unable to find reference for catalog item" while `voltadmin stop` takes a node out: the stopping node verifies catalog updates it no longer applies. Lab build #56's upgrade run, on 16.0.0; not reproduced locally. Major. | The error counts as a node failure (VoltDBErrors). |
-| ENG-30704 | A node stopped with `voltadmin stop` sometimes logs FATAL partition detection ("fewer than half of the previous servers") after it has shut down, as the survivors hang up on it before its JVM exits. Milestone 48's graceful stops, under load only; no reliable reproduction. Minor. | FATAL lines a stopped node logs after its shutdown are not counted (`chaos.excluded`). |
+| ENG-30704 | A node stopped with `voltadmin stop` sometimes logs FATAL partition detection ("fewer than half of the previous servers") after it has shut down, as the survivors hang up on it before its JVM exits; also after a forced exit, when the orderly shutdown stalls (milestone 51). Milestone 48's graceful stops, under load only; no reliable reproduction. Minor. | FATAL lines a stopped node logs after its shutdown, or its forced exit, are not counted (`chaos.excluded`). |
 | ENG-30705 | A task that `ON ERROR STOP` has stopped runs again after the node that ran it fails: the node that takes over starts its scheduler again (RUNNING) and runs the procedure once more. Found by TASK in lab build #61's kill run; `repros/ENG-30705.sh`; 16.0.0 too. Major. | While `--avoid-known-bugs` is true and nodes fail, TASK does not check the state of a task stopped by an error (the row counts still are). |
 | ENG-30708 | During an elastic join, the join's own index snapshot failed on some partitions ("Elastic streaming was invoked without proper activation", "Table streamer has no streams to serialize more"), and the join stayed at "Building index for data migration"; the next command-log truncation snapshot was refused by the engine ("COW context activation is not allowed while elastic indexing is in progress") and every original node crashed ("Failed to activate snapshot stream"), losing the cluster. Found by run-coverage.sh's resize run (milestone 50), once in two runs of the same seed; not reduced: snapshot saves, truncation snapshots and table swaps during a join did not reproduce it alone. Blocker. | None: a resize run can fail with FATAL lines. |
 | ENG-30710 | A user removed by `@SetYamlConfiguration` (`.users[name]=null`) still logs in when an `@UpdateClasses` runs at the same time: `@GetYamlConfiguration` no longer lists the user, but the update applies with the catalog unchanged (`securityChange=false`), so authentication keeps the user until the next catalog change. 16.0.0 too. Found by LOGIN beside JAVAPROC (milestone 50) in lab build #64's security run; `repros/ENG-30710.sh` (with `repros/users/RemovedUserRepro.java`) reproduces it at the first user. Critical. | While `--avoid-known-bugs` is true, JAVAPROC's `@UpdateClasses` calls hold the lock LOGIN and CONFIG share. |

@@ -893,9 +893,12 @@ chaos_loop() {
             # once a stopped node has shut down ("The database node has been shutdown"), it sometimes sees the
             # survivors hang up on it before its JVM exits, and partition detection logs FATAL ("fewer than half of
             # the previous servers", ENG-30704): seen in 5 of 6 stops of two loaded coverage runs, never in 20 stops of
-            # an idle cluster. Those lines, after its shutdown, are about a node that left on purpose, and are not counted
+            # an idle cluster. Those lines, after its shutdown, are about a node that left on purpose, and are not counted.
+            # A stop whose orderly shutdown stalls (a snapshot starting as it stops, milestone 51's coverage run) ends
+            # instead with "did not finish within 5 seconds ... Forcing the database node to exit", then the same FATAL
             vlog=$cluster/node$i/voltdbroot/log/volt.log
-            line=$(grep -n "The database node has been shutdown" "$vlog" 2>/dev/null | tail -1 | cut -d: -f1)
+            line=$(grep -nE "The database node has been shutdown|Forcing the database node to exit" "$vlog" 2>/dev/null \
+                | tail -1 | cut -d: -f1)
             [ -n "$line" ] && echo "node$i $line $(wc -l <"$vlog")" >>"$results/chaos.excluded"
         else
             kill -9 "$pid"

@@ -376,11 +376,14 @@ public class VoltDBStreamingSnapshotOracle implements TestOracle<VoltDBGlobalSta
         } catch (RuntimeException e) {
             return String.valueOf(e.getMessage());
         }
+        // a stream a node failure broke may never end: while nodes fail, it is given up after 120 s
+        VoltDBOptions o = state.getDbmsSpecificOptions();
+        int limit = timeout != null ? timeout : o.nodeFailures || o.resizes || o.crashes || o.upgrades ? 120 : 300;
         try {
-            f.get(timeout == null ? 300 : timeout, TimeUnit.SECONDS);
+            f.get(limit, TimeUnit.SECONDS);
             return null;
         } catch (TimeoutException e) {
-            return "no answer in " + (timeout == null ? 300 : timeout) + " s";
+            return "no answer in " + limit + " s";
         } catch (ExecutionException e) {
             Throwable c = e.getCause() == null ? e : e.getCause();
             return String.valueOf(c.getMessage()).replace('\n', ' ');
