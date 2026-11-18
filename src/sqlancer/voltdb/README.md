@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 53.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 54.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -73,6 +73,8 @@ Since milestone 52 run-sqlancer.sh turns the metrics system on, and the METRICS 
 against the calls it makes and the tables' rows; see [The METRICS oracle](#the-metrics-oracle).
 Since milestone 53 the DEFRAG oracle compacts tables with `@Defrag` and checks that every index still finds every
 row; see [The DEFRAG oracle](#the-defrag-oracle).
+Since milestone 54 the TLSRELOAD oracle rotates the cluster's TLS certificate with `@ReloadSslContext` while it runs;
+see [The TLSRELOAD oracle](#the-tlsreload-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -1609,6 +1611,51 @@ Results:
 
   `DefragMP`, used for replicated tables, is reached only by compacting every table, which that run did not.
 
+## The TLSRELOAD oracle
+
+Milestone 54. `@ReloadSslContext` (`voltadmin ssl reload`) makes every node reload its TLS keystore and truststore from
+their files, so a certificate can be renewed without a restart. Before this milestone, nothing called it. `SslSetup`
+had 18 of 348 lines covered, and `ReloadSslContext` 8 of 82.
+
+The procedure first asks every node for a checksum of the store files and their modification times. It reloads only
+if some node sees a file newer than its last load and every node sees the same checksum, unless `force` is set. It
+answers STATUS 0 (reloaded), 1 (the checks failed) or 2 (a reload failed).
+
+In a run with TLS (`--ssl`), the keystore and truststore are files in the run's `cluster/tls` directory, beside the
+truststore `--ssl-truststore` names, and every node reads them. A TLSRELOAD check takes a lock so that only one check
+runs at a time, then:
+
+1. calls `@ReloadSslContext(0)` with no store changed since the last load, which must answer STATUS 1 ("No updated
+   TLS/SSL store found");
+2. rotates the certificate:
+   - makes a new key pair and a self-signed certificate for localhost (keytool);
+   - adds the certificate to the truststore, so that the nodes and SQLancer trust both the old one and the new one;
+   - replaces the keystore with the new one, and calls `@ReloadSslContext(0)`, which must answer STATUS 0.
+
+   Then a TLS handshake with every node's client port must present the new certificate, `@Ping` must still run on the
+   connection SQLancer opened before the rotation, and a new connection must be able to run it too;
+3. without `--avoid-known-bugs` only, replaces the keystore with bytes that are no keystore and reloads. The answer
+   must be STATUS 2, and the nodes must go on presenting the certificate they had. This is ENG-30745: the node crashes
+   instead. The good keystore is then put back and loaded again.
+
+Store files are written whole and renamed into place, so a connection opened meanwhile never reads half a store. The
+truststore keeps the certificates of the last three rotations. Without `--ssl-truststore`, TLSRELOAD does nothing. At
+exit it prints its checks, the certificates rotated, the handshakes checked, the reloads refused with nothing changed,
+the bad keystores refused and the checks given up; the summary has the line.
+
+Results:
+- **Local trials** on 3 nodes, k=1, with security and TLS:
+  - beside LOGIN and NOREC for 5 minutes: 145 checks, 145 rotations, 435 handshakes;
+  - without `--avoid-known-bugs`, alone for 2 minutes: the first bad keystore took the node down (ENG-30745).
+- **Coverage:** in run-coverage.sh's 10-minute security run (1 node, TLS, 18 TLSRELOAD checks):
+
+| Class | Lines covered (before) | Lines covered (now) |
+| --- | --- | --- |
+| `SslSetup` | 18 | 177 of 348 |
+| `ReloadSslContext` | 8 | 72 of 82 |
+| `SslCertCheck` | 11 | 51 of 90 |
+| `SslContextHolder` | 5 | 18 of 20 |
+
 ## The STREAMS oracle
 
 A stream cannot be read, so STREAMS puts each row into a stream and into a shadow table with the same columns, and
@@ -2217,6 +2264,12 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
+The bug below was found in milestone 54.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30745 | `@ReloadSslContext` (voltadmin ssl reload) crashes the node when the keystore it reloads cannot be loaded (half written, the wrong file, another password), instead of answering STATUS 2 and keeping its TLS context. The reload calls the startup path, `SslSetup.setupSSL`, which calls `crashLocalVoltDB` on any failure. Every node reloads the same paths, so a whole cluster goes down. 16.0.0 too. `repros/ENG-30745.sh` (with `repros/tls/ReloadRepro.java`). Blocker. | While `--avoid-known-bugs` is true, TLSRELOAD reloads only keystores that load. |
 
 The bug below was found in milestone 52.
 
