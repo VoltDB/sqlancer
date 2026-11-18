@@ -287,6 +287,15 @@ public class VoltDBConnection extends SQLConnection {
     private <T extends Statement> T retrying(T statement, Class<T> type) {
         return type
                 .cast(Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[] { type }, (proxy, method, args) -> {
+                    // a batch is not retried: once it fails, the driver has cleared it, and a retry would run an
+                    // empty batch and report success (milestone 53)
+                    if ("executeBatch".equals(method.getName())) {
+                        try {
+                            return method.invoke(statement, args);
+                        } catch (InvocationTargetException e) {
+                            throw e.getCause();
+                        }
+                    }
                     if (method.getName().startsWith("execute")) {
                         holdDdl(args);
                     }

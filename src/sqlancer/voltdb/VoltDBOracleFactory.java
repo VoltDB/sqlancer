@@ -8,6 +8,7 @@ import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 import sqlancer.voltdb.gen.VoltDBExpressionGenerator;
 import sqlancer.voltdb.oracle.VoltDBBulkOracle;
 import sqlancer.voltdb.oracle.VoltDBConfigOracle;
+import sqlancer.voltdb.oracle.VoltDBDefragOracle;
 import sqlancer.voltdb.oracle.VoltDBDerivedTableOracle;
 import sqlancer.voltdb.oracle.VoltDBDifferentialOracle;
 import sqlancer.voltdb.oracle.VoltDBDurabilityOracle;
@@ -297,6 +298,17 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBMetricsOracle(globalState);
+        }
+    },
+    /**
+     * Table compaction (milestone 53): after @Defrag moves a fragmented table's tuples, the table read in full and
+     * through each of its indexes must hold exactly the rows expected, and so after further changes through the
+     * indexes.
+     */
+    DEFRAG {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBDefragOracle(globalState);
         }
     },
 
