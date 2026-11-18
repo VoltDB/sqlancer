@@ -26,6 +26,7 @@ import sqlancer.voltdb.oracle.VoltDBSmokeOracle;
 import sqlancer.voltdb.oracle.VoltDBSnapshotOracle;
 import sqlancer.voltdb.oracle.VoltDBStatsOracle;
 import sqlancer.voltdb.oracle.VoltDBStreamOracle;
+import sqlancer.voltdb.oracle.VoltDBStreamingSnapshotOracle;
 import sqlancer.voltdb.oracle.VoltDBSubqueryOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPAggregateOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPOracle;
@@ -273,6 +274,17 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBJavaProcedureOracle(globalState);
+        }
+    },
+    /**
+     * Streaming snapshots (milestone 51): a snapshot streamed to the client through Client2Impl.streamSnapshotAsync, of
+     * some tables or every table but some, must hold each table's rows and nothing else, and a second stream under the
+     * same name or at the same time must be refused (--snapshot-path).
+     */
+    STREAMSNAP {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBStreamingSnapshotOracle(globalState);
         }
     },
 

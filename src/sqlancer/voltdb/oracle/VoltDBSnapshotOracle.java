@@ -47,7 +47,8 @@ import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
  */
 public class VoltDBSnapshotOracle implements TestOracle<VoltDBGlobalState> {
 
-    private static final Object LOCK = new Object();
+    // one snapshot at a time: STREAMSNAP's streams take it too
+    static final Object LOCK = new Object();
     private static final AtomicLong NONCES = new AtomicLong();
     private static final AtomicLong RESTORES = new AtomicLong();
     private static final AtomicLong MERGES = new AtomicLong();
@@ -397,7 +398,7 @@ public class VoltDBSnapshotOracle implements TestOracle<VoltDBGlobalState> {
 
     // the files in the nodes' snapshot directories (dir/<node>/voltdbroot/snapshots) whose names pass the test; a file
     // the server deletes meanwhile is left out
-    private static List<Path> files(String dir, java.util.function.Predicate<String> name) throws IOException {
+    static List<Path> files(String dir, java.util.function.Predicate<String> name) throws IOException {
         List<Path> found = new ArrayList<>();
         try (DirectoryStream<Path> nodes = Files.newDirectoryStream(Paths.get(dir))) {
             for (Path node : nodes) {
@@ -434,16 +435,26 @@ public class VoltDBSnapshotOracle implements TestOracle<VoltDBGlobalState> {
 
     // @SnapshotDelete of the snapshot in each node's snapshot directory
     private void delete(String dir, String nonce) {
+        String done = deleteSnapshot(connection(), dir, nonce);
+        if (done != null) {
+            lastQuery = done;
+        }
+    }
+
+    // @SnapshotDelete of the snapshot NONCE in each node's snapshot directory under DIR (--snapshot-path); what the
+    // last call did, or null if none was made (STREAMSNAP removes its snapshots this way too)
+    static String deleteSnapshot(VoltDBConnection connection, String dir, String nonce) {
         Set<String> dirs = new java.util.TreeSet<>();
         try {
             for (Path f : files(dir, n -> n.startsWith(nonce + "-") || n.equals(nonce + ".jar"))) {
                 dirs.add(f.getParent().toString());
             }
         } catch (IOException e) {
-            return;
+            return null;
         }
+        String done = null;
         for (String d : dirs) {
-            try (CallableStatement call = connection().prepareCall("{call @SnapshotDelete(?, ?)}")) {
+            try (CallableStatement call = connection.prepareCall("{call @SnapshotDelete(?, ?)}")) {
                 call.setString(1, d);
                 call.setString(2, nonce);
                 try (ResultSet rs = call.executeQuery()) {
@@ -451,12 +462,13 @@ public class VoltDBSnapshotOracle implements TestOracle<VoltDBGlobalState> {
                     while (rs.next()) {
                         deleted++;
                     }
-                    lastQuery = "@SnapshotDelete('" + d + "', '" + nonce + "'): " + deleted + " files";
+                    done = "@SnapshotDelete('" + d + "', '" + nonce + "'): " + deleted + " files";
                 }
             } catch (SQLException | IgnoreMeException e) {
                 // the next check uses another nonce
             }
         }
+        return done;
     }
 
     private VoltDBConnection connection() {

@@ -38,6 +38,15 @@ public final class VoltDBInsertGenerator {
         Randomly r = globalState.getRandomly();
         String verb = !table.getPrimaryKey().isEmpty() && Randomly.getBooleanWithRatherLowProbability() ? "UPSERT"
                 : "INSERT";
+        if ("UPSERT".equals(verb)) {
+            // VoltDB's UPSERT needs a value for every primary key column, nullable ones included
+            for (VoltDBColumn c : table.getColumns()) {
+                if (!columns.contains(c)
+                        && table.getPrimaryKey().stream().anyMatch(k -> k.equalsIgnoreCase(c.getName()))) {
+                    columns.add(c);
+                }
+            }
+        }
         String sql = verb + " INTO " + table.getName() + " ("
                 + columns.stream().map(VoltDBColumn::getName).collect(Collectors.joining(", ")) + ") VALUES ("
                 + columns.stream().map(c -> VoltDBConstantGenerator.generate(r, c.getType(), c.isNullable()))
