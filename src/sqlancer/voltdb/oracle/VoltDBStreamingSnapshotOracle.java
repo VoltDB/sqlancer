@@ -54,13 +54,14 @@ import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
  * voltdbroots, where the check finds the files to delete with {@code @SnapshotDelete}. Without it the oracle does
  * nothing. Streams and SNAPSHOT's saves take turns.
  * <p>
- * Known bugs avoided with --avoid-known-bugs: ENG-30720 (the stream completes before its last chunks are handed over:
- * the check waits up to 10 s for them), ENG-30722 (a stream also sends the files of each snapshot whose name begins
- * with its own: names of a fixed width, deleted at once), ENG-30723 (a stream whose table lists match no table never
- * ends: without the option, some checks ask for a table that does not exist and expect a refusal) and ENG-30725 (a
- * client that disconnects after its stream ended breaks the stream in progress: the checks share two clients that stay
- * connected). ENG-30724 (a client keeps a request outstanding for 60 s after a stream, and close() waits for it) is
- * worked around in either case: clients are closed in the background.
+ * Known bugs avoided with --avoid-known-bugs: ENG-30720 (the stream completes before its last chunks are handed over,
+ * which may then be dropped: the check waits up to 10 s for them, and streams again, up to three times in all, if rows
+ * are still missing), ENG-30722 (a stream also sends the files of each snapshot whose name begins with its own: names
+ * of a fixed width, deleted at once), ENG-30723 (a stream whose table lists match no table never ends: without the
+ * option, some checks ask for a table that does not exist and expect a refusal) and ENG-30725 (a client that
+ * disconnects after its stream ended breaks the stream in progress: the checks share two clients that stay connected).
+ * ENG-30724 (a client keeps a request outstanding for 60 s after a stream, and close() waits for it) is worked around
+ * in either case: clients are closed in the background.
  */
 public class VoltDBStreamingSnapshotOracle implements TestOracle<VoltDBGlobalState> {
 
@@ -73,6 +74,8 @@ public class VoltDBStreamingSnapshotOracle implements TestOracle<VoltDBGlobalSta
     private static final AtomicLong SAME_NAME = new AtomicLong();
     private static final AtomicLong CONCURRENT = new AtomicLong();
     private static final AtomicLong LATE = new AtomicLong();
+    // streams short of rows after the wait (ENG-30720), streamed again
+    private static final AtomicLong RETRIED = new AtomicLong();
     private static final AtomicLong UNKNOWN_TABLE = new AtomicLong();
     // streams given up, and why
     private static final Map<String, Long> SKIPS = new ConcurrentHashMap<>();
@@ -102,7 +105,8 @@ public class VoltDBStreamingSnapshotOracle implements TestOracle<VoltDBGlobalSta
                         + SKIPPING + "); refusals checked: the same name " + SAME_NAME + ", a concurrent stream "
                         + CONCURRENT + ", an unknown table " + UNKNOWN_TABLE
                         + "; streams that handed over chunks after completing (ENG-30720): " + LATE
-                        + "; streams given up: " + SKIPS)));
+                        + "; streams short of rows and streamed again (ENG-30720): " + RETRIED + "; streams given up: "
+                        + SKIPS)));
     }
 
     private final VoltDBGlobalState state;
@@ -125,6 +129,15 @@ public class VoltDBStreamingSnapshotOracle implements TestOracle<VoltDBGlobalSta
                 n += l.size();
             }
             return n;
+        }
+    }
+
+    // a stream short of rows while avoiding known bugs (ENG-30720)
+    private static final class ShortStream extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        ShortStream(String message) {
+            super(message);
         }
     }
 
@@ -194,14 +207,28 @@ public class VoltDBStreamingSnapshotOracle implements TestOracle<VoltDBGlobalSta
                 break;
             }
             String nonce = nonce();
-            Received got = new Received();
             try {
-                String failed = stream(client, nonce, tables, skip, got, null);
-                if (failed != null) {
-                    skipOrFail("a stream of " + describe(tables, skip), failed);
+                // ENG-30720: a stream's last chunks can be dropped for good once it has completed; while avoiding
+                // known bugs, a stream still short of rows after the wait is streamed again, up to three times in all
+                for (int attempt = 1;; attempt++) {
+                    Received got = new Received();
+                    String failed = stream(client, nonce, tables, skip, got, null);
+                    if (failed != null) {
+                        skipOrFail("a stream of " + describe(tables, skip), failed);
+                    }
+                    STREAMS.incrementAndGet();
+                    try {
+                        compare(got, expected, wanted, tables, skip, nonce);
+                        break;
+                    } catch (ShortStream e) {
+                        if (attempt == 3) {
+                            throw new AssertionError(e.getMessage() + " (the third stream in a row short of rows)");
+                        }
+                        RETRIED.incrementAndGet();
+                        forget(dir, nonce);
+                        nonce = nonce();
+                    }
                 }
-                STREAMS.incrementAndGet();
-                compare(got, expected, wanted, tables, skip, nonce);
                 if (Randomly.getBooleanWithRatherLowProbability()) {
                     sameName(nonce, tables, skip);
                 }
@@ -241,6 +268,10 @@ public class VoltDBStreamingSnapshotOracle implements TestOracle<VoltDBGlobalSta
             }
         }
         String what = "the streaming snapshot " + nonce + " of " + describe(tables, skip);
+        if (o.avoidKnownBugs && rowsOf(got, wanted) < wantedRows) {
+            throw new ShortStream(what + " holds " + rowsOf(got, wanted) + " of the " + wantedRows
+                    + " rows of the tables asked for, 10 s after it completed");
+        }
         lastQuery = what;
         if (!got.metadata) {
             throw new AssertionError(what + " completed without its catalog metadata");
@@ -331,11 +362,16 @@ public class VoltDBStreamingSnapshotOracle implements TestOracle<VoltDBGlobalSta
                     skipOrFail(lastQuery, why);
                 }
             }
-            if (ra == null) {
-                compare(a, expected, wanted, tables, skip, first);
-            }
-            if (rb == null) {
-                compare(b, expected, wanted, tables, skip, second);
+            try {
+                if (ra == null) {
+                    compare(a, expected, wanted, tables, skip, first);
+                }
+                if (rb == null) {
+                    compare(b, expected, wanted, tables, skip, second);
+                }
+            } catch (ShortStream e) {
+                RETRIED.incrementAndGet();
+                throw new IgnoreMeException();
             }
             CONCURRENT.incrementAndGet();
             c1.keep();

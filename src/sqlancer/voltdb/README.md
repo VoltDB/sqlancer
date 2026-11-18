@@ -1457,8 +1457,10 @@ SQLancer log holds them.
 
 These bugs are avoided while `--avoid-known-bugs` is true; without it, STREAMSNAP finds them:
 
-- **ENG-30720:** a stream can complete before the client has handed its last chunks to the consumer. STREAMSNAP waits
-  up to 10 s for them, and counts the streams that needed it.
+- **ENG-30720:** a stream can complete before the client has handed its last chunks to the consumer, and those chunks
+  may then be dropped. STREAMSNAP waits up to 10 s for them. If rows are still missing, it streams again, up to three
+  attempts in all, and fails only if all three come up short. It counts the streams that needed the wait and those it
+  streamed again.
 - **ENG-30722:** a stream also sends the files of every snapshot whose name begins with its own. STREAMSNAP's names
   have a fixed width and a final letter, and their snapshots are deleted at once. Without the option, the names are
   `sqlstream1`, `sqlstream2` and so on, and ten are kept.
@@ -2103,7 +2105,7 @@ The bugs below were found in milestone 51.
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
-| ENG-30720 | `Client2Impl.streamSnapshotAsync` completes before its chunk consumer has every chunk. Each host sends its chunks, then an end-of-tables message, but the client handles incoming messages on a thread pool, so the end message can overtake the chunks before it. The future completes; the remaining chunks are handed over later, or dropped once the stream's hook is cleared. snapshot-transfer writes its `_SUCCESS` markers when the future completes. Released client 16.0.0 too. `repros/ENG-30720.sh` (with `repros/streaming/EarlyCompletionRepro.java`): 24 of 30 streams on one node with no throttle. Blocker. | While `--avoid-known-bugs` is true, STREAMSNAP waits up to 10 s for late chunks. |
+| ENG-30720 | `Client2Impl.streamSnapshotAsync` completes before its chunk consumer has every chunk. Each host sends its chunks, then an end-of-tables message, but the client handles incoming messages on a thread pool, so the end message can overtake the chunks before it. The future completes; the remaining chunks are handed over later, or dropped once the stream's hook is cleared ("Received snapshot message with no snapshot operation in progress": a local TLS run lost a 22-row table this way). snapshot-transfer writes its `_SUCCESS` markers when the future completes. Released client 16.0.0 too. `repros/ENG-30720.sh` (with `repros/streaming/EarlyCompletionRepro.java`): 24 of 30 streams on one node with no throttle. Blocker. | While `--avoid-known-bugs` is true, STREAMSNAP waits up to 10 s for late chunks, and streams again if rows are still missing (three attempts in all). |
 | ENG-30721 | The Java client prints its streaming debug lines to stderr on every stream (`debugActive = STREAMING_SNAPSHOT_DEBUG \| true`). Released client 16.0.0 too. Minor. | None. |
 | ENG-30722 | A streaming snapshot named `s1` also streams the files of every snapshot in the directory whose name begins with `s1`, such as `s10`, so a table can send another snapshot's (older) rows. `repros/ENG-30722.sh`. Blocker. | While `--avoid-known-bugs` is true, STREAMSNAP's names have a fixed width and a final letter, and its snapshots are deleted at once. |
 | ENG-30723 | A streaming snapshot whose table lists match no table never ends: each host finds no file and returns without sending its end-of-tables message, and the client waits forever (and cannot stream again). `repros/ENG-30723.sh`. Blocker. | While `--avoid-known-bugs` is true, STREAMSNAP asks only for tables that exist. |
