@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 51.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 52.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -69,6 +69,8 @@ Since milestone 50 the JAVAPROC oracle compiles Java stored procedures, compound
 `@UpdateClasses` and checks what they return and leave; see [The JAVAPROC oracle](#the-javaproc-oracle).
 Since milestone 51 the STREAMSNAP oracle streams snapshots to the client (`Client2Impl.streamSnapshotAsync`) and checks
 the rows each table sends; see [The STREAMSNAP oracle](#the-streamsnap-oracle).
+Since milestone 52 run-sqlancer.sh turns the metrics system on, and the METRICS oracle checks every node's `/metrics`
+against the calls it makes and the tables' rows; see [The METRICS oracle](#the-metrics-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -1492,6 +1494,68 @@ Results:
 
 In all, 642 more lines are covered, in 25 classes.
 
+## The METRICS oracle
+
+Milestone 52. VoltDB's metrics system was off in every run before this one: its recorders, its collector, the
+Prometheus endpoint on each node's metrics port and `@Metrics`. The `org.voltdb.metrics` packages had 373 of 2,004 lines
+covered. run-sqlancer.sh now turns it on in every run's deployment (`<metrics enabled="true" interval="1s"/>`) and
+passes every node's metrics port as `--metrics-servers`.
+
+Each METRICS check uses objects of its own: a partitioned table `XMP_<db>`, a replicated table `XMR_<db>`, and four
+procedures:
+
+- `XMI_<db>` inserts into XMP (a single-partition write);
+- `XMG_<db>` reads a row of XMP (a single-partition read);
+- `XMS_<db>` counts XMP's rows (a multi-partition read);
+- `XMU_<db>` inserts into XMR (a multi-partition write).
+
+A check scrapes every node's `/metrics` once the counts have settled (two scrapes alike, 1.2 s apart). It calls each
+procedure a few times; some inserts break the primary key and fail, which still counts as a call. It then scrapes again
+until the following hold, for up to 30 s, because the metrics reach `/metrics` seconds after the calls:
+
+- `voltdb_procedure_invoked_total`, summed over the cluster, has grown by the calls. A single-partition write is
+  counted on every replica (calls × (k+1)); a single-partition read only on the partition's leader; a multi-partition
+  procedure once, on the MP coordinator's host.
+- `voltdb_table_tuple_total` and `voltdb_index_entry_count_total` of XMP, summed, are its rows × (k+1); every site's for
+  XMR is XMR's rows.
+
+Then it checks two other views of the same counts:
+- `@Statistics PROCEDURE`'s invocations of each procedure must equal the metric's;
+- `@Metrics`, which answers for the host the connection reaches, must report that host's tuple counts as its
+  `/metrics` does.
+
+Some checks drop XMS and create it again first: no node may report it until it is called, and then its count starts
+from 0.
+
+A catalog change (DDL, `@UpdateClasses`) starts every procedure's count afresh, in the metrics and in `@Statistics`
+alike. So a check holds off this SQLancer's DDL (`VoltDBConnection.withoutDdl`) and the changes of CONFIG, LOGIN and
+JAVAPROC, which share a lock. A node that rejoins also starts afresh, so METRICS does nothing in runs where nodes fail,
+the cluster is resized or upgraded, or in XDCR runs. With TLS the metrics port serves HTTPS, and METRICS trusts the
+cluster's certificate through `--ssl-truststore`; the endpoint asks for no credentials, even with security on. At exit
+METRICS prints its checks, the calls counted, the series compared, the procedures dropped and created again, the
+`@Metrics` comparisons, the longest wait for the metrics to agree, and the checks given up; the summary has the line.
+
+A deployment change (`@SetYamlConfiguration`) also starts the metric's procedure counts afresh, but not
+`@Statistics`' (ENG-30728). While avoiding known bugs, METRICS therefore compares what the two grew by over the check,
+not their totals.
+
+Results:
+- **Local trials,** 5 minutes on 3 nodes, k=1:
+  - beside NOREC and JAVAPROC: passed, 39 checks, 499 calls counted, 3,744 series compared;
+  - with security and TLS, beside LOGIN, CONFIG and STATS: passed, 34 checks. The run before the ENG-30728 workaround
+    found ENG-30728, and so did a run without `--avoid-known-bugs`.
+- **Coverage:** in run-coverage.sh's 10-minute batch run (3 nodes, no node failures, 18 METRICS checks), the
+  `org.voltdb.metrics` packages reached 1,676 of 2,004 lines (from 373). By class:
+
+| Class | Lines covered |
+| --- | --- |
+| `DefaultPerProcedureMetricsRecorder` | 66 of 71 |
+| `DefaultNetworkMetricsRecorder` | 63 of 88 |
+| `DefaultSchedulerMetricRecorder` | 54 of 54 |
+| `SystemInformationPrometheusRenderer` | 83 of 91 |
+| `MetricHeapCalculator` | 84 of 88 |
+| `VoltTablesMetricExporter` | 156 of 156 (with its `Table`) |
+
 ## The STREAMS oracle
 
 A stream cannot be read, so STREAMS puts each row into a stream and into a shadow table with the same columns, and
@@ -2100,6 +2164,12 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
+The bug below was found in milestone 52.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30728 | A deployment change by `@SetYamlConfiguration`, even one that touches no procedure (`deployment.systemsettings.query.timeout`), starts the metrics system's procedure counts (`voltdb_procedure_invoked_total`) afresh, while `@Statistics PROCEDURE` keeps its counts; the two disagree from then on, and Prometheus sees a reset on a server that never restarted. Possibly the same cause as ENG-30450. `repros/ENG-30728.sh`. Major. | While `--avoid-known-bugs` is true, METRICS compares what the metric and the statistics grew by over its check. |
 
 The bugs below were found in milestone 51.
 
