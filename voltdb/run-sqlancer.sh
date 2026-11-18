@@ -1549,6 +1549,7 @@ result=PASS
     grep -m1 "^STREAMSNAP streams checked:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^METRICS checks:" "$results/sqlancer/out.log" 2>/dev/null
     grep -m1 "^DEFRAG checks:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^TLSRELOAD checks:" "$results/sqlancer/out.log" 2>/dev/null
     $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP $http_mode by $http_method$([ "${bad_signatures:-0}" -eq 0 ] || echo ", $bad_signatures BAD SIGNATURES"), ${jdbc_rows:-0} through JDBC, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)"); gap fills: ${gap_fills:-0} (HTTP held across ${gap_holds:-0} kills)"
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, ${stops:-0} graceful stops, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"

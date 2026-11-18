@@ -33,6 +33,7 @@ import sqlancer.voltdb.oracle.VoltDBSubqueryOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPAggregateOracle;
 import sqlancer.voltdb.oracle.VoltDBTLPOracle;
 import sqlancer.voltdb.oracle.VoltDBTaskOracle;
+import sqlancer.voltdb.oracle.VoltDBTlsReloadOracle;
 import sqlancer.voltdb.oracle.VoltDBTtlOracle;
 import sqlancer.voltdb.oracle.VoltDBViewOracle;
 import sqlancer.voltdb.oracle.VoltDBWindowOracle;
@@ -309,6 +310,16 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBDefragOracle(globalState);
+        }
+    },
+    /**
+     * Reloading TLS certificates (milestone 54), with --ssl-truststore: @ReloadSslContext refuses when nothing changed,
+     * reloads a rotated certificate, which every node must then present, and keeps existing connections working.
+     */
+    TLSRELOAD {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBTlsReloadOracle(globalState);
         }
     },
 
