@@ -49,6 +49,8 @@ public class VoltDBDefragOracle implements TestOracle<VoltDBGlobalState> {
     private static final AtomicLong DEFRAGS = new AtomicLong();
     private static final AtomicLong WHOLE = new AtomicLong();
     private static final AtomicLong READS = new AtomicLong();
+    // batches a concurrent schema change rejected, after which the model was read back
+    private static final AtomicLong REFILLS = new AtomicLong();
     private static final Map<String, Long> SKIPS = new ConcurrentHashMap<>();
     // the rows each database's table should hold, by id
     private static final Map<String, TreeMap<Integer, Row>> MODELS = new ConcurrentHashMap<>();
@@ -58,7 +60,8 @@ public class VoltDBDefragOracle implements TestOracle<VoltDBGlobalState> {
         Runtime.getRuntime()
                 .addShutdownHook(new Thread(() -> System.out.println("DEFRAG checks: " + CHECKS + "; compactions: "
                         + DEFRAGS + " (of every table " + WHOLE + "); tuples relocated: " + RELOCATED
-                        + "; reads compared: " + READS + "; checks given up: " + SKIPS)));
+                        + "; reads compared: " + READS + "; batches refilled after a schema change: " + REFILLS
+                        + "; checks given up: " + SKIPS)));
     }
 
     private final VoltDBGlobalState state;
@@ -134,6 +137,9 @@ public class VoltDBDefragOracle implements TestOracle<VoltDBGlobalState> {
     }
 
     // adds rows until the table has COUNT
+    // adds rows until the table has COUNT, in batches of 50. A batch that a concurrent schema change rejects ("planned
+    // against a catalog version", which every other database's DDL causes) may have inserted some of its rows: the
+    // model is then read back from the table, and filling goes on (up to 20 times)
     private void fill(String t, int k, java.util.SortedMap<Integer, Row> model, int count) {
         AtomicLong ids = IDS.computeIfAbsent(t, x -> new AtomicLong());
         StringBuilder sql = new StringBuilder("INSERT INTO ").append(t).append(" VALUES (?, ?, ?, ?");
@@ -141,40 +147,62 @@ public class VoltDBDefragOracle implements TestOracle<VoltDBGlobalState> {
             sql.append(", ?");
         }
         sql.append(")");
-        lastQuery = sql.toString();
-        List<Row> added = new ArrayList<>();
-        int pending = 0;
-        try (PreparedStatement st = (PreparedStatement) connection().prepareStatement(sql.toString())) {
-            while (model.size() + added.size() < count) {
-                int id = (int) ids.incrementAndGet();
+        int rejected = 0;
+        while (model.size() < count) {
+            lastQuery = sql.toString();
+            List<Row> batch = new ArrayList<>();
+            try (PreparedStatement st = (PreparedStatement) connection().prepareStatement(sql.toString())) {
+                while (model.size() + batch.size() < count && batch.size() < 50) {
+                    int id = (int) ids.incrementAndGet();
+                    String[] c = new String[COLUMNS];
+                    for (int i = 0; i < COLUMNS; i++) {
+                        // 50 bytes or so, in line; c1 unique within k
+                        c[i] = i == 0 ? "u" + id : "c" + i + "-" + id + "-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+                    }
+                    Row row = new Row(id, Randomly.getNotCachedInteger(0, 100), "s" + id % 97 + "-" + "z".repeat(300),
+                            c);
+                    st.setInt(1, k);
+                    st.setInt(2, id);
+                    st.setLong(3, row.n);
+                    st.setString(4, row.s);
+                    for (int i = 0; i < COLUMNS; i++) {
+                        st.setString(5 + i, c[i]);
+                    }
+                    st.addBatch();
+                    batch.add(row);
+                }
+                flush(st, batch.size());
+                for (Row row : batch) {
+                    model.put(row.id, row);
+                }
+            } catch (SQLException e) {
+                if (++rejected > 20 || !String.valueOf(e.getMessage()).contains("catalog version")
+                        && !String.valueOf(e.getMessage()).contains("a batch of")) {
+                    skip("insert: " + e.getMessage());
+                }
+                REFILLS.incrementAndGet();
+                reload(t, model);
+            }
+        }
+    }
+
+    // the model read back from the table
+    private void reload(String t, java.util.SortedMap<Integer, Row> model) {
+        lastQuery = "SELECT * FROM " + t + " ORDER BY id";
+        java.util.SortedMap<Integer, Row> now = new TreeMap<>();
+        try (Statement st = connection().createStatement(); ResultSet rs = st.executeQuery(lastQuery)) {
+            while (rs.next()) {
                 String[] c = new String[COLUMNS];
                 for (int i = 0; i < COLUMNS; i++) {
-                    // 50 bytes or so, in line; c1 unique within k
-                    c[i] = i == 0 ? "u" + id : "c" + i + "-" + id + "-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+                    c[i] = rs.getString(5 + i);
                 }
-                Row row = new Row(id, Randomly.getNotCachedInteger(0, 100), "s" + id % 97 + "-" + "z".repeat(300), c);
-                st.setInt(1, k);
-                st.setInt(2, id);
-                st.setLong(3, row.n);
-                st.setString(4, row.s);
-                for (int i = 0; i < COLUMNS; i++) {
-                    st.setString(5 + i, c[i]);
-                }
-                st.addBatch();
-                added.add(row);
-                pending++;
-                if (pending == 200) {
-                    flush(st, pending);
-                    pending = 0;
-                }
+                now.put(rs.getInt(2), new Row(rs.getInt(2), rs.getLong(3), rs.getString(4), c));
             }
-            flush(st, pending);
         } catch (SQLException e) {
-            skip("insert: " + e.getMessage());
+            skip("SELECT: " + e.getMessage());
         }
-        for (Row row : added) {
-            model.put(row.id, row);
-        }
+        model.clear();
+        model.putAll(now);
     }
 
     // runs a batch of PENDING inserts, each of which must have inserted its row. VoltDBConnection retries a batch that
