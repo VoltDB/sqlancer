@@ -16,6 +16,7 @@ import sqlancer.voltdb.oracle.VoltDBImportOracle;
 import sqlancer.voltdb.oracle.VoltDBJavaProcedureOracle;
 import sqlancer.voltdb.oracle.VoltDBLimitOracle;
 import sqlancer.voltdb.oracle.VoltDBLoginOracle;
+import sqlancer.voltdb.oracle.VoltDBMetricsOracle;
 import sqlancer.voltdb.oracle.VoltDBParameterOracle;
 import sqlancer.voltdb.oracle.VoltDBPermissionOracle;
 import sqlancer.voltdb.oracle.VoltDBPivotedQuerySynthesisOracle;
@@ -285,6 +286,17 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBStreamingSnapshotOracle(globalState);
+        }
+    },
+    /**
+     * The metrics system (milestone 52): every node's /metrics must count each procedure call (by k+1 for a
+     * single-partition write) and each table's rows, and agree with @Statistics PROCEDURE and @Metrics
+     * (--metrics-servers).
+     */
+    METRICS {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBMetricsOracle(globalState);
         }
     },
 
