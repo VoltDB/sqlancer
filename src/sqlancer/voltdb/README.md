@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 52.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 53.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -71,6 +71,8 @@ Since milestone 51 the STREAMSNAP oracle streams snapshots to the client (`Clien
 the rows each table sends; see [The STREAMSNAP oracle](#the-streamsnap-oracle).
 Since milestone 52 run-sqlancer.sh turns the metrics system on, and the METRICS oracle checks every node's `/metrics`
 against the calls it makes and the tables' rows; see [The METRICS oracle](#the-metrics-oracle).
+Since milestone 53 the DEFRAG oracle compacts tables with `@Defrag` and checks that every index still finds every
+row; see [The DEFRAG oracle](#the-defrag-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -1555,6 +1557,57 @@ Results:
 | `SystemInformationPrometheusRenderer` | 83 of 91 |
 | `MetricHeapCalculator` | 84 of 88 |
 | `VoltTablesMetricExporter` | 156 of 156 (with its `Table`) |
+
+## The DEFRAG oracle
+
+Milestone 53. `@Defrag` (`voltadmin defrag`) compacts a table. It moves the tuples out of the table's emptiest 2 MB
+blocks into others and frees those blocks, and every index of the table must follow each moved tuple. Nothing ran it
+before: `Defrag` had 3 of 52 lines covered, and `DefragSP` 4 of 16.
+
+Each DEFRAG check uses a table of its own, `XDW_<db>`, built so that its blocks fill and empty:
+- every row has the same k, so all rows are in one partition;
+- each row is about 2.5 KB, held in line in 40 `VARCHAR(63 BYTES)` columns, so a few hundred rows fill a block;
+- it has a primary key (k, id), an index on a number n, an index on a string s stored out of line, and a unique index
+  (k, c1).
+
+The oracle keeps the rows the table should hold, and a check:
+1. tops the table up to 1,500 to 3,000 rows;
+2. deletes most of them (every row whose id leaves a chosen remainder) and changes n and s of others;
+3. calls `@Defrag` on the table, full or 1 to 3 blocks; sometimes on every table, including the other oracles' tables
+   in use;
+4. reads the table in full, through the index on n, through the index on s and by the unique index, and each read must
+   return exactly the rows expected;
+5. makes more changes through the indexes (an update by n, a delete by (k, c1), inserts), then reads the table the same
+   ways again.
+
+An index whose entries still point at a tuple's old place would return the wrong rows.
+
+`@Defrag` refuses to run while a snapshot, an elastic operation or a rejoin is in progress; the check is then skipped. Other
+databases' DDL often rejects DEFRAG's insert batches ("planned against a catalog version"). A rejected batch may have
+inserted some of its rows, so DEFRAG reads its expected rows back from the table and goes on filling. At exit DEFRAG
+prints its checks, its compactions, the tuples relocated, the reads compared, the batches refilled and the checks
+given up; the summary has the line.
+
+Making DEFRAG work found a bug in SQLancer, not in VoltDB. `VoltDBConnection` retried every statement that a
+concurrent schema change rejected, `executeBatch` included. But the driver has already cleared a failed batch, so the
+retry ran an empty batch and reported success, and the oracle counted rows that were never inserted. Batches are no
+longer retried, and DEFRAG checks every batch's update counts. No other oracle uses batches.
+
+Results:
+- **Local trials,** 5 minutes on 3 nodes, k=1:
+  - DEFRAG alone, 4 threads: 1,295 checks, 162,370 tuples relocated;
+  - beside NOREC, SNAPSHOT and LOAD: 293 checks;
+  - beside SCHEMA and NOREC, with schema changes throughout: 787 checks, 102,851 tuples relocated, 350 batches
+    refilled.
+- **Standalone programs:** concurrent compactions of four tables, with snapshots or DDL running throughout, lost no
+  rows either.
+- **Coverage:** in run-coverage.sh's 10-minute batch run (13 DEFRAG checks among all the oracles):
+  - `Defrag`: 34 of 52 lines (from 3);
+  - `DefragSP`: 13 of 16 (from 4);
+  - `DefaultCompactionMetricsRecorder`: 24 of 27 (from 13);
+  - the engine's `persistenttable.cpp`, where compaction is: 1,079 of 1,675 lines (from 962).
+
+  `DefragMP`, used for replicated tables, is reached only by compacting every table, which that run did not.
 
 ## The STREAMS oracle
 
