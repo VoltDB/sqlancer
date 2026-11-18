@@ -43,7 +43,8 @@ import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
  * <li>{@code voltdb_procedure_invoked_total}, summed over the cluster, must have grown by the calls made, failed ones
  * included: a single-partition write by the calls times k+1 (every replica runs it), the others by the calls (a
  * single-partition read runs on the partition's leader, a multi-partition procedure on the MP coordinator);</li>
- * <li>for each of the procedures, {@code @Statistics PROCEDURE}'s invocations must equal the metric's;</li>
+ * <li>for each of the procedures, {@code @Statistics PROCEDURE}'s invocations must equal the metric's (while avoiding
+ * known bugs, grow by as much: a deployment change starts the metric afresh, not the statistics, ENG-30728);</li>
  * <li>{@code voltdb_table_tuple_total} of XMP, summed, must be its rows times k+1, and each site's for XMR must be
  * XMR's rows; {@code voltdb_index_entry_count_total} of their primary key indexes the same;</li>
  * <li>{@code @Metrics} (the host the connection reaches) must report the same tuple counts for that host;</li>
@@ -53,7 +54,7 @@ import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
  * A catalog change starts every procedure's counts afresh, so a check holds off DDL (VoltDBConnection.withoutDdl) and
  * the configuration and class changes of CONFIG, LOGIN and JAVAPROC. Counts also start afresh on a node that rejoins,
  * so in runs where nodes fail or the cluster changes, METRICS does nothing; nor in XDCR runs, where the peer's changes
- * arrive as more invocations.
+ * arrive as more invocations. With TLS (--ssl-truststore) the metrics port serves HTTPS.
  */
 public class VoltDBMetricsOracle implements TestOracle<VoltDBGlobalState> {
 
@@ -70,7 +71,7 @@ public class VoltDBMetricsOracle implements TestOracle<VoltDBGlobalState> {
     // a metric line: name{labels} value [timestamp]
     private static final Pattern LINE = Pattern.compile("^([a-zA-Z_:][a-zA-Z0-9_:]*)\\{(.*)\\}\\s+(\\S+)(\\s+\\S+)?$");
     private static final Pattern LABEL = Pattern.compile("([a-zA-Z_][a-zA-Z0-9_]*)=\"((?:[^\"\\\\]|\\\\.)*)\"");
-    private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+    private static volatile HttpClient http;
 
     static {
         Runtime.getRuntime()
@@ -162,6 +163,7 @@ public class VoltDBMetricsOracle implements TestOracle<VoltDBGlobalState> {
         int k = kfactor();
         // the counts as they stand once the last change has been collected: two scrapes alike, 1.2 s apart
         List<Sample> before = settled(p, r, insert, get, count, replicated);
+        Map<String, Long> statsBefore = statistics(Set.of(insert, get, count, replicated));
         if (recreate) {
             for (Sample s : select(before, "voltdb_procedure_invoked_total", "procedure_name", count)) {
                 throw new AssertionError(
@@ -226,7 +228,7 @@ public class VoltDBMetricsOracle implements TestOracle<VoltDBGlobalState> {
             SERIES.addAndGet(
                     select(after, metric, "table_name", p).size() + select(after, metric, "table_name", r).size());
         }
-        compareStatistics(after, expected.keySet());
+        compareStatistics(x.before, after, statsBefore, expected.keySet());
         compareSysproc(p);
         if (recreate) {
             RECREATED.incrementAndGet();
@@ -297,8 +299,8 @@ public class VoltDBMetricsOracle implements TestOracle<VoltDBGlobalState> {
         return null;
     }
 
-    // @Statistics PROCEDURE's invocations of each procedure, summed, must equal voltdb_procedure_invoked_total's
-    private void compareStatistics(List<Sample> after, Set<String> procs) {
+    // @Statistics PROCEDURE's invocations of each of PROCS, summed over the cluster
+    private Map<String, Long> statistics(Set<String> procs) {
         Map<String, Long> stats = new HashMap<>();
         lastQuery = "@Statistics('PROCEDURE', 0)";
         try (CallableStatement call = connection().prepareCall("{call @Statistics(?, ?)}")) {
@@ -307,7 +309,6 @@ public class VoltDBMetricsOracle implements TestOracle<VoltDBGlobalState> {
             try (ResultSet rs = call.executeQuery()) {
                 while (rs.next()) {
                     String name = rs.getString("PROCEDURE");
-                    // the name is the procedure's, possibly with a statement after it
                     if (name != null && procs.contains(name)) {
                         stats.merge(name, rs.getLong("INVOCATIONS"), Long::sum);
                     }
@@ -316,13 +317,27 @@ public class VoltDBMetricsOracle implements TestOracle<VoltDBGlobalState> {
         } catch (SQLException e) {
             skip("@Statistics: " + e.getMessage());
         }
+        return stats;
+    }
+
+    // @Statistics PROCEDURE's invocations of each procedure, summed, must equal voltdb_procedure_invoked_total's.
+    // ENG-30728: a deployment change (@SetYamlConfiguration) starts the metric afresh, not the statistics; while
+    // avoiding known bugs, what each grew by over the check is compared instead
+    private void compareStatistics(List<Sample> before, List<Sample> after, Map<String, Long> statsBefore,
+            Set<String> procs) {
+        Map<String, Long> stats = statistics(procs);
+        boolean growth = state.getDbmsSpecificOptions().avoidKnownBugs;
         for (String proc : procs) {
             long metric = (long) sum(select(after, "voltdb_procedure_invoked_total", "procedure_name", proc));
             long stat = stats.getOrDefault(proc, 0L);
+            if (growth) {
+                metric -= (long) sum(select(before, "voltdb_procedure_invoked_total", "procedure_name", proc));
+                stat -= statsBefore.getOrDefault(proc, 0L);
+            }
             if (metric != stat) {
-                throw new AssertionError(
-                        "voltdb_procedure_invoked_total of " + proc + ", summed over every node's /metrics, is "
-                                + metric + "; @Statistics PROCEDURE's invocations of it sum to " + stat);
+                throw new AssertionError("voltdb_procedure_invoked_total of " + proc
+                        + ", summed over every node's /metrics, " + (growth ? "grew by " : "is ") + metric
+                        + "; @Statistics PROCEDURE's invocations of it " + (growth ? "grew by " : "sum to ") + stat);
             }
         }
     }
@@ -389,12 +404,15 @@ public class VoltDBMetricsOracle implements TestOracle<VoltDBGlobalState> {
     // every node's /metrics, parsed
     private List<Sample> scrape() {
         List<Sample> all = new ArrayList<>();
+        String truststore = state.getDbmsSpecificOptions().sslTruststore;
+        boolean tls = truststore != null && !truststore.isBlank();
         for (String server : state.getDbmsSpecificOptions().metricsServers.split(",")) {
-            String url = "http://" + server.trim() + "/metrics";
+            // with TLS (run-sqlancer.sh --ssl) the metrics port serves HTTPS, with the cluster's certificate
+            String url = (tls ? "https://" : "http://") + server.trim() + "/metrics";
             lastQuery = "GET " + url;
             String body;
             try {
-                HttpResponse<String> resp = HTTP.send(
+                HttpResponse<String> resp = client(truststore).send(
                         HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(30)).GET().build(),
                         HttpResponse.BodyHandlers.ofString());
                 if (resp.statusCode() != 200) {
@@ -432,6 +450,34 @@ public class VoltDBMetricsOracle implements TestOracle<VoltDBGlobalState> {
             }
         }
         return all;
+    }
+
+    // one HTTP client for every check: trusting the cluster's certificate through --ssl-truststore, if any
+    private static HttpClient client(String truststore) {
+        if (http == null) {
+            synchronized (VoltDBMetricsOracle.class) {
+                if (http == null) {
+                    HttpClient.Builder b = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10));
+                    if (truststore != null && !truststore.isBlank()) {
+                        try (java.io.InputStream in = java.nio.file.Files
+                                .newInputStream(java.nio.file.Paths.get(truststore.trim()))) {
+                            java.security.KeyStore ks = java.security.KeyStore.getInstance("JKS");
+                            ks.load(in, "sqlancer".toCharArray());
+                            javax.net.ssl.TrustManagerFactory tmf = javax.net.ssl.TrustManagerFactory
+                                    .getInstance(javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
+                            tmf.init(ks);
+                            javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
+                            ctx.init(null, tmf.getTrustManagers(), null);
+                            b.sslContext(ctx);
+                        } catch (java.io.IOException | java.security.GeneralSecurityException e) {
+                            throw new AssertionError("the truststore " + truststore + " cannot be read", e);
+                        }
+                    }
+                    http = b.build();
+                }
+            }
+        }
+        return http;
     }
 
     private static List<Sample> select(List<Sample> samples, String metric, String label, String value) {
