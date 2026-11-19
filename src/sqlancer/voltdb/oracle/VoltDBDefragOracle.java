@@ -55,6 +55,9 @@ public class VoltDBDefragOracle implements TestOracle<VoltDBGlobalState> {
     // the rows each database's table should hold, by id
     private static final Map<String, TreeMap<Integer, Row>> MODELS = new ConcurrentHashMap<>();
     private static final Map<String, AtomicLong> IDS = new ConcurrentHashMap<>();
+    // the connection of the database each model belongs to: a later database of the same name starts afresh, as with
+    // --xdcr it may write through the other cluster, whose table (no DR table) holds other rows (milestone 55)
+    private static final Map<String, Object> OWNERS = new ConcurrentHashMap<>();
 
     static {
         Runtime.getRuntime()
@@ -97,10 +100,11 @@ public class VoltDBDefragOracle implements TestOracle<VoltDBGlobalState> {
         // every row on one k, so in one partition (whose blocks fill)
         int k = Math.floorMod(db.hashCode(), 1000);
         TreeMap<Integer, Row> model = MODELS.get(db);
-        if (model == null) {
+        if (model == null || OWNERS.get(db) != connection()) {
             create(t);
             model = new TreeMap<>();
             MODELS.put(db, model);
+            OWNERS.put(db, connection());
         }
         try {
             fill(t, k, model, (int) Randomly.getNotCachedInteger(1500, 3000));

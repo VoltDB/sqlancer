@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 54.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 55.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -75,6 +75,7 @@ Since milestone 53 the DEFRAG oracle compacts tables with `@Defrag` and checks t
 row; see [The DEFRAG oracle](#the-defrag-oracle).
 Since milestone 54 the TLSRELOAD oracle rotates the cluster's TLS certificate with `@ReloadSslContext` while it runs;
 see [The TLSRELOAD oracle](#the-tlsreload-oracle).
+Since milestone 55 `--ssl` combines with `--xdcr`, and DR runs over TLS too; see [XDCR over TLS](#xdcr-over-tls-milestone-55).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -378,6 +379,49 @@ kills, 2 graceful stops, 5 rejoins, 12 databases converged, 215 XCONFLICT checks
 10-minute XDCR run, now with kills (4 kills, 3 stops): DR and XDCR 57.6% of their lines (from 52.6%),
 `DRConsumerMpCoordinatorImpl` 379 of 880 (from 216), `ConsumerDRGatewayImpl` 497 of 856 (from 400), `DRConsumerDispatcher`
 551 of 849 (from 413), `DRNormalPartitionBufferReceiver` 460 of 863 (from 388).
+
+### XDCR over TLS (milestone 55)
+
+Until this milestone `--ssl` did not mix with `--xdcr`, so DR's TLS paths never ran: the consumer's TLS setup
+(`DRConsumerSslSetup`), the producer's TLS DR port, and the host name check on DR connections. Now, with both, the
+two clusters share the run's certificate, and DR runs over TLS:
+
+```
+<dr id="1" role="xdcr">
+    <connection source="..." ssl="..." ssl-host-check="true"/>
+</dr>
+<ssl enabled="true" external="true" internal="true" dr="true">
+```
+
+The seed picks two things:
+- how the consumer finds its truststore: `ssl="<file>"`, a properties file naming it (`trustStore=` and
+  `trustStorePassword=`), or `ssl=""`, the server's own truststore;
+- whether the consumer checks the producer's host name (`ssl-host-check="true"`) or not.
+
+A DR producer advertises this machine's address, not localhost, so the certificate now names every IPv4 address of
+the machine as well as localhost and 127.0.0.1 (`cluster/tls/san`), and TLSRELOAD's new certificates keep those
+names. Without them, the host name check refused every DR connection, and the consumer logged only "Could not
+establish connection to DR producer host", never why (ENG-30747).
+
+Both clusters read the same store files, so TLSRELOAD reloads both and checks every node of both. DEFRAG's table is
+not a DR table, so its rows differ between the clusters: a database that reuses a name now starts DEFRAG's model
+afresh, as it may write through the other cluster. Before these two changes, the first trial failed both oracles.
+
+Results:
+- **Local trials** (2 + 2 nodes, k=1, the 36 oracles other than DIFF and SMOKE):
+  - 10 minutes, a properties file and the host name check: passed; 21 databases converged, 38 TLSRELOAD checks
+    (152 handshakes, both clusters), 38 DEFRAG checks, no conflict;
+  - 5 minutes, the server's truststore and no host name check: passed; 12 databases converged, 19 TLSRELOAD checks
+    (76 handshakes), 19 DEFRAG checks, no conflict.
+- **Coverage:** run-coverage.sh has a new run, `xdcrssl` (`--nodes 2 --kfactor 1 --xdcr --ssl`), not among its
+  defaults. In the 10-minute trial above:
+  - `TLSPicoNetwork`: 51 of 56 lines (from 0);
+  - `TLSPicoNIOWriteStream`: 23 of 26 (from 0);
+  - `DRConsumerSslSetup`: 12 of 66 (from 7), and 38 in the 5-minute trial, which took the server's-truststore branch;
+  - `SslSetup`: 180 of 348 (from 177 in the security run, 18 in the XDCR run).
+
+  The one-node security run never opens an internal connection, so the TLS internal network (`TLSPicoNetwork`) ran
+  only now.
 
 ### The XDCR oracle
 
@@ -1274,7 +1318,7 @@ deploys
 so the client and admin ports, and the nodes' connections to each other, use TLS. SQLancer connects through the JDBC
 driver with `ssl=true` and the truststore (`--ssl-truststore`), the PERMS oracle's users too; sqlcmd gets an `--ssl` file
 naming the truststore, and voltadmin `--ssl=nocheck`. The mirror and the JDBC sink, which run without it, are reached
-in the clear. Not with `--xdcr`.
+in the clear. Since milestone 55 it combines with `--xdcr`; see [XDCR over TLS](#xdcr-over-tls-milestone-55).
 
 The nightly job's security run (`sqlancer-1n-k0-security`) adds `--ssl`. In a 4-minute trial on one node with
 security, beside 15 other oracles, PERMS checked 53 statements and IMPORT 577 lines; in a 5-minute one on 3 nodes with
@@ -2264,6 +2308,12 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
+
+The bug below was found in milestone 55.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30747 | XDCR over TLS: when a DR consumer's TLS handshake fails (here the host name check, `ssl-host-check="true"`, against a certificate that does not name the address the producer advertises), the log says only "Failed to connect to Cluster 1 at <host>:<port>: Could not establish connection to DR producer host <host>:<port>", every 10 seconds, never why: `DRConsumerDispatcher` logs only the exception's message, and the cause ("DR SSL handshake failed", an `SSLHandshakeException`) is lost. `repros/ENG-30747.sh`. Minor. | None needed: run-sqlancer.sh's certificate names this machine's addresses. |
 
 The bug below was found in milestone 54.
 

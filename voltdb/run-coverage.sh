@@ -22,7 +22,7 @@ Usage: voltdb/run-coverage.sh --voltdb <instrumented build> --results <dir> [opt
   --results DIR      where to put the runs and the report (created; must not exist)
   --duration SECS    how long each run's SQLancer runs (default 1200)
   --runs LIST        comma-separated runs to make, in order (default: security, kill, export, batch, resize,
-                     xdcr, crash, repros). Also sqlcoverage: "ant sqlcoverage" in --voltdb (VoltDB's own
+                     xdcr, crash, repros). Also xdcrssl: XDCR with TLS, DR included (milestone 55); and sqlcoverage: "ant sqlcoverage" in --voltdb (VoltDB's own
                      randomized SQL suite, against HSQL), for a baseline to compare with (coverage/compare.py)
   --coverage-port N  port of the JaCoCo collector (default 36300)
   --compare-with DIR the results of another run-coverage.sh (normally --runs sqlcoverage) to compare with: also
@@ -187,6 +187,8 @@ if ! $report_only; then
         resize) args=(--nodes 3 --kfactor 1 --sites 8 --resize-interval 120) ;;
         # with kills of the first cluster's nodes (milestone 49)
         xdcr) args=(--nodes 3 --kfactor 1 --sites 4 --xdcr --kill-interval "$kill_every") ;;
+        # XDCR over TLS (milestone 55), DR connections included
+        xdcrssl) args=(--nodes 2 --kfactor 1 --sites 4 --xdcr --ssl) ;;
         crash) args=(--nodes 3 --kfactor 1 --sites 8 --crash-interval "$crash_every") ;;
         repros | sqlcoverage) args=() ;;
         *) die "unknown run $run (see --runs)" ;;

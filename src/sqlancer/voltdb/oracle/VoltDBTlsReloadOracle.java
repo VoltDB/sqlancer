@@ -55,6 +55,9 @@ import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
  * </ol>
  * The truststore keeps the certificates of the last three rotations. Files are written whole and renamed into place, so
  * a connection opened meanwhile never reads half a store. Without --ssl-truststore TLSRELOAD does nothing.
+ * <p>
+ * With --xdcr and --ssl (milestone 55) both clusters read the same stores: every reload runs on both, each must answer
+ * the same STATUS, and every node of both must present the new certificate.
  */
 public class VoltDBTlsReloadOracle implements TestOracle<VoltDBGlobalState> {
 
@@ -111,9 +114,13 @@ public class VoltDBTlsReloadOracle implements TestOracle<VoltDBGlobalState> {
             String alias = "r" + System.currentTimeMillis();
             Path newStore = work.resolve("keystore.jks");
             Path cert = work.resolve("new.cer");
+            // the names the run script's certificate has (cluster/tls/san, milestone 55: this machine's addresses
+            // too, which DR's host name check needs), so that a rotation keeps them
+            Path sanFile = dir.resolve("san");
+            String san = Files.exists(sanFile) ? Files.readString(sanFile).trim() : "dns:localhost,ip:127.0.0.1";
             keytool("-genkeypair", "-alias", "voltdb", "-keyalg", "RSA", "-keysize", "2048", "-validity", "30",
-                    "-dname", "CN=localhost", "-ext", "SAN=dns:localhost,ip:127.0.0.1", "-keystore",
-                    newStore.toString(), "-storetype", "JKS", "-storepass", PASSWORD, "-keypass", PASSWORD);
+                    "-dname", "CN=localhost", "-ext", "SAN=" + san, "-keystore", newStore.toString(), "-storetype",
+                    "JKS", "-storepass", PASSWORD, "-keypass", PASSWORD);
             keytool("-exportcert", "-alias", "voltdb", "-keystore", newStore.toString(), "-storepass", PASSWORD,
                     "-file", cert.toString());
             // the truststore first, whole and renamed into place: the nodes and SQLancer trust both certificates
@@ -174,32 +181,62 @@ public class VoltDBTlsReloadOracle implements TestOracle<VoltDBGlobalState> {
         }
     }
 
-    // @ReloadSslContext(0): its STATUS
+    // @ReloadSslContext(0) on each cluster whose nodes read the stores: with --xdcr both clusters do (milestone 55),
+    // and
+    // a reload through one leaves the other on the old ones. Its STATUS, the same on each, or an AssertionError naming
+    // the cluster that differed
     private long[] reload() {
-        lastQuery = "@ReloadSslContext(0)";
-        try (CallableStatement call = connection().prepareCall("{call @ReloadSslContext(?)}")) {
-            call.setInt(1, 0);
-            try (ResultSet rs = call.executeQuery()) {
-                if (!rs.next()) {
-                    throw new AssertionError(lastQuery + " returned no row");
+        long first = -2;
+        String firstCluster = null;
+        for (List<String> cluster : clusters()) {
+            String where = String.join(",", cluster);
+            lastQuery = "@ReloadSslContext(0) on " + where;
+            Connection c;
+            try {
+                c = DriverManager.getConnection("jdbc:voltdb://" + where,
+                        VoltDBProvider.connectionProperties(state.getDbmsSpecificOptions(),
+                                state.getOptions().getUserName(), state.getOptions().getPassword(), true));
+            } catch (SQLException e) {
+                skip("connect: " + e.getMessage());
+                return new long[] { -1 };
+            }
+            long status;
+            try (Connection open = c; CallableStatement call = open.prepareCall("{call @ReloadSslContext(?)}")) {
+                call.setInt(1, 0);
+                try (ResultSet rs = call.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new AssertionError(lastQuery + " returned no row");
+                    }
+                    status = rs.getLong(1);
+                    lastQuery += " -> STATUS " + status + " " + rs.getString(2);
                 }
-                lastQuery += " -> STATUS " + rs.getLong(1) + " " + rs.getString(2);
-                return new long[] { rs.getLong(1) };
+            } catch (SQLException e) {
+                String m = String.valueOf(e.getMessage());
+                if (m.contains("Connection") || m.contains("connect")) {
+                    // a reload that took the node down (ENG-30745) loses the connection
+                    throw new AssertionError(lastQuery + " got no answer: " + m.split("\n")[0], e);
+                }
+                skip("@ReloadSslContext: " + m);
+                return new long[] { -1 };
             }
-        } catch (SQLException e) {
-            String m = String.valueOf(e.getMessage());
-            if (m.contains("Connection") || m.contains("connect")) {
-                // a reload that took the node down (ENG-30745) loses the connection
-                throw new AssertionError(lastQuery + " got no answer: " + m.split("\n")[0], e);
+            if (firstCluster == null) {
+                first = status;
+                firstCluster = where;
+            } else if (status != first) {
+                throw new AssertionError("@ReloadSslContext(0) answered STATUS " + first + " on " + firstCluster
+                        + " but STATUS " + status + " on " + where + ", which read the same stores");
             }
-            skip("@ReloadSslContext: " + m);
-            return new long[] { -1 };
         }
+        return new long[] { first };
     }
 
     // a TLS handshake with every node's client port must present the certificate EXPECTED
     private void served(String expected, String when) throws Exception {
-        for (String server : servers()) {
+        List<String> all = new ArrayList<>();
+        for (List<String> cluster : clusters()) {
+            all.addAll(cluster);
+        }
+        for (String server : all) {
             String[] hp = server.split(":");
             String got = handshake(hp[0], Integer.parseInt(hp[1]));
             HANDSHAKES.incrementAndGet();
@@ -231,6 +268,21 @@ public class VoltDBTlsReloadOracle implements TestOracle<VoltDBGlobalState> {
             throw new AssertionError("a new TLS connection after the certificate was rotated fails: " + e.getMessage(),
                     e);
         }
+    }
+
+    // the clusters whose nodes read the stores: --servers, and with --xdcr the other cluster too
+    private List<List<String>> clusters() {
+        List<List<String>> all = new ArrayList<>();
+        all.add(servers());
+        String xdcr = state.getDbmsSpecificOptions().xdcr;
+        if (xdcr != null && !xdcr.isBlank()) {
+            List<String> peer = new ArrayList<>();
+            for (String s : xdcr.split(",")) {
+                peer.add(s.trim());
+            }
+            all.add(peer);
+        }
+        return all;
     }
 
     private List<String> servers() {

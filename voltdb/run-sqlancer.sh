@@ -56,7 +56,10 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
                      --crash-interval, --xdcr or --upgrade-from.
   --ssl              TLS (milestone 42): the cluster's client, admin and internal connections use TLS, with a
                      self-signed certificate made for the run (keytool); SQLancer, sqlcmd and voltadmin connect over
-                     it. Not with --xdcr. The mirror and the JDBC sink run without it.
+                     it. With --xdcr (milestone 55), both clusters use the certificate, and DR runs over TLS too
+                     (<ssl dr="true">): by the seed, each consumer connection either names a properties file with the
+                     truststore (ssl="<file>") or uses the server's own truststore (ssl=""), and checks the
+                     producer's host name or not (ssl-host-check). The mirror and the JDBC sink run without it.
   --export           add a file export target ("sqlancer", CSV into each node's voltdbroot/sqlancer_export) for the
                      STREAMS oracle's streams, and check at the end, after @Quiesce, that it wrote every row they got;
                      and a loopback target ("sqlancer_lb", into the table XS_LB) whose rows STREAMS checks as it goes;
@@ -211,9 +214,6 @@ if $security; then
         [ -z "$upgrade_from" ] ||
         die "--security does not mix with --kill-interval, --resize-interval, --crash-interval, --xdcr or --upgrade-from"
     provider_args=(--security true ${provider_args[@]+"${provider_args[@]}"})
-fi
-if $ssl; then
-    ! $xdcr || die "--ssl does not mix with --xdcr"
 fi
 if $export; then
     provider_args=(--export-target sqlancer,sqlancer_http,sqlancer_jdbc --loopback-target sqlancer_lb --ttl-migrate-target sqlancer_lbt ${provider_args[@]+"${provider_args[@]}"})
@@ -422,7 +422,7 @@ stop_cluster() {
         within 120 mirror_cmd "$mirror_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $nodes)" ${admin_creds[@]+"${admin_creds[@]}"} >>"$results/run.log" 2>&1
     fi
     if $xdcr && grep -q "Server completed initialization" "$cluster/xdcr0/voltdbroot/log/volt.log" 2>/dev/null; then
-        within 120 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $xdcr_slot)" >>"$results/run.log" 2>&1
+        within 120 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $xdcr_slot)" ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} >>"$results/run.log" 2>&1
     fi
     # only processes started for this run carry its directory on their command line, and their PIDs are recorded
     for _ in $(seq 1 30); do
@@ -479,7 +479,7 @@ sqlancer_dirty=$(git -C "$repo_dir" status --porcelain 2>/dev/null | grep -v '^?
     echo "xdcr:             $($xdcr && echo "a second cluster of $nodes node(s), k=$kfactor, client ports $(xdcr_hosts client)" || echo no)"
     echo "upgrade:          $([ -n "$upgrade_from" ] && echo "from $upgrade_from ($(upgrade_cmd "$upgrade_from/bin/voltdb" --version 2>&1 | tail -1)) at $upgrade_at s" || echo no)"
     echo "security:         $($security && echo "on: users sqlancer (administrator), reader (sqlancer_read), writer (sqlancer_write)" || echo off)"
-    echo "tls:              $($ssl && echo "on: client, admin and internal connections, a self-signed certificate (cluster/tls)" || echo off)"
+    echo "tls:              $($ssl && echo "on: client, admin and internal connections$($xdcr && echo ", and DR (the consumer's truststore: $([ $((seed / 11 % 2)) -eq 0 ] && echo "a properties file" || echo "the server's"); host name check $([ $((seed / 13 % 2)) -eq 0 ] && echo on || echo off))"), a self-signed certificate (cluster/tls)" || echo off)"
     echo "export:           $($export && echo "file target sqlancer, CSV; HTTP target $http_mode by $http_method$([ "$http_mode" = signed ] && echo ", $http_sig_alg")" || echo no)"
     echo "crash interval:   $([ "$crash_interval" -gt 0 ] && echo "$crash_interval s, every node killed and recovered" || echo never)"
     echo "resize interval:  $([ "$resize_interval" -gt 0 ] && echo "$resize_interval s, $added nodes added and removed by turns" || echo never)"
@@ -497,12 +497,22 @@ if [ "$crash_interval" -gt 0 ]; then
     <commandlog enabled="true" synchronous="true"/>
     <snapshot prefix="auto" frequency="2m" retain="2"/>'
 fi
-# with --xdcr, DR id 1 here and 2 on the peer, each the other's source
+# with --xdcr, DR id 1 here and 2 on the peer, each the other's source; with --ssl too (milestone 55), DR runs over
+# TLS, and the seed picks how the consumer finds its truststore (a properties file, or the server's own) and whether
+# it checks the producer's host name
 dr=
+dr_tls=
+dr_ssl_attr=
 if $xdcr; then
+    if $ssl; then
+        dr_tls=' dr="true"'
+        dr_ssl_file=$([ $((seed / 11 % 2)) -eq 0 ] && echo "$cluster/tls/ssl.properties" || echo "")
+        dr_ssl_attr=" ssl=\"$dr_ssl_file\""
+        [ $((seed / 13 % 2)) -eq 0 ] && dr_ssl_attr+=' ssl-host-check="true"'
+    fi
     dr='
     <dr id="1" role="xdcr">
-        <connection source="'$(xdcr_hosts replication)'"/>
+        <connection source="'$(xdcr_hosts replication)'"'"$dr_ssl_attr"'/>
     </dr>'
 fi
 # with --security, three users; the provider creates the two roles (CREATE ROLE) when it first connects
@@ -584,8 +594,16 @@ fi
 tls=
 if $ssl; then
     mkdir -p "$cluster/tls"
+    # the certificate names localhost and every IPv4 address of this machine: a DR producer advertises the machine's
+    # address, not localhost, and the consumer's host name check (ssl-host-check, milestone 55) needs it named;
+    # TLSRELOAD's new certificates take the same names from cluster/tls/san
+    san="dns:localhost,ip:127.0.0.1"
+    for a in $({ ifconfig 2>/dev/null || ip -4 addr 2>/dev/null; } | awk '/inet /{sub("addr:", "", $2); sub("/.*", "", $2); print $2}' | sort -u); do
+        [ "$a" = 127.0.0.1 ] || san+=",ip:$a"
+    done
+    echo "$san" >"$cluster/tls/san"
     keytool -genkeypair -alias voltdb -keyalg RSA -keysize 2048 -validity 30 -dname "CN=localhost" \
-        -ext "SAN=dns:localhost,ip:127.0.0.1" -keystore "$cluster/tls/keystore.jks" -storetype JKS \
+        -ext "SAN=$san" -keystore "$cluster/tls/keystore.jks" -storetype JKS \
         -storepass sqlancer -keypass sqlancer >"$cluster/tls/keytool.log" 2>&1 &&
         keytool -exportcert -alias voltdb -keystore "$cluster/tls/keystore.jks" -storepass sqlancer \
             -file "$cluster/tls/voltdb.cer" >>"$cluster/tls/keytool.log" 2>&1 &&
@@ -597,7 +615,7 @@ if $ssl; then
     ssl_voltadmin=(--ssl=nocheck)
     provider_args+=(--ssl-truststore "$cluster/tls/truststore.jks")
     tls='
-    <ssl enabled="true" external="true" internal="true">
+    <ssl enabled="true" external="true" internal="true"'"$dr_tls"'>
         <keystore path="'"$cluster/tls/keystore.jks"'" password="sqlancer"/>
         <truststore path="'"$cluster/tls/truststore.jks"'" password="sqlancer"/>
     </ssl>'
