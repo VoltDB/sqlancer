@@ -413,6 +413,15 @@ Results:
     (152 handshakes, both clusters), 38 DEFRAG checks, no conflict;
   - 5 minutes, the server's truststore and no host name check: passed; 12 databases converged, 19 TLSRELOAD checks
     (76 handshakes), 19 DEFRAG checks, no conflict.
+- **Lab build #72** (fork 4b67731e, the job script's `xsec` shape, 30 minutes per run, all 37 oracles), both runs with
+  the host name check:
+  - `2:1:xsec:4`, a properties file: passed; 39 databases converged, 74 TLSRELOAD checks (296 handshakes), 51 DEFRAG
+    checks, no conflict;
+  - `3:1:xsec:4`, the server's truststore: passed; 34 databases converged, 62 TLSRELOAD checks (372 handshakes), 35
+    DEFRAG checks, no conflict.
+
+  In each, one DEFRAG check gave up when an insert batch was refused with USER_ABORT; a check that gives up fails
+  nothing, and the message is cut short in the summary.
 - **Coverage:** run-coverage.sh has a new run, `xdcrssl` (`--nodes 2 --kfactor 1 --xdcr --ssl`), not among its
   defaults. In the 10-minute trial above:
   - `TLSPicoNetwork`: 51 of 56 lines (from 0);
