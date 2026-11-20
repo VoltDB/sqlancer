@@ -1,6 +1,8 @@
 package sqlancer.voltdb.oracle;
 
 import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.sql.CallableStatement;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -182,6 +184,25 @@ public class VoltDBBulkOracle implements TestOracle<VoltDBGlobalState> {
         }
     }
 
+    // ENG-30708: twice an elastic join's index snapshot failed on SWAP's tables, after which the next snapshot crashed
+    // every original node; not reduced. While avoiding known bugs, @SwapTables waits, for up to 15 minutes, while the
+    // --join-hold file exists, which run-sqlancer.sh creates for each grow
+    private void holdDuringJoin() {
+        String hold = state.getDbmsSpecificOptions().joinHold;
+        if (hold == null || !state.getDbmsSpecificOptions().avoidKnownBugs) {
+            return;
+        }
+        long deadline = System.currentTimeMillis() + 15 * 60 * 1000;
+        while (Files.exists(Paths.get(hold)) && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IgnoreMeException();
+            }
+        }
+    }
+
     private void swap(String a, String b) throws SQLException {
         for (String t : new String[] { a, b }) {
             for (int i = (int) Randomly.getNotCachedInteger(0, 10); i > 0; i--) {
@@ -190,6 +211,7 @@ public class VoltDBBulkOracle implements TestOracle<VoltDBGlobalState> {
         }
         List<String> rowsA = rows(a);
         List<String> rowsB = rows(b);
+        holdDuringJoin();
         for (int round = 0; round < (Randomly.getBoolean() ? 2 : 1); round++) {
             lastQuery = "@SwapTables('" + a + "', '" + b + "')";
             long moved;

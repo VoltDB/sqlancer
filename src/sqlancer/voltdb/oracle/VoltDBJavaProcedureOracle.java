@@ -503,6 +503,10 @@ public class VoltDBJavaProcedureOracle implements TestOracle<VoltDBGlobalState> 
             why = updateClasses(connection(), jar, deletes);
         }
         if (why != null) {
+            if (VoltDBErrors.isRetryable(new SQLException(why))) {
+                // refused before it ran, for longer than the connection retries it (see VoltDBConnection)
+                throw new IgnoreMeException();
+            }
             if (mustSucceed) {
                 throw new AssertionError(lastQuery + " should succeed; it failed: " + why);
             }

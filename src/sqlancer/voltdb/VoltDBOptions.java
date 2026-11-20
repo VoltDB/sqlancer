@@ -80,6 +80,9 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--ddl-hold", description = "A file that, while it exists, holds every DDL statement until it is gone (run-sqlancer.sh creates it during each shrink, ENG-30622); ignored with --avoid-known-bugs false")
     public String ddlHold;
 
+    @Parameter(names = "--join-hold", description = "A file that, while it exists, holds the SWAP oracle's @SwapTables until it is gone (run-sqlancer.sh creates it during each grow, ENG-30708); ignored with --avoid-known-bugs false")
+    public String joinHold;
+
     @Parameter(names = "--mirror", description = "Comma-separated host:port client addresses of a second cluster, normally running another VoltDB version: every statement that changes the database is repeated on it, and the DIFF oracle compares the two clusters' rows for the same query")
     public String mirror;
 

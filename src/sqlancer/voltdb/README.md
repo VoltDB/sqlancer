@@ -4,7 +4,7 @@ A SQLancer provider for [VoltDB](https://www.voltactivedata.com/), developed for
 VoltDB schemas, both replicated and partitioned tables, fills them with single-row inserts, upserts, updates and deletes, and runs SQLancer's oracles
 against them through the VoltDB JDBC driver.
 
-**Status: milestone 55.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
+**Status: milestone 56.** The provider creates schemas and data and runs these logic-bug oracles: NoREC (the default,
 milestone 2), TLP WHERE (milestone 3), TLP DISTINCT, TLP HAVING and TLP AGGREGATE (milestone 5), PQS (milestone 6), and
 PARAMS, literals against JDBC parameters (milestone 8). Since milestone 9 each database's rows are also updated,
 upserted and deleted before the oracles run. Since milestone 10 each database also has materialized views, which the
@@ -135,7 +135,7 @@ voltdb/run-sqlancer.sh --voltdb /opt/voltdb --nodes 3 --duration 3600 --seed 7 -
 | `--kill-interval SECS` | 0 (never) | Every SECS seconds, kill a random node, node 0 included, with `kill -9`, restart it and wait until it has rejoined (see [Node failures](#node-failures)). Needs k-safety 1 or more. |
 | `--resize-interval SECS` | 0 (never) | Every SECS seconds, add k+1 nodes with `voltdb start --add`, or remove them again with `voltadmin resize`, by turns (see [Elastic resizes](#elastic-resizes)). Does not mix with `--kill-interval`. |
 | `--crash-interval SECS` | 0 (never) | Every SECS seconds, kill every node at once with `kill -9` and restart them all, which recovers the database from its snapshots and synchronous command log (see [Whole-cluster crashes](#whole-cluster-crashes)). Does not mix with `--kill-interval` or `--resize-interval`. |
-| `--xdcr` | off | Also start a second cluster of the same shape, linked to the first by XDCR (see [XDCR](#xdcr)). Does not mix with `--kill-interval`, `--resize-interval` or `--crash-interval`. |
+| `--xdcr` | off | Also start a second cluster of the same shape, linked to the first by XDCR (see [XDCR](#xdcr)). With `--kill-interval` (milestone 49) or `--resize-interval` (milestone 56), the first cluster's nodes fail or are added and removed; does not mix with `--crash-interval`. |
 | `--upgrade-from DIR` | none | Start the cluster on this older kit, normally the last release, and upgrade it in service to `--voltdb`, one node at a time (see [In-service upgrades](#in-service-upgrades)). Needs k-safety 1 or more. Does not mix with `--kill-interval`, `--resize-interval`, `--crash-interval` or `--xdcr`. |
 | `--upgrade-java-home DIR` | the environment's | JAVA_HOME for the older kit's nodes (16.0.0 needs Java 17 or 21). |
 | `--upgrade-at SECS` | a third of `--duration` | When the upgrade starts. |
@@ -276,6 +276,15 @@ An elastic join, like a rejoin, makes system requests time out for a minute (ENG
 `@SystemCatalog`, which the JDBC driver's `getMetaData()` and `DatabaseMetaData` calls send, fail with "OPS request hit
 sixty second timeout" or "Too many pending stat requests". The connection retries them for up to 150 seconds, with or
 without `--resizes`.
+
+A catalog update (DDL, and JAVAPROC's `@UpdateClasses`) is refused while an elastic operation, a leader promotion or a
+transaction repair is in progress, and the connection retries it for up to `--retry-seconds` (120 by default).
+Milestone 56's coverage baseline had a shrink leave the MP repair blocker held for 128 s, until the next grow
+(ENG-30758): every DDL statement was refused the whole time, and TTL and JAVAPROC, which expect their DDL to succeed,
+failed. A statement still refused once the retries run out is now skipped; the connection prints "Refused past
+--retry-seconds:" for it, and the summary counts those lines. The summary also reads the servers' logs for MP repair
+blockers held more than 60 s ("MP repair blockers held over 60 s"), the signature of ENG-30758, with the time each
+was created.
 
 ## Whole-cluster crashes
 
@@ -2318,10 +2327,11 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
 
-The bug below was found in milestone 56.
+The bugs below were found in milestone 56.
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
+| ENG-30758 | After an elastic remove, a replica-change callback for a removed partition, holding the replica list from between the two removed hosts' failures, ran after the partition was cleaned up and appointed a site on a removed host as its leader. The MP repair blocker that created stayed for 128 s, until the next grow: `MpScheduler` removes it only when every MP master is on a live host. Meanwhile every catalog update (DDL, `@UpdateClasses`) and every rejoin is refused ("while leader promotion or transaction repair are in progress"). Found once by run-coverage.sh's resize run (instrumented build, under SQLancer's load); 14 rounds of a grow/shrink script, with and without load, did not reproduce it. Blocker. | Statements still refused after `--retry-seconds` are skipped and counted, and the summary reports MP repair blockers held over 60 s. |
 | ENG-30757 | The JDBC driver cannot connect to a cluster that requires client certificates (`<ssl clientauthrequired="true">`): it has no keystore property (only `ssl`, `truststore` and `truststorepassword`), and it builds a truststore-only TLS config, so `javax.net.ssl.keyStore` is ignored too. The Java client (`Client2Config.trustStoreWithMutualAuth`) connects. `repros/ENG-30757.sh` (with `repros/tls/MutualAuthRepro.java`). Major. | None: SQLancer works through JDBC, so no run uses mutual TLS, and the server's certificate revocation (CRL) checks on client connections stay untested. |
 
 The bug below was found in milestone 55.
@@ -2362,7 +2372,7 @@ The bugs below were found in milestones 43, 46, 47 and 48.
 | ENG-30696 | DDL fails with "Unable to find reference for catalog item" while `voltadmin stop` takes a node out: the stopping node verifies catalog updates it no longer applies. Lab build #56's upgrade run, on 16.0.0; not reproduced locally. Major. | The error counts as a node failure (VoltDBErrors). |
 | ENG-30704 | A node stopped with `voltadmin stop` sometimes logs FATAL partition detection ("fewer than half of the previous servers") after it has shut down, as the survivors hang up on it before its JVM exits; also after a forced exit, when the orderly shutdown stalls (milestone 51). Milestone 48's graceful stops, under load only; no reliable reproduction. Minor. | FATAL lines a stopped node logs after its shutdown, or its forced exit, are not counted (`chaos.excluded`). |
 | ENG-30705 | A task that `ON ERROR STOP` has stopped runs again after the node that ran it fails: the node that takes over starts its scheduler again (RUNNING) and runs the procedure once more. Found by TASK in lab build #61's kill run; `repros/ENG-30705.sh`; 16.0.0 too. Major. | While `--avoid-known-bugs` is true and nodes fail, TASK does not check the state of a task stopped by an error (the row counts still are). |
-| ENG-30708 | During an elastic join, the join's own index snapshot failed on some partitions ("Elastic streaming was invoked without proper activation", "Table streamer has no streams to serialize more"), and the join stayed at "Building index for data migration"; the next command-log truncation snapshot was refused by the engine ("COW context activation is not allowed while elastic indexing is in progress") and every original node crashed ("Failed to activate snapshot stream"), losing the cluster. Found by run-coverage.sh's resize run (milestone 50), once in two runs of the same seed; not reduced: snapshot saves, truncation snapshots and table swaps during a join did not reproduce it alone. Blocker. | None: a resize run can fail with FATAL lines. |
+| ENG-30708 | During an elastic join, the join's own index snapshot failed on some partitions ("Elastic streaming was invoked without proper activation", "Table streamer has no streams to serialize more"), and the join stayed at "Building index for data migration"; the next command-log truncation snapshot was refused by the engine ("COW context activation is not allowed while elastic indexing is in progress") and every original node crashed ("Failed to activate snapshot stream"), losing the cluster. Found by run-coverage.sh's resize run (milestone 50), once in two runs of the same seed; seen again in milestone 56's first full XDCR resize trial, on the same SWAP tables (XWPA), with the index snapshot starting while the join's truncation snapshot ran. Not reduced: snapshot saves, truncation snapshots and table swaps during a join did not reproduce it alone, nor did 6 joins under constant swaps with the join's truncation snapshot (milestone 56). Blocker. | While `--avoid-known-bugs` is true, SWAP's `@SwapTables` waits during each grow (`--join-hold`, milestone 56). |
 | ENG-30710 | A user removed by `@SetYamlConfiguration` (`.users[name]=null`) still logs in when an `@UpdateClasses` runs at the same time: `@GetYamlConfiguration` no longer lists the user, but the update applies with the catalog unchanged (`securityChange=false`), so authentication keeps the user until the next catalog change. 16.0.0 too. Found by LOGIN beside JAVAPROC (milestone 50) in lab build #64's security run; `repros/ENG-30710.sh` (with `repros/users/RemovedUserRepro.java`) reproduces it at the first user. Critical. | While `--avoid-known-bugs` is true, JAVAPROC's `@UpdateClasses` calls hold the lock LOGIN and CONFIG share. |
 | ENG-30711 | `@UpdateClasses` restarts a task that `ON ERROR STOP` stopped: with classes changed, `TaskManager` recreates every task's handler, the stopped one included, which shows RUNNING and runs its procedure again. An ordinary DDL change does not. 16.0.0 too. Found by TASK beside JAVAPROC (milestone 50) in lab build #65's security run; `repros/ENG-30711.sh`. Major. | While `--avoid-known-bugs` is true, TASK's checks and JAVAPROC's `@UpdateClasses` calls exclude each other (a read-write lock). |
 

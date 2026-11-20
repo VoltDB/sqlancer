@@ -25,6 +25,9 @@ public final class VoltDBErrors {
             // blocker refuses DDL, before it starts, while a rejoin, leader promotion, transaction repair or an
             // interrupted catalog update is in progress ("Can't do catalog update(@AdHoc) while ...")
             "Can't do catalog update(@AdHoc) while",
+            // the same for @UpdateClasses (the JAVAPROC oracle), refused while an elastic join or remove is in
+            // progress (run-sqlancer.sh --resize-interval; the coverage baseline of milestone 56)
+            "Can't do catalog update(@UpdateClasses) while",
             // another connection's catalog update (@UpdateCore) is still running; its blocker can be gone when the
             // node that held it failed, so a DDL statement gets this far and is refused before it stages anything
             // (UpdateApplicationBase). Seen once node 0 was among the nodes killed (milestone 15).

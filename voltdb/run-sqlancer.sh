@@ -42,7 +42,8 @@ Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
   --xdcr             also start a second cluster of the same shape, linked to the first by XDCR (active-active
                      DR), and run the provider with --xdcr: each database writes through one of the two, its DDL
                      runs on both, and the XDCR oracle compares their rows. With --kill-interval, the first
-                     cluster's nodes are killed and rejoined (milestone 49). Not with --resize-interval or
+                     cluster's nodes are killed and rejoined (milestone 49); with --resize-interval, the first
+                     cluster grows and shrinks while the second keeps its size (milestone 56). Not with
                      --crash-interval.
   --upgrade-from DIR start the cluster on this older VoltDB kit (normally the last release) and, at
                      --upgrade-at, upgrade it in service to --voltdb: one node at a time, voltadmin stop, then
@@ -225,9 +226,10 @@ $security && admin_creds=(-u sqlancer -p sqlancer)
 ssl_sqlcmd=()
 ssl_voltadmin=()
 if $xdcr; then
-    # with --kill-interval (milestone 49), the nodes killed and rejoined are the first cluster's; the second stays up
-    [ "$resize_interval" -eq 0 ] && [ "$crash_interval" -eq 0 ] ||
-        die "--xdcr does not mix with --resize-interval or --crash-interval"
+    # with --kill-interval (milestone 49), the nodes killed and rejoined are the first cluster's, and with
+    # --resize-interval (milestone 56) the nodes added and removed are too; the second cluster keeps its nodes. The
+    # added nodes are initialized with the first cluster's deployment, its DR connection to the second included.
+    [ "$crash_interval" -eq 0 ] || die "--xdcr does not mix with --crash-interval"
 fi
 if [ "$crash_interval" -gt 0 ]; then
     # a crash drops every call in flight and every connection; the provider skips what it interrupted and waits for
@@ -345,6 +347,11 @@ if [ "$resize_interval" -gt 0 ] || [ "$kill_interval" -gt 0 ]; then
     # DDL waits while this file exists, which shrink and each kill create (the provider ignores it with
     # --avoid-known-bugs false)
     provider_args+=(--ddl-hold "$results/ddl.hold")
+fi
+if [ "$resize_interval" -gt 0 ]; then
+    # @SwapTables waits while this file exists, which each grow creates (ENG-30708; ignored with --avoid-known-bugs
+    # false)
+    provider_args+=(--join-hold "$results/join.hold")
 fi
 cluster=$results/cluster
 # a server JVM that crashes writes its error report (the native stack, and the statement and registers at the crash)
@@ -1231,7 +1238,7 @@ shrink_steps() {
     return 1
 }
 resize_loop() {
-    local n=0 t0
+    local n=0 t0 rc
     while true; do
         for _ in $(seq 1 "$resize_interval"); do
             [ -e "$results/resize.stop" ] && return 0
@@ -1240,7 +1247,14 @@ resize_loop() {
         n=$((n + 1))
         t0=$SECONDS
         echo "$(date '+%H:%M:%S') grow $n: adding $added node(s)" >>"$results/resize.log"
-        if ! grow $n; then
+        # ENG-30708: @SwapTables is held (the provider's --join-hold) from a few seconds before the grow, letting a swap
+        # in flight finish, until it is done
+        touch "$results/join.hold"
+        sleep 3
+        grow $n
+        rc=$?
+        rm -f "$results/join.hold"
+        if [ $rc -ne 0 ]; then
             echo "$(date '+%H:%M:%S') grow $n: FAILED after $((SECONDS - t0)) s" >>"$results/resize.log"
             return 1
         fi
@@ -1533,6 +1547,18 @@ for f in "$results"/servers/add*-*/volt.log; do
     case $f in *-rejected*) continue ;; esac
     fatal=$((fatal + $(grep -c " FATAL " "$f")))
 done
+# MP repair blockers held more than 60 s (ENG-30758, milestone 56): LeaderAppointer creates /db/action_blockers/mp_repair_blocker
+# at a leader promotion and the MPI removes it once its repair is done, normally within a second; while it is held,
+# DDL, @UpdateClasses and rejoins are refused. The creations and removals of every node's log (the cluster's own,
+# not the XDCR peer's), in time order (UTC, as the logs are); a hold counts from its first creation to the next removal,
+# or to now if none followed
+long_repairs=$(cat "$results"/servers/node*/volt.log "$results"/servers/add*-*/volt.log 2>/dev/null |
+    grep -h "action_blockers/mp_repair_blocker successfully" | sort |
+    awk -v now="$(date -u +%H:%M:%S)" '{ split($2, t, /[:,]/); s = t[1] * 3600 + t[2] * 60 + t[3] }
+        / Create / { if (!held) { held = 1; since = s; at = $2 } }
+        / Remove / { if (held && s - since > 60) { n++; list = list (list ? ", " : "") at " for " s - since " s" } held = 0 }
+        END { split(now, t, ":"); if (held && t[1] * 3600 + t[2] * 60 + t[3] - since > 60) { n++; list = list (list ? ", " : "") at " until the end" }
+            print n + 0 (n ? " (" list ")" : "") }')
 
 # --- summary -----------------------------------------------------------------------------------------------------
 
@@ -1570,6 +1596,8 @@ result=PASS
     grep -m1 "^TLSRELOAD checks:" "$results/sqlancer/out.log" 2>/dev/null
     $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP $http_mode by $http_method$([ "${bad_signatures:-0}" -eq 0 ] || echo ", $bad_signatures BAD SIGNATURES"), ${jdbc_rows:-0} through JDBC, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)"); gap fills: ${gap_fills:-0} (HTTP held across ${gap_holds:-0} kills)"
     echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
+    echo "statements refused past --retry-seconds, skipped: $(grep -c "^Refused past --retry-seconds:" "$results/sqlancer/out.log" 2>/dev/null || true)"
+    echo "MP repair blockers held over 60 s (ENG-30758): $long_repairs"
     [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, ${stops:-0} graceful stops, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
     [ "$crash_interval" -gt 0 ] && echo "crashes: $crashes crashes, ${shutdowns:-0} shutdowns with --save, $recoveries recoveries$($crash_failed && echo ", a recovery FAILED (crash.log)")"
     [ -n "$upgrade_from" ] && echo "upgrade: $upgraded of $nodes nodes upgraded$($upgrade_failed && echo ", FAILED (upgrade.log)")"

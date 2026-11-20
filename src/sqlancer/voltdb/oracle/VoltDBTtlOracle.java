@@ -14,6 +14,7 @@ import sqlancer.IgnoreMeException;
 import sqlancer.Randomly;
 import sqlancer.Reproducer;
 import sqlancer.common.oracle.TestOracle;
+import sqlancer.voltdb.VoltDBErrors;
 import sqlancer.voltdb.VoltDBProvider.VoltDBGlobalState;
 
 /**
@@ -254,6 +255,10 @@ public class VoltDBTtlOracle implements TestOracle<VoltDBGlobalState> {
         try (Statement st = state.getConnection().createStatement()) {
             st.execute(sql);
         } catch (SQLException e) {
+            if (VoltDBErrors.isRetryable(e)) {
+                // refused before it ran, for longer than the connection retries it (see VoltDBConnection)
+                throw new IgnoreMeException();
+            }
             if (!String.valueOf(e.getMessage()).contains("already exists")) {
                 throw new AssertionError(sql, e);
             }

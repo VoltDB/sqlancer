@@ -320,6 +320,14 @@ public class VoltDBConnection extends SQLConnection {
                                     Thread.sleep(ThreadLocalRandom.current().nextLong(20, 100));
                                     continue;
                                 }
+                                if (method.getName().startsWith("execute") && cause instanceof SQLException
+                                        && VoltDBErrors.isRetryable((SQLException) cause)) {
+                                    // still refused after --retry-seconds: the summary counts these lines, as a
+                                    // refusal that lasts this long is not a concurrent change's (ENG-30758: an MP
+                                    // repair blocker left behind by an elastic remove)
+                                    System.out.println("Refused past --retry-seconds: "
+                                            + String.valueOf(cause.getMessage()).split("\n")[0]);
+                                }
                                 Throwable thrown = skippedIfNodeFailure(cause);
                                 if (thrown instanceof IgnoreMeException) {
                                     failureSeen = true;
