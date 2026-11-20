@@ -2318,6 +2318,12 @@ The bugs below were found in milestone 29's lab run of the milestones before it.
 | --- | --- | --- |
 | ENG-30628 | A LEFT JOIN of a partitioned table P whose WHERE clause compares a scalar subquery with P's primary key (its partitioning column) fails to plan: "SQL error while compiling query: java.lang.IllegalStateException" (`SubPlanAssembler.buildIndexAccessPlanForTable`). The inner join, and the WHERE clause on P alone, plan. Also on 16.0.0. Found by TLP AGGREGATE in lab build #41 (the upgrade run, after the upgrade). | No scalar subqueries in a query with an outer join. |
 
+The bug below was found in milestone 56.
+
+| Ticket | Issue | Workaround |
+| --- | --- | --- |
+| ENG-30757 | The JDBC driver cannot connect to a cluster that requires client certificates (`<ssl clientauthrequired="true">`): it has no keystore property (only `ssl`, `truststore` and `truststorepassword`), and it builds a truststore-only TLS config, so `javax.net.ssl.keyStore` is ignored too. The Java client (`Client2Config.trustStoreWithMutualAuth`) connects. `repros/ENG-30757.sh` (with `repros/tls/MutualAuthRepro.java`). Major. | None: SQLancer works through JDBC, so no run uses mutual TLS, and the server's certificate revocation (CRL) checks on client connections stay untested. |
+
 The bug below was found in milestone 55.
 
 | Ticket | Issue | Workaround |
