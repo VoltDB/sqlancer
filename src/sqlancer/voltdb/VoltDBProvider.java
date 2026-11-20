@@ -63,6 +63,10 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
     private static final AtomicBoolean ROLES_CREATED = new AtomicBoolean();
     // how long a new database waits for XDCR to apply what is queued before it drops its name's leftovers (ENG-30630)
     private static final long DR_APPLIED_MILLIS = 60_000;
+    // with resizes (milestone 56): after a shrink the other cluster's DR consumer keeps trying the removed hosts for
+    // about a minute, and replication from this cluster waits until it moves on; 60 s ran out 5 times in a 15-minute
+    // trial, and each drop that followed paused the stream for good (ENG-30630)
+    private static final long DR_APPLIED_MILLIS_RESIZES = 240_000;
     // VoltDB's default DR flush interval (deployment systemsettings/flushinterval/dr) is 1 s; a little more
     private static final long DR_FLUSH_MILLIS = 1_500;
 
@@ -211,7 +215,9 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
             // on their way to this one when it drops and recreates the tables pause that DR stream for good; so
             // everything either cluster has queued for the other is applied first
             if (globalState.getDbmsSpecificOptions().avoidKnownBugs) {
-                awaitDrApplied(sqlCon, peerCon);
+                awaitDrApplied(
+                        globalState.getDbmsSpecificOptions().resizes ? DR_APPLIED_MILLIS_RESIZES : DR_APPLIED_MILLIS,
+                        sqlCon, peerCon);
             }
             dropLeftovers(globalState, sqlCon, true);
             dropLeftovers(globalState, peerCon, false);
@@ -293,7 +299,7 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
     // LASTQUEUEDDRID counts only flushed DR buffers, and a buffer is flushed every DR_FLUSH_MILLIS: rows this
     // database's name wrote in the last second are not queued yet, and they paused a DR stream once its tables were
     // dropped (lab build #46). So the queues are read after a flush.
-    private static void awaitDrApplied(VoltDBConnection... clusters) throws SQLException {
+    private static void awaitDrApplied(long waitMillis, VoltDBConnection... clusters) throws SQLException {
         try {
             Thread.sleep(DR_FLUSH_MILLIS);
         } catch (InterruptedException e) {
@@ -304,7 +310,7 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
         for (VoltDBConnection c : clusters) {
             queued.add(drProducer(c));
         }
-        long deadline = System.currentTimeMillis() + DR_APPLIED_MILLIS;
+        long deadline = System.currentTimeMillis() + waitMillis;
         for (int i = 0; i < clusters.length; i++) {
             while (true) {
                 Map<String, long[]> now = drProducer(clusters[i]);
@@ -321,7 +327,7 @@ public class VoltDBProvider extends SQLProviderAdapter<VoltDBProvider.VoltDBGlob
                 if (System.currentTimeMillis() >= deadline) {
                     // dropping now may pause the DR stream for good (ENG-30630); said so the run's log explains it
                     System.err.println("XDCR: what one cluster queued for the other was not applied within "
-                            + DR_APPLIED_MILLIS / 1000 + " s; dropping the earlier database's tables anyway");
+                            + waitMillis / 1000 + " s; dropping the earlier database's tables anyway");
                     break;
                 }
                 try {

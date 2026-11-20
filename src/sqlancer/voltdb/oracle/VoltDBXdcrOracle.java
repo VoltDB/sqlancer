@@ -29,7 +29,10 @@ import sqlancer.voltdb.VoltDBSchema.VoltDBTable;
 public class VoltDBXdcrOracle implements TestOracle<VoltDBGlobalState> {
 
     private static final long CONVERGE_MILLIS = 60_000;
-    // where nodes fail (milestone 49), a rejoining node's partitions catch up on DR only once it has rejoined
+    // where nodes fail (milestone 49), a rejoining node's partitions catch up on DR only once it has rejoined; and
+    // where the cluster resizes (milestone 56), the other cluster's DR consumer keeps trying the removed hosts for
+    // about
+    // a minute after a shrink before it moves on
     private static final long CONVERGE_MILLIS_NODE_FAILURES = 180_000;
     private static final String ERROR = "error: ";
 
@@ -53,7 +56,8 @@ public class VoltDBXdcrOracle implements TestOracle<VoltDBGlobalState> {
             names.add(table.getName());
         }
         names.addAll(state.getViews().keySet());
-        long converge = state.getDbmsSpecificOptions().nodeFailures ? CONVERGE_MILLIS_NODE_FAILURES : CONVERGE_MILLIS;
+        long converge = state.getDbmsSpecificOptions().nodeFailures || state.getDbmsSpecificOptions().resizes
+                ? CONVERGE_MILLIS_NODE_FAILURES : CONVERGE_MILLIS;
         long deadline = System.currentTimeMillis() + converge;
         List<String> differences;
         while (true) {

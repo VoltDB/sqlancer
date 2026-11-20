@@ -441,6 +441,31 @@ Results:
   The one-node security run never opens an internal connection, so the TLS internal network (`TLSPicoNetwork`) ran
   only now.
 
+### XDCR with elastic resizes (milestone 56)
+
+Milestone 56's coverage baseline still had the DR consumer's multi-partition coordinator at 43% of its lines
+(`DRConsumerMpCoordinatorImpl`), its failure handling at 20%, and no run changed a DR cluster's partition count.
+`--xdcr` now combines with `--resize-interval`: the first cluster grows by k+1 nodes and shrinks back by turns, as in
+any resize run, while the second keeps its nodes. The added nodes get the first cluster's deployment, its DR
+connection included, so the producer gains and loses partitions while the other cluster consumes from it.
+
+What the first trials needed:
+- After a shrink, the other cluster's DR consumer keeps trying the removed hosts for about a minute ("Host ... may
+  have left producer cluster 1", then "appears to have left") before it moves on, and replication from the resized
+  cluster waits. The provider's wait before a database reuses a name (see [XDCR](#xdcr)) ran out 5 times in a
+  15-minute trial at 60 s, and each drop after it paused the DR stream for good (ENG-30630). With `--resizes` the
+  wait is now 240 s, and the XDCR oracle allows 180 s for convergence, as with node failures.
+- The first two full trials lost a join to ENG-30708 (see the known bugs), both times on a partitioned SWAP table; in
+  the second no swap ran during the join, as they were held. While avoiding known bugs, SWAP now swaps only
+  replicated tables in a run with `--resizes`.
+
+Results:
+- **Local trial** (3 + 3 nodes, k=1, 4 sites per host, a resize every 120 s, 15 minutes, the 36 oracles other than
+  DIFF and SMOKE): passed; 3 grows and 3 shrinks, 23 databases converged, 67 XCONFLICT checks, 96 SWAP checks, no
+  conflict logged, no DR wait ran out.
+- run-coverage.sh has a new run, `xresize` (`--nodes 3 --kfactor 1 --sites 4 --xdcr --resize-interval 120`), not among
+  its defaults, and the job script a new shape, `xrN` (`3:1:xr120:4`).
+
 ### The XDCR oracle
 
 XDCR reads every table and materialized view of the database on both clusters and compares their rows as multisets.
@@ -2372,7 +2397,7 @@ The bugs below were found in milestones 43, 46, 47 and 48.
 | ENG-30696 | DDL fails with "Unable to find reference for catalog item" while `voltadmin stop` takes a node out: the stopping node verifies catalog updates it no longer applies. Lab build #56's upgrade run, on 16.0.0; not reproduced locally. Major. | The error counts as a node failure (VoltDBErrors). |
 | ENG-30704 | A node stopped with `voltadmin stop` sometimes logs FATAL partition detection ("fewer than half of the previous servers") after it has shut down, as the survivors hang up on it before its JVM exits; also after a forced exit, when the orderly shutdown stalls (milestone 51). Milestone 48's graceful stops, under load only; no reliable reproduction. Minor. | FATAL lines a stopped node logs after its shutdown, or its forced exit, are not counted (`chaos.excluded`). |
 | ENG-30705 | A task that `ON ERROR STOP` has stopped runs again after the node that ran it fails: the node that takes over starts its scheduler again (RUNNING) and runs the procedure once more. Found by TASK in lab build #61's kill run; `repros/ENG-30705.sh`; 16.0.0 too. Major. | While `--avoid-known-bugs` is true and nodes fail, TASK does not check the state of a task stopped by an error (the row counts still are). |
-| ENG-30708 | During an elastic join, the join's own index snapshot failed on some partitions ("Elastic streaming was invoked without proper activation", "Table streamer has no streams to serialize more"), and the join stayed at "Building index for data migration"; the next command-log truncation snapshot was refused by the engine ("COW context activation is not allowed while elastic indexing is in progress") and every original node crashed ("Failed to activate snapshot stream"), losing the cluster. Found by run-coverage.sh's resize run (milestone 50), once in two runs of the same seed; seen again in milestone 56's first full XDCR resize trial, on the same SWAP tables (XWPA), with the index snapshot starting while the join's truncation snapshot ran. Not reduced: snapshot saves, truncation snapshots and table swaps during a join did not reproduce it alone, nor did 6 joins under constant swaps with the join's truncation snapshot (milestone 56). Blocker. | While `--avoid-known-bugs` is true, SWAP's `@SwapTables` waits during each grow (`--join-hold`, milestone 56). |
+| ENG-30708 | During an elastic join, the join's own index snapshot failed on some partitions ("Elastic streaming was invoked without proper activation", "Table streamer has no streams to serialize more"), and the join stayed at "Building index for data migration"; the next command-log truncation snapshot was refused by the engine ("COW context activation is not allowed while elastic indexing is in progress") and every original node crashed ("Failed to activate snapshot stream"), losing the cluster. Found by run-coverage.sh's resize run (milestone 50), once in two runs of the same seed; seen twice more in milestone 56's XDCR resize trials, each time on a partitioned table of the SWAP check, with the index snapshot starting while the join's truncation snapshot ran; the second time no swap ran during the join (they were held), so it is what earlier swaps left behind, and the join hung at "Building index" for 10 minutes instead (no later snapshot crashed it). Not reduced: snapshot saves, truncation snapshots and table swaps during a join did not reproduce it alone, nor did 6 joins under constant swaps with the join's truncation snapshot (milestone 56). Blocker. | While `--avoid-known-bugs` is true, SWAP swaps only replicated tables in a run with `--resizes` (milestone 56); the elastic index covers partitioned tables only. |
 | ENG-30710 | A user removed by `@SetYamlConfiguration` (`.users[name]=null`) still logs in when an `@UpdateClasses` runs at the same time: `@GetYamlConfiguration` no longer lists the user, but the update applies with the catalog unchanged (`securityChange=false`), so authentication keeps the user until the next catalog change. 16.0.0 too. Found by LOGIN beside JAVAPROC (milestone 50) in lab build #64's security run; `repros/ENG-30710.sh` (with `repros/users/RemovedUserRepro.java`) reproduces it at the first user. Critical. | While `--avoid-known-bugs` is true, JAVAPROC's `@UpdateClasses` calls hold the lock LOGIN and CONFIG share. |
 | ENG-30711 | `@UpdateClasses` restarts a task that `ON ERROR STOP` stopped: with classes changed, `TaskManager` recreates every task's handler, the stopped one included, which shows RUNNING and runs its procedure again. An ordinary DDL change does not. 16.0.0 too. Found by TASK beside JAVAPROC (milestone 50) in lab build #65's security run; `repros/ENG-30711.sh`. Major. | While `--avoid-known-bugs` is true, TASK's checks and JAVAPROC's `@UpdateClasses` calls exclude each other (a read-write lock). |
 

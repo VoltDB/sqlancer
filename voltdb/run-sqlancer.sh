@@ -348,11 +348,6 @@ if [ "$resize_interval" -gt 0 ] || [ "$kill_interval" -gt 0 ]; then
     # --avoid-known-bugs false)
     provider_args+=(--ddl-hold "$results/ddl.hold")
 fi
-if [ "$resize_interval" -gt 0 ]; then
-    # @SwapTables waits while this file exists, which each grow creates (ENG-30708; ignored with --avoid-known-bugs
-    # false)
-    provider_args+=(--join-hold "$results/join.hold")
-fi
 cluster=$results/cluster
 # a server JVM that crashes writes its error report (the native stack, and the statement and registers at the crash)
 # here rather than into the directory the script was started from, so that the results keep it (lab build #51)
@@ -1238,7 +1233,7 @@ shrink_steps() {
     return 1
 }
 resize_loop() {
-    local n=0 t0 rc
+    local n=0 t0
     while true; do
         for _ in $(seq 1 "$resize_interval"); do
             [ -e "$results/resize.stop" ] && return 0
@@ -1247,14 +1242,7 @@ resize_loop() {
         n=$((n + 1))
         t0=$SECONDS
         echo "$(date '+%H:%M:%S') grow $n: adding $added node(s)" >>"$results/resize.log"
-        # ENG-30708: @SwapTables is held (the provider's --join-hold) from a few seconds before the grow, letting a swap
-        # in flight finish, until it is done
-        touch "$results/join.hold"
-        sleep 3
-        grow $n
-        rc=$?
-        rm -f "$results/join.hold"
-        if [ $rc -ne 0 ]; then
+        if ! grow $n; then
             echo "$(date '+%H:%M:%S') grow $n: FAILED after $((SECONDS - t0)) s" >>"$results/resize.log"
             return 1
         fi
