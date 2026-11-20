@@ -403,7 +403,12 @@ public class VoltDBDefragOracle implements TestOracle<VoltDBGlobalState> {
 
     private void skip(String why) {
         String w = String.valueOf(why).split("\n")[0];
-        SKIPS.merge(w.length() > 70 ? w.substring(0, 70) : w, 1L, Long::sum);
+        // the summary counts each reason by its first 70 characters; the first time, the whole of it goes to standard
+        // error (lab build #72 gave up on an insert "(USER_ABORT): 'E=2...", cut short there)
+        if (SKIPS.merge(w.length() > 70 ? w.substring(0, 70) : w, 1L, Long::sum) == 1L) {
+            String all = String.valueOf(why);
+            System.err.println("DEFRAG gives up a check: " + (all.length() > 2000 ? all.substring(0, 2000) : all));
+        }
         throw new IgnoreMeException();
     }
 
