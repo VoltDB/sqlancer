@@ -17,6 +17,11 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.voltdb.VoltTable;
+import org.voltdb.VoltType;
+import org.voltdb.client.ClientResponse;
+import org.voltdb.client.ProcCallException;
+
 import sqlancer.IgnoreMeException;
 import sqlancer.Randomly;
 import sqlancer.Reproducer;
@@ -347,11 +352,40 @@ public class VoltDBSnapshotOracle implements TestOracle<VoltDBGlobalState> {
             }
         } catch (SQLException e) {
             String m = String.valueOf(e.getMessage());
-            // a restore that found duplicates reports that it failed; one that a node failure stopped is skipped
-            if (duplicatesPath == null || !m.contains("Restore failed to complete")) {
+            // a restore that found duplicates reports that it failed; one that a node failure stopped is skipped,
+            // and so is one refused because the snapshot lacks partitions (a FAILURE row "Table: T is missing 4 out
+            // of 10 total partitions", after a shrink removed the nodes holding their files), which changed nothing
+            if (duplicatesPath == null || !m.contains("Restore failed to complete") || missingPartitions(e)) {
                 throw new IgnoreMeException();
             }
         }
+    }
+
+    // whether a failed restore's result table says the snapshot lacks some of the table's partitions
+    private static boolean missingPartitions(Throwable thrown) {
+        for (Throwable t = thrown; t != null; t = t.getCause()) {
+            if (t instanceof ProcCallException) {
+                ClientResponse r = ((ProcCallException) t).getClientResponse();
+                if (r == null || r.getResults() == null) {
+                    return false;
+                }
+                for (VoltTable table : r.getResults()) {
+                    table.resetRowPosition();
+                    while (table.advanceRow()) {
+                        for (int c = 0; c < table.getColumnCount(); c++) {
+                            if (table.getColumnType(c) == VoltType.STRING) {
+                                String v = table.getString(c);
+                                if (v != null && v.matches("(?s).*is missing \\d+ out of \\d+ total partitions.*")) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                return false;
+            }
+        }
+        return false;
     }
 
     // @SnapshotScan of a node's snapshot directory must list the snapshot, of the table alone

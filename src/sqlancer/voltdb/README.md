@@ -465,6 +465,14 @@ Results:
   conflict logged, no DR wait ran out.
 - run-coverage.sh has a new run, `xresize` (`--nodes 3 --kfactor 1 --sites 4 --xdcr --resize-interval 120`), not among
   its defaults, and the job script a new shape, `xrN` (`3:1:xr120:4`).
+- **Lab build #74** (`3:1:xr120:4`, 30 minutes, the 37 oracles, a 16.0.0 mirror): failed after 21 minutes (4 grows, 3
+  shrinks), on ENG-30056 (see the known bugs), filed earlier from replication-group2. At the first shrink every node of
+  the resized cluster merged its DR consumer trackers under cluster id -1 and kept its own older positions for the
+  other cluster ("shipped map carries no entries for synced cluster -1 (unexpected)", "PRESERVE local entries for
+  cluster 2"); the other cluster had already truncated past them, so from then on it refused the consumer's
+  subscription every 30 s ("DR does not have the next binary log in the sequence for partition 0. Partition 0 is no
+  longer covered"). 10 databases converged before that; the next 4 did not within 180 s. There is no workaround short
+  of not shrinking, so `xr120` stays out of the job's default CLUSTERS until ENG-30056 is fixed.
 
 ### The XDCR oracle
 
@@ -653,8 +661,10 @@ server.
 
 The job's parameters change a manual run: `CLUSTERS` (runs as `nodes:kfactor[:chaos[:sites]]`, where chaos is the
 seconds between node failures, `r` and the seconds between elastic resizes, `c` and the seconds between crashes, or
-`x` for an XDCR pair, `u` for an in-service upgrade from `MIRROR_VERSION`, `sec` for security, or `exp` for export, and
-sites the sites per host, default `3:1:300 1:0:sec 3:2:exp:2 3:1:r120 3:1:x:4 3:1:u 3:1:c600`), `DURATION` (seconds
+`x` for an XDCR pair (`xN` with a node failure every N seconds, `xsec` over TLS, `xrN` with a resize every N seconds),
+`u` for an in-service upgrade from `MIRROR_VERSION`, `sec` for security, or `exp` for export, and sites the sites per
+host, default `3:1:300 1:0:sec 3:2:exp300:2 3:1:r120 3:1:x300:4 3:1:xsec:4 3:1:u 3:1:c600`; `xsec` joined the
+defaults in milestone 56), `DURATION` (seconds
 per run, default 2700), `ORACLES`, `SEED`, `EXTRA_ARGS` (provider options) and `SQLANCER_REF`. A run of the job alone
 needs a kit: give `releasedir`, for example `releases/one-offs/16.1.0-SNAPSHOT-master/<kit build>`.
 
@@ -1265,6 +1275,11 @@ How the oracle fits VoltDB's snapshot handling:
   after 16.0.0), so while `--avoid-known-bugs` is true and the cluster upgrades from 16.0.0 (`--upgrades`; restores do
   not reach the mirror) no DDL of SQLancer runs during a restore: every connection's DDL holds a lock shared
   (`VoltDBConnection`), and a restore holds it exclusive.
+- A snapshot saved before or during a shrink can lack the partitions whose files were on the removed nodes, and VoltDB
+  refuses to restore it with the same status as a restore that found duplicates ("Restore failed to complete"), its
+  result table saying why ("Table: T is missing 4 out of 10 total partitions"). Milestone 50's resize run took such a
+  refusal for a restore and reported the untouched table's rows as lost; a restore refused for missing partitions is
+  now skipped.
 
 In an XDCR run (`--xdcr`) SNAPSHOT checks nothing: a restore is local to one cluster, and milestone 41's coverage run
 found that its restores there stop the replication of other tables for a while (the DR consumer reconnects), so the
@@ -2361,6 +2376,7 @@ The bugs below were found in milestone 56.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30758 | After an elastic remove, a replica-change callback for a removed partition, holding the replica list from between the two removed hosts' failures, ran after the partition was cleaned up and appointed a site on a removed host as its leader. The MP repair blocker that created stayed for 128 s, until the next grow: `MpScheduler` removes it only when every MP master is on a live host. Meanwhile every catalog update (DDL, `@UpdateClasses`) and every rejoin is refused ("while leader promotion or transaction repair are in progress"). Found once by run-coverage.sh's resize run (instrumented build, under SQLancer's load); 14 rounds of a grow/shrink script, with and without load, did not reproduce it. `repros/ENG-30758.sh` (with `repros/elastic/SlowAppointer.java`) reproduces it every time on a plain build by forcing the sighting's timing: it kills the first removed host as the remove starts draining, so the two fail ~100 ms apart, and holds the LeaderAppointer's callback thread for 500 ms (a JDI breakpoint) before its isClusterKSafe; DDL is still refused 60 s later. Blocker. | Statements still refused after `--retry-seconds` are skipped and counted, and the summary reports MP repair blockers held over 60 s. |
+| ENG-30056 | (Filed from replication-group2, not counted among SQLancer's bugs.) After an elastic remove, `RestartDRConsumerNT` merges the DR consumer trackers of every partition and ships them under cluster id -1, but `setDRIDTrackerFromBytes` replaces only the given cluster's entries (since ENG-29285), so the merged view is dropped and the survivors resume from their own older positions; the producer has truncated past them and refuses the subscription for good ("DR does not have the next binary log in the sequence for partition N. Partition N is no longer covered"), and nothing more replicates in that direction. Met by lab build #74's XDCR resize run (milestone 56) at its first shrink. Blocker. | None; the job's `xrN` shape is not among its default CLUSTERS. |
 | ENG-30757 | The JDBC driver cannot connect to a cluster that requires client certificates (`<ssl clientauthrequired="true">`): it has no keystore property (only `ssl`, `truststore` and `truststorepassword`), and it builds a truststore-only TLS config, so `javax.net.ssl.keyStore` is ignored too. The Java client (`Client2Config.trustStoreWithMutualAuth`) connects. `repros/ENG-30757.sh` (with `repros/tls/MutualAuthRepro.java`). Major. | None: SQLancer works through JDBC, so no run uses mutual TLS, and the server's certificate revocation (CRL) checks on client connections stay untested. |
 
 The bug below was found in milestone 55.
