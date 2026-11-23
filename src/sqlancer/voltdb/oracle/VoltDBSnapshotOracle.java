@@ -213,16 +213,19 @@ public class VoltDBSnapshotOracle implements TestOracle<VoltDBGlobalState> {
         }
     }
 
-    // ENG-30676: a restore while a node rejoins wedges the cluster (a site's queue blocked for good); while
-    // avoiding known bugs, a restore waits while --ddl-hold's file exists, which run-sqlancer.sh creates from before
-    // each kill until the node has rejoined
+    // ENG-30676: a restore while a node rejoins, or during an elastic join, wedges the cluster (a site's queue blocked
+    // for good); while avoiding known bugs, a restore waits while --ddl-hold's file exists, which run-sqlancer.sh
+    // creates from before each kill until the node has rejoined, or the restore.hold next to it, which it creates from
+    // before each join until the join is done
     private void awaitNoHold() {
         String hold = state.getDbmsSpecificOptions().ddlHold;
         if (hold == null || !state.getDbmsSpecificOptions().avoidKnownBugs) {
             return;
         }
+        Path ddl = Paths.get(hold);
+        Path joins = ddl.resolveSibling("restore.hold");
         long deadline = System.currentTimeMillis() + 900_000;
-        while (Files.exists(Paths.get(hold)) && System.currentTimeMillis() < deadline) {
+        while ((Files.exists(ddl) || Files.exists(joins)) && System.currentTimeMillis() < deadline) {
             try {
                 Thread.sleep(500);
             } catch (InterruptedException e) {

@@ -1242,10 +1242,17 @@ resize_loop() {
         n=$((n + 1))
         t0=$SECONDS
         echo "$(date '+%H:%M:%S') grow $n: adding $added node(s)" >>"$results/resize.log"
+        # ENG-30676: a restore during an elastic join wedges the cluster as one during a rejoin does, so SNAPSHOT's
+        # restores wait (its --ddl-hold's sibling restore.hold) from a few seconds before the join, letting one in
+        # flight finish, until the join is done
+        touch "$results/restore.hold"
+        sleep 3
         if ! grow $n; then
+            rm -f "$results/restore.hold"
             echo "$(date '+%H:%M:%S') grow $n: FAILED after $((SECONDS - t0)) s" >>"$results/resize.log"
             return 1
         fi
+        rm -f "$results/restore.hold"
         echo "$(date '+%H:%M:%S') grow $n: done, $((SECONDS - t0)) s" >>"$results/resize.log"
         for _ in $(seq 1 "$resize_interval"); do
             [ -e "$results/resize.stop" ] && return 0
