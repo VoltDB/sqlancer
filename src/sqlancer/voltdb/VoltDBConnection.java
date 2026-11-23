@@ -80,10 +80,9 @@ public class VoltDBConnection extends SQLConnection {
     // the --ddl-hold file, or null
     private Path ddlHold;
 
-    // ENG-30677: writes to a join view's replicated table crash the server while a snapshot restore and DDL run at
-    // once;
-    // DDL, on every connection of this SQLancer, holds this shared, and a restore (VoltDBSnapshotOracle, while
-    // avoiding known bugs) holds it exclusive
+    // ENG-30677 (fixed after 16.0.0): writes to a join view's replicated table crash a 16.0.0 server while a snapshot
+    // restore and DDL run at once; DDL, on every connection of this SQLancer, holds this shared, and a restore
+    // (VoltDBSnapshotOracle, while avoiding known bugs during an upgrade from 16.0.0) holds it exclusive
     private static final ReentrantReadWriteLock DDL_OR_RESTORE = new ReentrantReadWriteLock();
 
     public VoltDBConnection(Connection connection, int retrySeconds, boolean nodeFailures) {

@@ -127,6 +127,8 @@ public final class VoltDBExpressionGenerator
 
     private final VoltDBGlobalState state;
     private final boolean avoidKnownBugs;
+    // ENG-30595 (fixed after 16.0.0), see generateSubqueryComparison
+    private final boolean avoidEng30595;
 
     // the FROM list, comma-separated; the joins attach to its last table
     private List<VoltDBTable> fromTables = new ArrayList<>();
@@ -170,6 +172,7 @@ public final class VoltDBExpressionGenerator
     public VoltDBExpressionGenerator(VoltDBGlobalState state) {
         this.state = state;
         this.avoidKnownBugs = state.getDbmsSpecificOptions().avoidKnownBugs;
+        this.avoidEng30595 = state.getDbmsSpecificOptions().avoidBugsOf1600();
     }
 
     @Override
@@ -1382,10 +1385,11 @@ public final class VoltDBExpressionGenerator
         Kind k = kind;
         VoltDBTable table = Randomly.fromList(subqueryTables);
         return (VoltDBSubquery) inDomain(kind, () -> {
-            // ENG-30595: a string function of a scalar subquery on the left of IN or = ANY gets a value of the wrong
-            // type, and CHAR_LENGTH of it crashes the server, so unless --avoid-known-bugs is false the left operand
-            // has no subquery
-            VoltDBExpression left = avoidKnownBugs ? withoutSubqueries(() -> generateComparand(k, depth))
+            // ENG-30595 (fixed after 16.0.0): a string function of a scalar subquery on the left of IN or = ANY gets
+            // a value of the wrong type, and CHAR_LENGTH of it crashes a 16.0.0 server; DIFF runs the query on the
+            // mirror too, so with a mirror (normally 16.0.0) or an upgrade from 16.0.0, while avoiding known bugs, the
+            // left operand has no subquery
+            VoltDBExpression left = avoidEng30595 ? withoutSubqueries(() -> generateComparand(k, depth))
                     : generateComparand(k, depth);
             if (k == Kind.STRING && avoidKnownBugs && !referencesColumn(left)) {
                 // ENG-30549: the planner folds a comparison of two string constants ignoring trailing spaces, while

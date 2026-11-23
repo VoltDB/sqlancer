@@ -97,4 +97,10 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
         return oracles;
     }
 
+    // whether to avoid a known bug that is fixed after 16.0.0 but still hits a 16.0.0 server: one is in the run when
+    // there is a mirror (--mirror, normally 16.0.0) or an in-service upgrade from 16.0.0 (--upgrades)
+    public boolean avoidBugsOf1600() {
+        return avoidKnownBugs && (mirror != null && !mirror.isBlank() || upgrades);
+    }
+
 }

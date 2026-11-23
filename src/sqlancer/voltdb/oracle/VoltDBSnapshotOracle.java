@@ -310,12 +310,14 @@ public class VoltDBSnapshotOracle implements TestOracle<VoltDBGlobalState> {
 
     private void restore(String nonce, String table, String duplicatesPath) {
         awaitNoHold();
-        if (!state.getDbmsSpecificOptions().avoidKnownBugs) {
+        // ENG-30677 (fixed after 16.0.0): a restore while DDL runs crashes a 16.0.0 server on writes to a join view's
+        // replicated table. Restores run only on the main cluster, not the mirror, so only an in-service upgrade from
+        // 16.0.0 (--upgrades) puts 16.0.0 nodes in their way; then, while avoiding known bugs, no DDL of this SQLancer
+        // runs during the restore
+        if (!state.getDbmsSpecificOptions().avoidKnownBugs || !state.getDbmsSpecificOptions().upgrades) {
             restoreNow(nonce, table, duplicatesPath);
             return;
         }
-        // ENG-30677: a restore while DDL runs crashes the server on writes to a join view's replicated table; no DDL of
-        // this SQLancer runs during the restore
         try {
             VoltDBConnection.withoutDdl(() -> {
                 restoreNow(nonce, table, duplicatesPath);

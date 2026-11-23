@@ -1261,8 +1261,9 @@ How the oracle fits VoltDB's snapshot handling:
   waits while `--ddl-hold`'s file exists, from before each kill until the node has rejoined.
 - After a node has rejoined, a restore's duplicates can go unwritten (ENG-30678 below), so while `--avoid-known-bugs` is
   true and nodes fail, resize, crash or upgrade, the duplicates files are not counted; the table still is.
-- A restore while DDL runs makes writes to a join view's replicated table crash the server (ENG-30677 below), so while
-  `--avoid-known-bugs` is true no DDL of SQLancer runs during a restore: every connection's DDL holds a lock shared
+- A restore while DDL runs makes writes to a join view's replicated table crash a 16.0.0 server (ENG-30677 below, fixed
+  after 16.0.0), so while `--avoid-known-bugs` is true and the cluster upgrades from 16.0.0 (`--upgrades`; restores do
+  not reach the mirror) no DDL of SQLancer runs during a restore: every connection's DDL holds a lock shared
   (`VoltDBConnection`), and a restore holds it exclusive.
 
 In an XDCR run (`--xdcr`) SNAPSHOT checks nothing: a restore is local to one cluster, and milestone 41's coverage run
@@ -1917,12 +1918,15 @@ Milestone 30's coverage run found that code never ran. Such a view:
   nothing else: VoltDB keeps a view of partitioned tables only when every joined row is in one partition.
 - Joins a replicated table on a comparison of two columns of the same kind (=, <, <=, >, >= or <>; random rows rarely
   have equal values, and most comparisons let many pairs of rows through), a random predicate over the tables
-  joined so far, or both; while `--avoid-known-bugs` is true, on the comparison alone (ENG-30673 below).
-- Has a random WHERE clause a third of the time while `--avoid-known-bugs` is false. ENG-30583 is about views of one
+  joined so far, or both; while `--avoid-known-bugs` is true with a mirror or an upgrade from 16.0.0, on the
+  comparison alone (ENG-30673 below, fixed after 16.0.0).
+- Has a random WHERE clause a third of the time unless `--avoid-known-bugs` is true with a mirror or an upgrade from
+  16.0.0. ENG-30583 is about views of one
   table, and constants, LIKE and BETWEEN in a join view's conditions leave later DDL working; but a random predicate
   can fail on a row (DATEADD out of range, say), and a row whose join-view maintenance fails is not entirely rolled
   back: the next DDL crashes the server (ENG-30673 below; lab build #51's export run, where the 16.0.0 mirror died of
-  it too). So while `--avoid-known-bugs` is true, a join view's ON and WHERE clauses hold only column comparisons.
+  it too; fixed after 16.0.0). So while `--avoid-known-bugs` is true with a mirror or an upgrade from 16.0.0, a join
+  view's ON and WHERE clauses hold only column comparisons.
 - While `--avoid-known-bugs` is true, groups by columns with distinct names: the view is right, but its query run as a
   SELECT merges groups (ENG-30529 below).
 - While `--avoid-known-bugs` is true and DIFF's mirror or an in-service upgrade runs 16.0.0, groups by no DECIMAL
@@ -2285,7 +2289,7 @@ The bugs below were found in milestone 14, by subqueries and the SUBQUERY oracle
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30594 | A subquery in the output of an IN or `= ANY` subquery, such as `1 IN (SELECT (SELECT MAX(a) FROM t AS s1) FROM t AS s0)`, crashes the planner: NullPointerException, "this.m_subqueryNode" is null. ALL and EXISTS work. | The output of an IN, ANY or ALL subquery holds no subquery. |
-| ENG-30595 | `CHAR_LENGTH((SELECT MAX(s) ...)) IN (SELECT ...)` kills the server (SIGSEGV in `StringRef::getObject`): the string function on the left of an IN or `= ANY` subquery gets an INTEGER instead of the scalar subquery's value. UPPER of it fails with "Type INTEGER can't be cast as VARCHAR". Found by SUBQUERY as a node crash. Critical. | The left operand of an IN, ANY or ALL subquery holds no subquery. |
+| ENG-30595 (fixed after 16.0.0) | `CHAR_LENGTH((SELECT MAX(s) ...)) IN (SELECT ...)` kills the server (SIGSEGV in `StringRef::getObject`): the string function on the left of an IN or `= ANY` subquery gets an INTEGER instead of the scalar subquery's value. UPPER of it fails with "Type INTEGER can't be cast as VARCHAR". Found by SUBQUERY as a node crash. Critical. 16.0.0 too; master is fixed. | With a 16.0.0 mirror or upgrade, the left operand of an IN, ANY or ALL subquery holds no subquery (DIFF runs the query on the mirror too). |
 | ENG-30596 | A bare scalar subquery on the left of an IN list fails in the EE: "Invalid ExpressionType 'COMPARE_IN' called for VectorComparisonExpression". `(SELECT ...) + 0 IN (...)` works. | A numeric one is written `(s + 0)`; a string one is not generated there. |
 | ENG-30597 | With GROUP BY and an aggregate, an ALL or IN subquery whose output is a column of the outer query fails: `<> ALL` in the EE ("invalid column type 'INVALID'", or a garbage type such as 'UNKNOWN[-47]'), IN in the planner (IndexOutOfBoundsException in `rewriteInSubqueryAsExists`). Found by TLP DISTINCT. | The output of an IN, ANY or ALL subquery reads only the subquery's own columns. |
 | ENG-16927 (comment) | An old bug, open since 2019: any subquery in the string argument of SUBSTRING or TRIM crashes the SQL parser (NullPointerException in `QueryExpression.getColumns`). Other functions of a subquery work. Found by TLP AGGREGATE. | SUBSTRING's string argument has no subquery (and TRIM is already written `LTRIM(RTRIM(x))`). |
@@ -2431,7 +2435,7 @@ The bugs below were found in milestone 37.
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
 | ENG-30678 | After a node has been killed and has rejoined (node 0 in the reproduction), `@SnapshotRestore` with a duplicates path leaves the duplicate rows out of the table, as it should, but writes none of them to the duplicates files, and no host logs finding them. 16.0.0 too. Found by SNAPSHOT in a 3-node trial with kills; `repros/ENG-30678.sh` restores a replicated table into itself between kills and finds the files empty after the first host has rejoined. Major. | While `--avoid-known-bugs` is true and nodes fail, resize, crash or upgrade, SNAPSHOT checks the restored table but does not count the duplicates files |
-| ENG-30677 | Writes to the replicated table of a view over a join of a replicated and a (empty) partitioned table crash the server (SIGSEGV in `ReplicatedMaterializedViewHandler`'s maintenance scan, on a stale table) while a `@SnapshotRestore` of another table and DDL on others run at once; either alone does not. 16.0.0 too. Found by SNAPSHOT in a 3-node trial (all three nodes at once, 13 s in); `repros/ENG-30677.sh` (a stress script) crashes it in seconds to minutes. Server crash, Blocker for V16.1.0. | While `--avoid-known-bugs` is true, no DDL of SQLancer runs during a restore: DDL holds a lock shared, a restore exclusive |
+| ENG-30677 (fixed after 16.0.0) | Writes to the replicated table of a view over a join of a replicated and a (empty) partitioned table crash the server (SIGSEGV in `ReplicatedMaterializedViewHandler`'s maintenance scan, on a stale table) while a `@SnapshotRestore` of another table and DDL on others run at once; either alone does not. 16.0.0 too. Found by SNAPSHOT in a 3-node trial (all three nodes at once, 13 s in); `repros/ENG-30677.sh` (a stress script) crashes it in seconds to minutes. Server crash, Blocker for V16.1.0; master is fixed. | With an upgrade from 16.0.0, no DDL of SQLancer runs during a restore: DDL holds a lock shared, a restore exclusive (restores run only on the main cluster, so a mirror does not need it) |
 | ENG-30676 | `@SnapshotRestore` of a table while a node rejoins wedges the cluster for good: a site waits in `SnapshotRestore.executePlanFragment` (`SiteMailbox.recvBlocking`) for table data that never comes, the MP site waits for it, nothing else runs on those sites, and the rejoin never completes. 16.0.0 too. Found by SNAPSHOT in a 3-node trial with node kills; `repros/ENG-30676.sh` (two clients restoring a table while a node is killed and rejoined) wedges the cluster at the first kill. Hang, Blocker for V16.1.0. | While `--avoid-known-bugs` is true, a restore waits while `--ddl-hold`'s file exists (from before each kill until the node has rejoined) |
 
 Milestone 37 also met the open ENG-15392: a `@SnapshotRestore` parameter that is not JSON makes the server
@@ -2448,7 +2452,7 @@ The bugs below were found in milestone 33.
 
 | Ticket | Issue | Workaround |
 | --- | --- | --- |
-| ENG-30673 | A view over a join whose ON clause can fail on a row (`ON DATEADD(QUARTER, t0.a, t1.d) IS NOT NULL`): an INSERT of a row out of DATEADD's range fails, as it should, but the row stays visible to the view's maintenance (a later UPDATE of the other table fails on it), and the next DDL, whatever it is, aborts the server while rebuilding the tables ("getStats() called with ... an invalid locator"). 16.0.0 too. Lab build #51's export run: all three nodes and the mirror died at one catalog update. `repros/ENG-30673.sql`. | While `--avoid-known-bugs` is true, a join view's ON and WHERE clauses hold only column comparisons |
+| ENG-30673 (fixed after 16.0.0) | A view over a join whose ON clause can fail on a row (`ON DATEADD(QUARTER, t0.a, t1.d) IS NOT NULL`): an INSERT of a row out of DATEADD's range fails, as it should, but the row stays visible to the view's maintenance (a later UPDATE of the other table fails on it), and the next DDL, whatever it is, aborts the server while rebuilding the tables ("getStats() called with ... an invalid locator"). 16.0.0 too. Lab build #51's export run: all three nodes and the mirror died at one catalog update. `repros/ENG-30673.sql`. Master is fixed. | With a 16.0.0 mirror or upgrade, a join view's ON and WHERE clauses hold only column comparisons |
 | ENG-30667 | After a node rejoins, a view without GROUP BY over a join of replicated tables (`SELECT COUNT(*), MIN(b.d) FROM b JOIN a ON ...`) returns its one row twice on about one read in three, through any node: the rejoined node's copy holds the row twice. A view without GROUP BY of one table stays right. Also on 16.0.0. Found by VIEWS in a local trial with export and a node killed every 60 s; a script reproduces it at every run (`voltdb/repros/ENG-30667.sh`). Wrong result. | While nodes fail, rejoin, resize, crash or upgrade, a join view groups by at least one column. |
 
 The bugs below were found in milestone 32's lab runs (builds #48 and #49).
