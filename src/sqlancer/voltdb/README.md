@@ -534,6 +534,11 @@ voltdb/run-repros.sh --voltdb ~/voltdb [--port-base 31000] [--results DIR] [--on
 The run fails on CHANGED or ERROR; FIXED does not fail it. `<results>/repros-<time>/summary.txt` has the counts and a
 line per ticket, and `<ticket>.log` the setup's output and the check's.
 
+A script reproduction still running after `--script-timeout` seconds (default 1800) is killed and is an ERROR, its log
+ending "still running after N s"; an ERROR's server and client logs are kept as `<ticket>-logs.tar.gz`. Until
+milestone 57 nothing stopped one: lab builds #79 and #80 waited on ENG-30677
+until the job's own time limit, and every reproduction after it went unchecked.
+
 A `.sql` reproduction has header lines, setup statements, a line `-- check`, and the statements whose output is
 compared:
 

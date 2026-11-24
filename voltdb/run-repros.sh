@@ -16,6 +16,8 @@ Usage: $0 --voltdb DIR [options]
   --port-base N      first port; a reproduction's node i uses N + 10*i + 0..5 (default 31000)
   --results DIR      where the run's directory is created (default ./repro-results)
   --only LIST        comma-separated tickets to run (default: every file in voltdb/repros)
+  --script-timeout N seconds a script reproduction (.sh) may run before it is killed and counted an ERROR
+                     (default 1800)
   -h, --help         this help
 EOF
 }
@@ -32,6 +34,7 @@ license=
 port_base=31000
 results_root=./repro-results
 only=
+script_timeout=1800
 while [ $# -gt 0 ]; do
     case $1 in
     --voltdb) voltdb_home=$2; shift 2 ;;
@@ -39,11 +42,13 @@ while [ $# -gt 0 ]; do
     --port-base) port_base=$2; shift 2 ;;
     --results) results_root=$2; shift 2 ;;
     --only) only=$2; shift 2 ;;
+    --script-timeout) script_timeout=$2; shift 2 ;;
     -h | --help) usage; exit 0 ;;
     *) usage >&2; die "unknown option $1" ;;
     esac
 done
 [ -n "$voltdb_home" ] || { usage >&2; die "--voltdb is required"; }
+[[ $script_timeout =~ ^[0-9]+$ ]] || die "--script-timeout needs a number of seconds"
 [ -x "$voltdb_home/bin/voltdb" ] || die "no bin/voltdb in $voltdb_home"
 license_args=()
 [ -z "$license" ] || license_args=(--license "$license")
@@ -198,18 +203,30 @@ run_sql() {
     stop_cluster "$nodes"
 }
 
-# a script reproduction: exit 0 while the bug reproduces, 1 once it is fixed, anything else an error
+# a script reproduction: exit 0 while the bug reproduces, 1 once it is fixed, anything else an error. One still
+# running after --script-timeout seconds is killed, with what it started, and is an error: lab builds #79 and #80 (24
+# November 2026) waited on ENG-30677 until the job's own time limit, losing every later reproduction's verdict.
 run_sh() {
-    local f=$1 log=$2 rc
+    local f=$1 log=$2 rc limit=()
     mkdir -p "$work"
-    VOLTDB_HOME=$voltdb_home VOLTDB_LICENSE=$license PORT_BASE=$port_base WORKDIR=$work timeout_secs=1800 bash "$f" >"$log" 2>&1
+    command -v timeout >/dev/null && limit=(timeout -k 30 "$script_timeout")
+    VOLTDB_HOME=$voltdb_home VOLTDB_LICENSE=$license PORT_BASE=$port_base WORKDIR=$work \
+        ${limit[@]+"${limit[@]}"} bash "$f" >"$log" 2>&1
     rc=$?
     case $rc in
     0) verdict=BROKEN ;;
     1) verdict=FIXED ;;
+    124 | 137)
+        [ ${#limit[@]} -gt 0 ] && echo "ERROR: still running after $script_timeout s (--script-timeout), killed" >>"$log"
+        verdict=ERROR
+        ;;
     *) verdict=ERROR ;;
     esac
     settle_ports
+    # an error's server and client logs, kept beside its own log
+    if [ "$verdict" = ERROR ]; then
+        (cd "$work" && find . -name '*.log' -size -64M -print0 | tar -czf "${log%.log}-logs.tar.gz" --null -T -) 2>/dev/null
+    fi
     rm -rf "$work"
 }
 
