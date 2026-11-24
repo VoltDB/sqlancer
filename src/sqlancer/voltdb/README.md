@@ -623,7 +623,8 @@ system test (`matrix-systemtest/master`, on the nights the rotation in `internal
 
 The job fetches this repository at the commit in its `SQLANCER_REF` parameter. That commit is pinned in the Jenkinsfile,
 so a change here reaches the nightly run only when the Jenkinsfile is changed to name it. It then builds SQLancer with
-the kit's runtime JDK and makes seven runs, one after the other, every node on the agent:
+the kit's runtime JDK and makes eight runs. Since milestone 57 each run has an agent of its own and they all run at
+once (`SPLIT`, on by default), every node of a run on its agent; before that they ran one after the other on one agent:
 
 | Run (triagedb name) | Cluster | Oracles | Time |
 | --- | --- | --- | --- |
@@ -631,7 +632,8 @@ the kit's runtime JDK and makes seven runs, one after the other, every node on t
 | `sqlancer-1n-k0-security` | 1 node, 8 sites per host, security on (see [The PERMS oracle](#the-perms-oracle)), and since milestone 42 TLS (see [TLS](#tls)); `sqlancer-1n-k0` until milestone 28 | the same | 45 minutes |
 | `sqlancer-3n-k2-export-s2` | 3 nodes, k=2, 2 sites per host: every partition on every node, and 2 partitions in all; the streams export (see [The STREAMS oracle](#the-streams-oracle)); `sqlancer-3n-k2-s2` until milestone 29 | the same | 45 minutes |
 | `sqlancer-3n-k1-resize120` | 3 nodes, k=1, 8 sites per host; every 2 minutes, 2 nodes are added, or removed again (see [Elastic resizes](#elastic-resizes)) | the same | 45 minutes |
-| `sqlancer-3n-k1-xdcr-s4` | Two clusters of 3 nodes, k=1, 4 sites per host, linked by XDCR (see [XDCR](#xdcr)) | the same | 45 minutes |
+| `sqlancer-3n-k1-xdcr-kill300-s4` | Two clusters of 3 nodes, k=1, 4 sites per host, linked by XDCR (see [XDCR](#xdcr)); a node of the first is killed and rejoined every 5 minutes | the same | 45 minutes |
+| `sqlancer-3n-k1-xdcr-tls-s4` | The same XDCR pair over TLS, DR connections included, without node failures (since milestone 56) | the same | 45 minutes |
 | `sqlancer-3n-k1-upgrade` | 3 nodes, k=1, 8 sites per host, started on 16.0.0 and upgraded in service to the kit a third of the way in (see [In-service upgrades](#in-service-upgrades)) | the same | 45 minutes |
 | `sqlancer-3n-k1-crash600` | 3 nodes, k=1, 8 sites per host, a synchronous command log; every 10 minutes every node is killed and the cluster recovered (see [Whole-cluster crashes](#whole-cluster-crashes)) | the same | 45 minutes |
 
@@ -639,15 +641,23 @@ The shapes differ in what the planner and the execution engine do. With one node
 gathers 8 partitions' results in one process. With 3 nodes, k=1, the partitions' leaders are spread over the nodes and
 each has one replica, and node failures move them; elastic resizes add a partition group and move data to it and
 back; crashes replay the command log. With k=2 and 2 sites per host, every node holds every partition, so
-there are only 2 partitions and every write is replicated twice. The whole job takes about 5 hours 50 minutes.
+there are only 2 partitions and every write is replicated twice.
 
-Before the runs, the job reruns the bug reproductions against the kit, as the triagedb row `sqlancer-repros` (see
-[Bug reproductions](#bug-reproductions)): about 10 minutes on 1 node. It fails when a reproduction changes or cannot
-run; the bugs that no longer reproduce are listed in the build log ("no longer reproduces: ..."). `SQLANCER_REPROS=no`
-skips it.
+The job also reruns the bug reproductions against the kit, as the triagedb row `sqlancer-repros` (see
+[Bug reproductions](#bug-reproductions)): 40 minutes to an hour, as the shell reproductions that load a cluster until
+it breaks take up to 30 minutes each, on an agent of its own when `SPLIT` is on, else
+before the runs. It fails when a reproduction changes or cannot run; the bugs that no longer reproduce are listed in
+the build log ("no longer reproduces: ..."). `REPROS` off skips it. `CLUSTERS` `none` runs nothing else: a
+check of which known bugs a kit still has, in under an hour.
 
-Every run uses `--use-reducer`. The first run's seed is the UTC time as `yyyymmddHHMM`, and each next run's is one
-more.
+Split, the whole job takes about an hour, as long as its longest cell, when eight agents of its label are free (a run
+waits for one otherwise), and each run's agent has a time limit of its `DURATION` plus 50 minutes, so a run that hangs
+is stopped without holding up the others (the reproductions' agent has 2 hours 20 minutes). One after the other
+(`SPLIT` off), it takes about 7 hours on one agent.
+
+Every run uses `--use-reducer`. The first run's seed is the time the build started as `yyyymmddHHMM` (the
+controller's clock), and each next run's is one more, split or not: each agent gets the first seed and its run's
+place in `CLUSTERS` (`SQLANCER_SEED_OFFSET` in the pro script).
 `--avoid-known-bugs` stays on, so a failure is a new bug, or a known one in a new form.
 
 Each run is one row in the triagedb, with the seed in its run arguments. A failing row's reason is the oracle's account
@@ -664,8 +674,9 @@ seconds between node failures, `r` and the seconds between elastic resizes, `c` 
 `x` for an XDCR pair (`xN` with a node failure every N seconds, `xsec` over TLS, `xrN` with a resize every N seconds),
 `u` for an in-service upgrade from `MIRROR_VERSION`, `sec` for security, or `exp` for export, and sites the sites per
 host, default `3:1:300 1:0:sec 3:2:exp300:2 3:1:r120 3:1:x300:4 3:1:xsec:4 3:1:u 3:1:c600`; `xsec` joined the
-defaults in milestone 56), `DURATION` (seconds
-per run, default 2700), `ORACLES`, `SEED`, `EXTRA_ARGS` (provider options) and `SQLANCER_REF`. A run of the job alone
+defaults in milestone 56; `none` for only the reproductions), `SPLIT`, `REPROS`, `DURATION` (seconds
+per run, default 2700), `ORACLES`, `SEED`, `EXTRA_ARGS` (provider options) and `SQLANCER_REF`. To rerun one failed
+run, give `CLUSTERS` its shape and `SEED` and `ORACLES` from its bundle's `manifest.txt`. A run of the job alone
 needs a kit: give `releasedir`, for example `releases/one-offs/16.1.0-SNAPSHOT-master/<kit build>`.
 
 ## Start a VoltDB server by hand
