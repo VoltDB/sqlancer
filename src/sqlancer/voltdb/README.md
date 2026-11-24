@@ -535,9 +535,15 @@ The run fails on CHANGED or ERROR; FIXED does not fail it. `<results>/repros-<ti
 line per ticket, and `<ticket>.log` the setup's output and the check's.
 
 A script reproduction still running after `--script-timeout` seconds (default 1800) is killed and is an ERROR, its log
-ending "still running after N s"; an ERROR's server and client logs are kept as `<ticket>-logs.tar.gz`. Until
-milestone 57 nothing stopped one: lab builds #79 and #80 waited on ENG-30677
-until the job's own time limit, and every reproduction after it went unchecked.
+ending "still running after N s"; an ERROR's server and client logs are kept as `<ticket>-logs.tar.gz`. Until milestone
+57 nothing stopped one: lab builds #79 and #80 waited on ENG-30677 until the job's own time limit, and every
+reproduction after it went unchecked.
+
+Each script runs with a clean environment: `PATH`, `HOME`, `JAVA_HOME`, `LANG`, `TMPDIR`, `VOLTDB_HOME`,
+`VOLTDB_LICENSE`, `PORT_BASE` and `WORKDIR`, nothing else. The scripts' own settings have common names (`DURATION`,
+`ROUNDS`, `KILLS`, `SITES`, ...), and a job's environment holds its parameters: the lab job's `DURATION=2700` made
+ENG-30677 load its cluster for 45 minutes instead of 5, which is why builds #79 to #81 never saw it end (it ran 1,786
+snapshot restores without a crash). To change a script's settings, run it by hand.
 
 A `.sql` reproduction has header lines, setup statements, a line `-- check`, and the statements whose output is
 compared:

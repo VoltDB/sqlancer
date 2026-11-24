@@ -205,12 +205,17 @@ run_sql() {
 
 # a script reproduction: exit 0 while the bug reproduces, 1 once it is fixed, anything else an error. One still
 # running after --script-timeout seconds is killed, with what it started, and is an error: lab builds #79 and #80 (24
-# November 2026) waited on ENG-30677 until the job's own time limit, losing every later reproduction's verdict.
+# November 2026) waited on ENG-30677 until the job's own time limit, losing every later reproduction's verdict. To
+# change a script's own settings, run it by hand (its header names them).
 run_sh() {
     local f=$1 log=$2 rc limit=()
     mkdir -p "$work"
     command -v timeout >/dev/null && limit=(timeout -k 30 "$script_timeout")
-    VOLTDB_HOME=$voltdb_home VOLTDB_LICENSE=$license PORT_BASE=$port_base WORKDIR=$work \
+    # a clean environment: the scripts' own settings (DURATION, ROUNDS, KILLS, SITES, ...) have common names, and a
+    # job's environment holds its parameters (the sqlancer job's DURATION=2700 ran ENG-30677's load for 45 minutes,
+    # not 5, so lab builds #79 to #81 never saw it end)
+    env -i PATH="$PATH" HOME="$HOME" ${JAVA_HOME:+JAVA_HOME="$JAVA_HOME"} ${LANG:+LANG="$LANG"} ${TMPDIR:+TMPDIR="$TMPDIR"} \
+        VOLTDB_HOME="$voltdb_home" VOLTDB_LICENSE="$license" PORT_BASE="$port_base" WORKDIR="$work" \
         ${limit[@]+"${limit[@]}"} bash "$f" >"$log" 2>&1
     rc=$?
     case $rc in
