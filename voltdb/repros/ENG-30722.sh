@@ -1,0 +1,31 @@
+#!/bin/bash
+: <<'HEADER'
+-- ticket: ENG-30722
+-- summary: A streaming snapshot also streams the files of every snapshot whose name begins with its own: s1 streams s10's rows too
+HEADER
+# The runner's env: VOLTDB_HOME, PORT_BASE, WORKDIR (and VOLTDB_LICENSE, if any). One node.
+# streaming/PrefixNonceRepro.java: a table R holds the rows 1-5, and a streaming snapshot of it is named s10; then R
+# holds the rows 6-8, and a streaming snapshot of it is named s1. Exit 0 if the stream s1 holds rows other than 6-8
+# (the bug: it also streams s10's files, whose names begin with s1), 1 if not.
+set -u
+here=$(cd "$(dirname "$0")" && pwd)
+V=$VOLTDB_HOME
+C=$WORKDIR/prefixnonce
+B=$PORT_BASE
+rm -rf "$C"; mkdir -p "$C/classes"
+cat > "$C/d.xml" <<X
+<?xml version="1.0"?>
+<deployment><cluster sitesperhost="4" kfactor="0"/><httpd enabled="false"/></deployment>
+X
+"$V/bin/voltdb" init --force ${VOLTDB_LICENSE:+--license "$VOLTDB_LICENSE"} -D "$C/n0" -C "$C/d.xml" > "$C/init.log" 2>&1
+(nohup "$V/bin/voltdb" start -D "$C/n0" -H localhost:$((B + 2)) --client=$B --admin=$((B + 1)) --internal=$((B + 2)) \
+    --zookeeper=$((B + 3)) --replication=$((B + 4)) --metrics=$((B + 5)) > "$C/start.log" 2>&1 & echo $! > "$C/n0.pid")
+cleanup() { "$V/bin/voltadmin" shutdown --force -H localhost:$((B + 1)) > /dev/null 2>&1; sleep 5; kill -9 "$(cat "$C/n0.pid")" 2>/dev/null; }
+trap cleanup EXIT
+for _ in $(seq 1 120); do grep -q "Server completed initialization" "$C/start.log" 2>/dev/null && break; sleep 1; done
+grep -q "Server completed initialization" "$C/start.log" || { echo "the node did not start"; tail -20 "$C/start.log"; exit 2; }
+cp="$V/voltdb/*:$V/lib/*"
+javac -cp "$cp" -d "$C/classes" "$here/streaming/PrefixNonceRepro.java" || exit 2
+# the client prints its streaming debug lines ("... ") to stderr (ENG-30721)
+java -cp "$cp:$C/classes" PrefixNonceRepro localhost:$B 2> "$C/client.err" | grep -v SLF4J
+exit "${PIPESTATUS[0]}"

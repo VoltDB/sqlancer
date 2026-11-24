@@ -1,0 +1,1620 @@
+#!/usr/bin/env bash
+#
+# Starts a VoltDB cluster on this machine, runs SQLancer's VoltDB provider against it for a set time, stops the
+# cluster, and saves everything to one results directory: a manifest, the SQLancer output and logs, every node's
+# server log, the failing databases' logs (the reproductions) and a PASS/FAIL summary.
+#
+# Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
+# Run with --help for the options. Exit code: 0 PASS, 1 FAIL, 2 the run could not be set up.
+
+set -u
+
+usage() {
+    cat <<'EOF'
+Usage: voltdb/run-sqlancer.sh --voltdb <dir> [options] [-- <provider options>]
+
+  --voltdb DIR       VoltDB kit or build, holding bin/voltdb (default: $VOLTDB_HOME)
+  --license FILE     license for voltdb init, which an enterprise kit needs (default: none)
+  --nodes N          nodes, all on this machine (default 1)
+  --kfactor K        k-safety (default 0 for one node, 1 for more)
+  --sites N          sites per host (default 8)
+  --oracle LIST      comma-separated oracles: NOREC, TLP_WHERE, TLP_DISTINCT, TLP_HAVING,
+                     TLP_AGGREGATE, PQS, PARAMS, VIEWS, LIMIT, SMOKE (default NOREC,TLP_WHERE)
+  --duration SECS    how long SQLancer runs (default 1800)
+  --seed N           random seed (default: the current time; recorded in the manifest either way)
+  --threads N        SQLancer threads (default 4)
+  --queries N        oracle checks per generated database (default 100)
+  --port-base N      first of the ports the cluster uses, 10 per node (default 30000, below the
+                     ephemeral ports Linux and macOS give outgoing connections)
+  --results DIR      where the run's directory is created (default ./sqlancer-results)
+  --use-reducer      reduce each failure with SQLancer's statement reducer
+  --kill-interval S  every S seconds, kill a random node, node 0 included, with kill -9 and restart it,
+                     which rejoins it to the cluster (default 0: never). Needs --kfactor 1 or more.
+  --resize-interval S  every S seconds, resize the cluster elastically, growing and shrinking by turns: add
+                     k+1 nodes (voltdb start --add), then remove them (voltadmin resize) (default 0: never).
+                     Not with --kill-interval.
+  --crash-interval S every S seconds, kill every node at once with kill -9 and restart them all, which
+                     recovers the database from its snapshots and synchronous command log (default 0:
+                     never). Not with --kill-interval or --resize-interval.
+  --graceful B       (milestone 48) with --kill-interval, every other node failure (the second, fourth, ...) is
+                     "voltadmin stop" instead of kill -9; with --crash-interval, every other crash is "voltadmin
+                     shutdown --save", whose restart recovers from the shutdown snapshot (default true)
+  --xdcr             also start a second cluster of the same shape, linked to the first by XDCR (active-active
+                     DR), and run the provider with --xdcr: each database writes through one of the two, its DDL
+                     runs on both, and the XDCR oracle compares their rows. With --kill-interval, the first
+                     cluster's nodes are killed and rejoined (milestone 49); with --resize-interval, the first
+                     cluster grows and shrinks while the second keeps its size (milestone 56). Not with
+                     --crash-interval.
+  --upgrade-from DIR start the cluster on this older VoltDB kit (normally the last release) and, at
+                     --upgrade-at, upgrade it in service to --voltdb: one node at a time, voltadmin stop, then
+                     voltdb start on the new kit, which rejoins. Needs --kfactor 1 or more. Not with
+                     --kill-interval, --resize-interval, --crash-interval or --xdcr.
+  --upgrade-java-home DIR  JAVA_HOME for the older kit's nodes (default: the environment's)
+  --upgrade-at S     seconds into the run to start the upgrade (default: a third of --duration)
+  --security         enable security: SQLancer connects as the administrator "sqlancer", and the provider gets
+                     --security true, for the PERMS oracle's users "reader" (role sqlancer_read, SQLREAD) and
+                     "writer" (role sqlancer_write, SQL). Not with --kill-interval, --resize-interval,
+                     --crash-interval, --xdcr or --upgrade-from.
+  --ssl              TLS (milestone 42): the cluster's client, admin and internal connections use TLS, with a
+                     self-signed certificate made for the run (keytool); SQLancer, sqlcmd and voltadmin connect over
+                     it. With --xdcr (milestone 55), both clusters use the certificate, and DR runs over TLS too
+                     (<ssl dr="true">): by the seed, each consumer connection either names a properties file with the
+                     truststore (ssl="<file>") or uses the server's own truststore (ssl=""), and checks the
+                     producer's host name or not (ssl-host-check). The mirror and the JDBC sink run without it.
+  --export           add a file export target ("sqlancer", CSV into each node's voltdbroot/sqlancer_export) for the
+                     STREAMS oracle's streams, and check at the end, after @Quiesce, that it wrote every row they got;
+                     and a loopback target ("sqlancer_lb", into the table XS_LB) whose rows STREAMS checks as it goes;
+                     an HTTP target ("sqlancer_http") and a JDBC target ("sqlancer_jdbc", into a one-node sink
+                     cluster of the same kit) whose rows are counted with the file target's
+  --http-mode MODE   how the HTTP target sends rows (milestone 47): form (one row per request as form pairs, by POST,
+                     PUT or GET), signed (form, signed with HmacSHA1 or HmacSHA256, which the receiver checks) or
+                     batch (CSV batches every 10 s, by POST or PUT); default: chosen from the seed, as is the method
+  --keep-cluster     leave the cluster running and its data in place after the run
+  --mirror-voltdb DIR  also start one node of this other VoltDB kit (normally the last release) and run
+                     the provider with --mirror: every change is repeated on it, and the DIFF oracle
+                     compares the two clusters' rows
+  --mirror-license FILE  license for the mirror's voltdb init (default: --license)
+  --mirror-java-home DIR  JAVA_HOME for the mirror (default: the environment's); an older release may
+                     not run on the newer JDK the cluster uses (16.0.0 needs Java 17 or 21)
+  -h, --help         this help
+
+Options after -- go to the provider, after "voltdb --oracle ...", e.g. -- --avoid-known-bugs false.
+EOF
+}
+
+die() {
+    echo "run-sqlancer: $*" >&2
+    exit 2
+}
+
+script_dir=$(cd "$(dirname "$0")" && pwd)
+repo_dir=$(dirname "$script_dir")
+
+voltdb_home=${VOLTDB_HOME:-}
+license=
+nodes=1
+kfactor=
+sites=8
+oracles=NOREC,TLP_WHERE
+duration=1800
+seed=
+threads=4
+queries=100
+# below Linux's (32768-60999) and macOS's (49152-65535) ephemeral ports: an outgoing connection can take a port in
+# that range while a killed node is down (--kill-interval), and the node then cannot bind it when it restarts
+port_base=30000
+results_root=$PWD/sqlancer-results
+use_reducer=false
+keep_cluster=false
+kill_interval=0
+crash_interval=0
+graceful=true
+xdcr=false
+security=false
+ssl=false
+export=false
+http_mode=
+upgrade_from=
+upgrade_java_home=
+upgrade_at=
+resize_interval=0
+mirror_home=
+mirror_license=
+mirror_java_home=
+provider_args=()
+command_line="$0 $*"
+
+while [ $# -gt 0 ]; do
+    case $1 in
+    --voltdb) voltdb_home=$2; shift 2 ;;
+    --license) license=$2; shift 2 ;;
+    --nodes) nodes=$2; shift 2 ;;
+    --kfactor) kfactor=$2; shift 2 ;;
+    --sites) sites=$2; shift 2 ;;
+    --oracle) oracles=$2; shift 2 ;;
+    --duration) duration=$2; shift 2 ;;
+    --seed) seed=$2; shift 2 ;;
+    --threads) threads=$2; shift 2 ;;
+    --queries) queries=$2; shift 2 ;;
+    --port-base) port_base=$2; shift 2 ;;
+    --results) results_root=$2; shift 2 ;;
+    --use-reducer) use_reducer=true; shift ;;
+    --keep-cluster) keep_cluster=true; shift ;;
+    --kill-interval) kill_interval=$2; shift 2 ;;
+    --crash-interval) crash_interval=$2; shift 2 ;;
+    --graceful) graceful=$2; shift 2 ;;
+    --xdcr) xdcr=true; shift ;;
+    --security) security=true; shift ;;
+    --ssl) ssl=true; shift ;;
+    --export) export=true; shift ;;
+    --http-mode) http_mode=$2; shift 2 ;;
+    --upgrade-from) upgrade_from=$2; shift 2 ;;
+    --upgrade-java-home) upgrade_java_home=$2; shift 2 ;;
+    --upgrade-at) upgrade_at=$2; shift 2 ;;
+    --resize-interval) resize_interval=$2; shift 2 ;;
+    --mirror-voltdb) mirror_home=$2; shift 2 ;;
+    --mirror-license) mirror_license=$2; shift 2 ;;
+    --mirror-java-home) mirror_java_home=$2; shift 2 ;;
+    -h | --help) usage; exit 0 ;;
+    --) shift; provider_args=("$@"); break ;;
+    *) usage >&2; die "unknown option: $1" ;;
+    esac
+done
+
+[ -n "$voltdb_home" ] || die "--voltdb (or VOLTDB_HOME) is required"
+[ -x "$voltdb_home/bin/voltdb" ] || die "no bin/voltdb in $voltdb_home"
+license_args=()
+if [ -n "$license" ]; then
+    [ -r "$license" ] || die "cannot read the license $license"
+    license_args=(--license "$license")
+fi
+mirror_license_args=()
+if [ -n "$mirror_home" ]; then
+    [ -x "$mirror_home/bin/voltdb" ] || die "no bin/voltdb in $mirror_home"
+    [ -z "$mirror_java_home" ] || [ -x "$mirror_java_home/bin/java" ] || die "no bin/java in $mirror_java_home"
+    mirror_license=${mirror_license:-$license}
+    if [ -n "$mirror_license" ]; then
+        [ -r "$mirror_license" ] || die "cannot read the license $mirror_license"
+        mirror_license_args=(--license "$mirror_license")
+    fi
+fi
+for n in "$nodes" "$sites" "$duration" "$threads" "$queries" "$port_base" "$kill_interval" "$resize_interval" "$crash_interval"; do
+    case $n in '' | *[!0-9]*) die "not a number: '$n'" ;; esac
+done
+[ "$nodes" -ge 1 ] || die "--nodes must be at least 1"
+if [ -z "$kfactor" ]; then
+    if [ "$nodes" -eq 1 ]; then kfactor=0; else kfactor=1; fi
+fi
+[ "$kfactor" -lt "$nodes" ] || die "--kfactor must be less than --nodes"
+[ -n "$seed" ] || seed=$(date +%s)
+# the HTTP target's mode and method, from the seed unless --http-mode names the mode (milestone 47)
+http_modes=(form signed batch)
+[ -n "$http_mode" ] || http_mode=${http_modes[$((seed % 3))]}
+case "$http_mode" in
+    form|signed) http_methods=(POST PUT GET) ;;
+    batch) http_methods=(POST PUT) ;;
+    *) die "--http-mode must be form, signed or batch" ;;
+esac
+http_method=${http_methods[$((seed / 3 % ${#http_methods[@]}))]}
+http_sig_alg=$([ $((seed / 7 % 2)) -eq 0 ] && echo HmacSHA1 || echo HmacSHA256)
+[ "$kill_interval" -eq 0 ] || [ "$resize_interval" -eq 0 ] || die "--kill-interval and --resize-interval do not mix"
+[ "$crash_interval" -eq 0 ] || { [ "$kill_interval" -eq 0 ] && [ "$resize_interval" -eq 0 ]; } ||
+    die "--crash-interval does not mix with --kill-interval or --resize-interval"
+if [ -n "$upgrade_from" ]; then
+    [ -x "$upgrade_from/bin/voltdb" ] || die "no bin/voltdb in $upgrade_from"
+    [ "$kfactor" -ge 1 ] || die "--upgrade-from needs --kfactor 1 or more"
+    [ "$kill_interval" -eq 0 ] && [ "$resize_interval" -eq 0 ] && [ "$crash_interval" -eq 0 ] && ! $xdcr ||
+        die "--upgrade-from does not mix with --kill-interval, --resize-interval, --crash-interval or --xdcr"
+    [ -n "$upgrade_at" ] || upgrade_at=$((duration / 3))
+    case $upgrade_at in '' | *[!0-9]*) die "not a number: '$upgrade_at'" ;; esac
+    # a stopped node drops the calls in flight on it, which the provider then expects (see VoltDBErrors)
+    provider_args=(--upgrades true ${provider_args[@]+"${provider_args[@]}"})
+fi
+if $security; then
+    [ "$kill_interval" -eq 0 ] && [ "$resize_interval" -eq 0 ] && [ "$crash_interval" -eq 0 ] && ! $xdcr &&
+        [ -z "$upgrade_from" ] ||
+        die "--security does not mix with --kill-interval, --resize-interval, --crash-interval, --xdcr or --upgrade-from"
+    provider_args=(--security true ${provider_args[@]+"${provider_args[@]}"})
+fi
+if $export; then
+    provider_args=(--export-target sqlancer,sqlancer_http,sqlancer_jdbc --loopback-target sqlancer_lb --ttl-migrate-target sqlancer_lbt ${provider_args[@]+"${provider_args[@]}"})
+fi
+# the administrator's credentials for voltadmin and sqlancer, with --security
+admin_creds=()
+$security && admin_creds=(-u sqlancer -p sqlancer)
+# with --ssl, how sqlcmd (a truststore, below) and voltadmin (no certificate check) reach the cluster over TLS
+ssl_sqlcmd=()
+ssl_voltadmin=()
+if $xdcr; then
+    # with --kill-interval (milestone 49), the nodes killed and rejoined are the first cluster's, and with
+    # --resize-interval (milestone 56) the nodes added and removed are too; the second cluster keeps its nodes. The
+    # added nodes are initialized with the first cluster's deployment, its DR connection to the second included.
+    [ "$crash_interval" -eq 0 ] || die "--xdcr does not mix with --crash-interval"
+fi
+if [ "$crash_interval" -gt 0 ]; then
+    # a crash drops every call in flight and every connection; the provider skips what it interrupted and waits for
+    # the cluster to recover (see VoltDBErrors)
+    provider_args=(--crashes true ${provider_args[@]+"${provider_args[@]}"})
+fi
+if [ "$resize_interval" -gt 0 ]; then
+    # a shrink drops the calls in flight on the hosts it removes, which the provider then expects (see VoltDBErrors)
+    provider_args=(--resizes true ${provider_args[@]+"${provider_args[@]}"})
+fi
+if [ "$kill_interval" -gt 0 ]; then
+    [ "$kfactor" -ge 1 ] || die "--kill-interval needs --kfactor 1 or more"
+    # the provider expects the errors a node failure causes (see VoltDBErrors)
+    provider_args=(--node-failures true ${provider_args[@]+"${provider_args[@]}"})
+fi
+
+java=java
+[ -n "${JAVA_HOME:-}" ] && java=$JAVA_HOME/bin/java
+
+jar=$(ls "$repo_dir"/target/sqlancer-*.jar 2>/dev/null | head -1)
+if [ -z "$jar" ]; then
+    echo "Building SQLancer (mvn package -DskipTests)"
+    (cd "$repo_dir" && mvn -q package -DskipTests) || die "the build failed"
+    jar=$(ls "$repo_dir"/target/sqlancer-*.jar | head -1)
+fi
+
+# Ports: node i uses port_base + 10*i + 0..5 for client, admin, internal, zookeeper, replication and metrics
+port() { echo $((port_base + 10 * $1 + $2)); }
+client_port() { port "$1" 0; }
+# every node's address, as a comma-separated list: hosts() internal for the cluster's host list, hosts client for
+# SQLancer's connections
+hosts() {
+    local list= i
+    for ((i = 0; i < nodes; i++)); do
+        list+="${list:+,}localhost:$("$1_port" $i)"
+    done
+    echo "$list"
+}
+# SQLancer connects to every node (--servers), so that it keeps running while any one of them is down; --host and
+# --port remain for the run's other uses of SQLancer's options
+if [ "$nodes" -gt 1 ]; then
+    provider_args+=(--servers "$(hosts client)")
+fi
+admin_port() { port "$1" 1; }
+internal_port() { port "$1" 2; }
+metrics_port() { port "$1" 5; }
+# the metrics system is on (milestone 52), collecting every second: METRICS reads every node's /metrics
+provider_args+=(--metrics-servers "$(hosts metrics)")
+
+port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+# the mirror, if any, takes the port slot after the last node's; the k+1 nodes a resize adds take the slots after that
+added=0
+[ "$resize_interval" -gt 0 ] && added=$((kfactor + 1))
+added_slot=$((nodes + 1))
+# the XDCR peer's nodes take the slots from 20; with --export, the JDBC target's sink node takes slot 19; with IMPORT
+# among the oracles, the pull socket importer's ports are slot 18's first four
+xdcr_slot=20
+sink_slot=19
+import_slot=18
+importing_oracle=false
+case ",$oracles," in *,IMPORT,*) importing_oracle=true ;; esac
+for ((i = 0; i < added_slot + added; i++)); do
+    [ "$i" -eq "$nodes" ] && [ -z "$mirror_home" ] && continue
+    for j in 0 1 2 3 4 5; do
+        p=$(port $i $j)
+        port_in_use "$p" && die "port $p is in use; pick another --port-base"
+    done
+done
+if $importing_oracle; then
+    [ $((added_slot + added)) -le "$import_slot" ] || die "IMPORT allows at most $((import_slot - 1 - added)) nodes"
+    for j in 0 1 2 3; do
+        port_in_use "$(port $import_slot $j)" && die "port $(port $import_slot $j) is in use; pick another --port-base"
+    done
+    provider_args+=(--import-ports "$(port $import_slot 0)-$(port $import_slot 3)")
+fi
+if $export; then
+    [ $((added_slot + added)) -le "$sink_slot" ] || die "--export allows at most $((sink_slot - 1 - added)) nodes"
+    for j in 0 1 2 3 4 5; do
+        port_in_use "$(port $sink_slot $j)" && die "port $(port $sink_slot $j) is in use; pick another --port-base"
+    done
+fi
+if $xdcr; then
+    [ "$nodes" -le "$xdcr_slot" ] || die "--xdcr allows at most $xdcr_slot nodes"
+    for ((i = xdcr_slot; i < xdcr_slot + nodes; i++)); do
+        for j in 0 1 2 3 4 5; do
+            p=$(port $i $j)
+            port_in_use "$p" && die "port $p is in use; pick another --port-base"
+        done
+    done
+fi
+# the XDCR peer's addresses, like hosts(): xdcr_hosts client|internal|replication
+xdcr_hosts() {
+    local list= i k
+    case $1 in client) k=0 ;; internal) k=2 ;; replication) k=4 ;; esac
+    for ((i = 0; i < nodes; i++)); do
+        list+="${list:+,}localhost:$(port $((xdcr_slot + i)) $k)"
+    done
+    echo "$list"
+}
+replication_hosts() {
+    local list= i
+    for ((i = 0; i < nodes; i++)); do
+        list+="${list:+,}localhost:$(port $i 4)"
+    done
+    echo "$list"
+}
+
+run_id=sqlancer-$(date -u +%Y%m%dT%H%M%SZ)-seed$seed
+results=$results_root/$run_id
+cluster=$results/cluster
+mkdir -p "$cluster" "$results/sqlancer" "$results/servers" "$results/reproductions" || die "cannot create $results"
+results=$(cd "$results" && pwd)
+if [ "$resize_interval" -gt 0 ] || [ "$kill_interval" -gt 0 ]; then
+    # DDL waits while this file exists, which shrink and each kill create (the provider ignores it with
+    # --avoid-known-bugs false)
+    provider_args+=(--ddl-hold "$results/ddl.hold")
+fi
+cluster=$results/cluster
+# a server JVM that crashes writes its error report (the native stack, and the statement and registers at the crash)
+# here rather than into the directory the script was started from, so that the results keep it (lab build #51)
+export VOLTDB_OPTS="${VOLTDB_OPTS:-} -XX:ErrorFile=$cluster/hs_err_pid%p.log"
+# a user snapshot asked for while another snapshot runs is queued and retried every USER_SNAPSHOT_RETRY_INTERVAL
+# seconds (30 by default); every SNAPSHOT restore asks for a truncation snapshot, so the next save would wait 30 s
+# (SQLANCER_USER_SNAPSHOT_RETRY overrides it; empty keeps VoltDB's default)
+user_snapshot_retry=${SQLANCER_USER_SNAPSHOT_RETRY-1}
+[ -n "$user_snapshot_retry" ] && export VOLTDB_OPTS="$VOLTDB_OPTS -DUSER_SNAPSHOT_RETRY_INTERVAL=$user_snapshot_retry"
+# the SNAPSHOT oracle's snapshots go to each node's own snapshot directory, under its voltdbroot here, where SQLancer
+# reads the files they write
+provider_args+=(--snapshot-path "$cluster")
+# XCONFLICT reads XDCR's conflict log under the nodes' voltdbroots here
+provider_args+=(--cluster-dir "$cluster")
+# JAVAPROC (milestone 50) compiles its procedure classes against the kit's procedure API, server and client jars
+procedure_classpath=$(ls "$voltdb_home"/lib/volt-procedure-api-*.jar "$voltdb_home"/voltdb/voltdb-*.jar \
+    "$voltdb_home"/voltdb/voltdbclient-*.jar 2>/dev/null | paste -sd: -)
+[ -n "$procedure_classpath" ] && provider_args+=(--procedure-classpath "$procedure_classpath")
+
+log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$results/run.log"; }
+
+cluster_started=false
+sqlancer_pid=
+
+# within SECS COMMAND...: runs COMMAND, killing it after SECS seconds (macOS has no timeout(1))
+# runs a command of the mirror's kit with the mirror's JAVA_HOME, if any
+# upgrade_cmd CMD...: runs a command of the older kit with its JAVA_HOME (--upgrade-java-home), if any
+upgrade_cmd() {
+    if [ -n "$upgrade_from" ] && [ -n "$upgrade_java_home" ]; then
+        (export JAVA_HOME=$upgrade_java_home PATH=$upgrade_java_home/bin:$PATH && exec "$@")
+    else
+        "$@"
+    fi
+}
+mirror_cmd() {
+    if [ -n "$mirror_java_home" ]; then
+        JAVA_HOME=$mirror_java_home PATH=$mirror_java_home/bin:$PATH "$@"
+    else
+        "$@"
+    fi
+}
+
+within() {
+    local secs=$1
+    shift
+    "$@" &
+    local pid=$! i
+    for ((i = 0; i < secs; i++)); do
+        kill -0 "$pid" 2>/dev/null || { wait "$pid"; return; }
+        sleep 1
+    done
+    kill -9 "$pid" 2>/dev/null
+    echo "run-sqlancer: gave up after $secs s: $*" >&2
+    return 124
+}
+
+stop_cluster() {
+    $cluster_started || return 0
+    cluster_started=false
+    if $keep_cluster; then
+        log "Leaving the cluster running (--keep-cluster): client port $(client_port 0), data in $cluster"
+        return 0
+    fi
+    log "Stopping the cluster"
+    # by port only once this run's node 0 is known to be up, so that it cannot reach another server on that port
+    # at most 120 s: on a wedged cluster (ENG-30612) the shutdown never returns, and the processes are killed below
+    if grep -q "Server completed initialization" "$cluster/node0/voltdbroot/log/volt.log" 2>/dev/null; then
+        # with --export, a graceful shutdown first, which drains and closes the export files
+        if ! { $export && within 180 "$voltdb_home/bin/voltadmin" shutdown -H "localhost:$(admin_port 0)" ${admin_creds[@]+"${admin_creds[@]}"} ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} >>"$results/run.log" 2>&1; }; then
+            within 120 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port 0)" ${admin_creds[@]+"${admin_creds[@]}"} ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} >>"$results/run.log" 2>&1
+        fi
+    fi
+    if [ -n "$mirror_home" ] && grep -q "Server completed initialization" "$cluster/mirror/voltdbroot/log/volt.log" 2>/dev/null; then
+        within 120 mirror_cmd "$mirror_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $nodes)" ${admin_creds[@]+"${admin_creds[@]}"} >>"$results/run.log" 2>&1
+    fi
+    if $xdcr && grep -q "Server completed initialization" "$cluster/xdcr0/voltdbroot/log/volt.log" 2>/dev/null; then
+        within 120 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $xdcr_slot)" ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} >>"$results/run.log" 2>&1
+    fi
+    # only processes started for this run carry its directory on their command line, and their PIDs are recorded
+    for _ in $(seq 1 30); do
+        pgrep -f "$cluster/" >/dev/null || break
+        sleep 1
+    done
+    pkill -f "$cluster/" 2>/dev/null
+    for f in "$cluster"/node*.pid "$cluster"/add*.pid "$cluster"/mirror.pid "$cluster"/sink.pid; do
+        [ -e "$f" ] && is_server "$(cat "$f")" && kill -9 "$(cat "$f")" 2>/dev/null
+    done
+}
+
+# is_server PID: whether PID is a running VoltDB server (and not another process that reused the PID)
+is_server() {
+    ps -ww -o command= -p "$1" 2>/dev/null | grep -q "org.voltdb.VoltDB"
+}
+
+trap 'stop_cluster' EXIT
+interrupted() {
+    log "Interrupted"
+    [ -n "$sqlancer_pid" ] && kill "$sqlancer_pid" 2>/dev/null
+    echo "RESULT: ERROR (interrupted)" >"$results/summary.txt"
+    exit 2
+}
+trap interrupted INT TERM
+
+# --- manifest ----------------------------------------------------------------------------------------------------
+
+sqlancer_commit=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo unknown)
+sqlancer_dirty=$(git -C "$repo_dir" status --porcelain 2>/dev/null | grep -v '^??' | wc -l | tr -d ' ')
+{
+    echo "run:              $run_id"
+    echo "started:          $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "host:             $(hostname) ($(uname -sm))"
+    echo "command:          $command_line"
+    echo "sqlancer jar:     $jar"
+    echo "sqlancer commit:  $sqlancer_commit$([ "$sqlancer_dirty" = 0 ] || echo " (plus $sqlancer_dirty uncommitted changes)")"
+    echo "voltdb:           $voltdb_home"
+    echo "voltdb version:   $("$voltdb_home/bin/voltdb" --version 2>&1 | tail -1)"
+    echo "license:          ${license:-none}"
+    [ -n "$mirror_home" ] && echo "mirror:           $mirror_home ($(mirror_cmd "$mirror_home/bin/voltdb" --version 2>&1 | tail -1)), 1 node, client port $(client_port $nodes)$([ -z "$mirror_java_home" ] || echo ", java $(mirror_cmd java -version 2>&1 | head -1)")"
+    echo "java:             $("$java" -version 2>&1 | head -1)"
+    echo "nodes:            $nodes"
+    echo "kfactor:          $kfactor"
+    echo "sites per host:   $sites"
+    echo "client ports:     $(for ((i = 0; i < nodes; i++)); do printf '%s ' "$(client_port $i)"; done)"
+    echo "oracles:          $oracles"
+    echo "duration:         $duration s"
+    echo "seed:             $seed"
+    echo "threads:          $threads"
+    echo "queries per db:   $queries"
+    echo "use reducer:      $use_reducer"
+    echo "kill interval:    $([ "$kill_interval" -gt 0 ] && echo "$kill_interval s" || echo never)"
+    echo "xdcr:             $($xdcr && echo "a second cluster of $nodes node(s), k=$kfactor, client ports $(xdcr_hosts client)" || echo no)"
+    echo "upgrade:          $([ -n "$upgrade_from" ] && echo "from $upgrade_from ($(upgrade_cmd "$upgrade_from/bin/voltdb" --version 2>&1 | tail -1)) at $upgrade_at s" || echo no)"
+    echo "security:         $($security && echo "on: users sqlancer (administrator), reader (sqlancer_read), writer (sqlancer_write)" || echo off)"
+    echo "tls:              $($ssl && echo "on: client, admin and internal connections$($xdcr && echo ", and DR (the consumer's truststore: $([ $((seed / 11 % 2)) -eq 0 ] && echo "a properties file" || echo "the server's"); host name check $([ $((seed / 13 % 2)) -eq 0 ] && echo on || echo off))"), a self-signed certificate (cluster/tls)" || echo off)"
+    echo "export:           $($export && echo "file target sqlancer, CSV; HTTP target $http_mode by $http_method$([ "$http_mode" = signed ] && echo ", $http_sig_alg")" || echo no)"
+    echo "crash interval:   $([ "$crash_interval" -gt 0 ] && echo "$crash_interval s, every node killed and recovered" || echo never)"
+    echo "resize interval:  $([ "$resize_interval" -gt 0 ] && echo "$resize_interval s, $added nodes added and removed by turns" || echo never)"
+    echo "provider options: ${provider_args[*]:-}"
+} >"$results/manifest.txt"
+cat "$results/manifest.txt"
+
+# --- cluster -----------------------------------------------------------------------------------------------------
+
+# with --crash-interval, a synchronous command log (a transaction is acknowledged once it is on disk, so none that was
+# acknowledged may be lost) and a snapshot every 2 minutes, which recovery starts from before replaying the log
+durability=
+if [ "$crash_interval" -gt 0 ]; then
+    durability='
+    <commandlog enabled="true" synchronous="true"/>
+    <snapshot prefix="auto" frequency="2m" retain="2"/>'
+fi
+# with --xdcr, DR id 1 here and 2 on the peer, each the other's source; with --ssl too (milestone 55), DR runs over
+# TLS, and the seed picks how the consumer finds its truststore (a properties file, or the server's own) and whether
+# it checks the producer's host name
+dr=
+dr_tls=
+dr_ssl_attr=
+if $xdcr; then
+    if $ssl; then
+        dr_tls=' dr="true"'
+        dr_ssl_file=$([ $((seed / 11 % 2)) -eq 0 ] && echo "$cluster/tls/ssl.properties" || echo "")
+        dr_ssl_attr=" ssl=\"$dr_ssl_file\""
+        [ $((seed / 13 % 2)) -eq 0 ] && dr_ssl_attr+=' ssl-host-check="true"'
+    fi
+    dr='
+    <dr id="1" role="xdcr">
+        <connection source="'$(xdcr_hosts replication)'"'"$dr_ssl_attr"'/>
+    </dr>'
+fi
+# with --security, three users; the provider creates the two roles (CREATE ROLE) when it first connects
+users=
+if $security; then
+    users='
+    <security enabled="true" provider="hash"/>
+    <users>
+        <user name="sqlancer" password="sqlancer" roles="administrator"/>
+        <user name="reader" password="reader" roles="sqlancer_read"/>
+        <user name="writer" password="writer" roles="sqlancer_write"/>
+    </users>'
+fi
+# ENG-30681: into VoltDB the JDBC target writes rows with UPSERT, but the tables it creates have no primary key, so
+# VoltDB refuses every row; and its CREATE TABLE gives a FLOAT column the type DOUBLE PRECISION, which VoltDB refuses
+# too. While avoiding known bugs (the provider's default), the sink's tables are created beforehand, with I (unique in
+# the run) as their primary key, and the target creates none; a row exported twice is upserted once
+jdbc_createtable=false
+case " ${provider_args[*]-} " in *" --avoid-known-bugs false "*) jdbc_createtable=true ;; esac
+# with --export, a file target for the STREAMS oracle's streams, one CSV line per row. The outdir is relative, so each
+# node writes into its own voltdbroot, as on separate hosts: in one shared directory two nodes exporting the same
+# stream in the same second name the same file, and the target refuses it and retries the block for good, logging a
+# stack trace each time (lab build #43: 60 GB of volt.log per node in 45 minutes, and the rows it held never written)
+exporting=
+# the HTTP target (milestone 47): form pairs, signed or not, or CSV batches, whose endpoint must name the table, the
+# partition and the generation; a batch is sent when the target rolls it, every period
+http_properties='
+            <property name="endpoint">http://localhost:'"$(port 0 7)"'/%t</property>
+            <property name="method">'"$http_method"'</property>'
+case "$http_mode" in
+    signed) http_properties+='
+            <property name="secret">sqlancer-secret</property>
+            <property name="signatureMethod">'"$http_sig_alg"'</property>
+            <property name="signatureName">Signature</property>' ;;
+    # ENG-30694: in batch mode the client reads the endpoint's query string without checking that it has one, and
+    # with none it fails every batch after sending it (a NullPointerException) and sends it again, for good: the stream
+    # exports nothing more. While avoiding known bugs the endpoint has a query string
+    batch)
+        http_query='?sqlancer=1'
+        case " ${provider_args[*]-} " in *" --avoid-known-bugs false "*) http_query= ;; esac
+        http_properties='
+            <property name="endpoint">http://localhost:'"$(port 0 7)"'/%t/%p/%g'"$http_query"'</property>
+            <property name="method">'"$http_method"'</property>
+            <property name="batch.mode">true</property>
+            <property name="type">csv</property>
+            <property name="period">10s</property>' ;;
+esac
+if $export; then
+    exporting='
+    <export>
+        <configuration target="sqlancer" enabled="true" type="file">
+            <property name="type">csv</property>
+            <property name="nonce">sqlancer</property>
+            <property name="outdir">sqlancer_export</property>
+            <property name="period">1</property>
+        </configuration>
+        <configuration target="sqlancer_http" enabled="true" type="http">'"$http_properties"'
+        </configuration>
+        <configuration target="sqlancer_jdbc" enabled="true" type="jdbc">
+            <property name="jdbcurl">jdbc:voltdb://localhost:'"$(port $sink_slot 0)"'</property>
+            <property name="jdbcuser">sqlancer</property>
+            <property name="jdbcpassword">sqlancer</property>
+            <property name="ignoregenerations">true</property>
+            <property name="skipinternals">true</property>
+            <property name="createtable">'"$jdbc_createtable"'</property>
+        </configuration>
+        <configuration target="sqlancer_lb" enabled="true" type="custom"
+                exportconnectorclass="org.voltdb.exportclient.loopback.LoopbackExportClient">
+            <property name="procedure">XS_LB.insert</property>
+        </configuration>
+        <configuration target="sqlancer_lbt" enabled="true" type="custom"
+                exportconnectorclass="org.voltdb.exportclient.loopback.LoopbackExportClient">
+            <property name="procedure">XS_LBT.insert</property>
+        </configuration>
+    </export>'
+fi
+# with --ssl, a self-signed certificate for localhost in a keystore, the same certificate in a truststore, and
+# sqlcmd's file naming the truststore; the cluster uses TLS for its client, admin and internal connections
+tls=
+if $ssl; then
+    mkdir -p "$cluster/tls"
+    # the certificate names localhost and every IPv4 address of this machine: a DR producer advertises the machine's
+    # address, not localhost, and the consumer's host name check (ssl-host-check, milestone 55) needs it named;
+    # TLSRELOAD's new certificates take the same names from cluster/tls/san
+    san="dns:localhost,ip:127.0.0.1"
+    for a in $({ ifconfig 2>/dev/null || ip -4 addr 2>/dev/null; } | awk '/inet /{sub("addr:", "", $2); sub("/.*", "", $2); print $2}' | sort -u); do
+        [ "$a" = 127.0.0.1 ] || san+=",ip:$a"
+    done
+    echo "$san" >"$cluster/tls/san"
+    keytool -genkeypair -alias voltdb -keyalg RSA -keysize 2048 -validity 30 -dname "CN=localhost" \
+        -ext "SAN=$san" -keystore "$cluster/tls/keystore.jks" -storetype JKS \
+        -storepass sqlancer -keypass sqlancer >"$cluster/tls/keytool.log" 2>&1 &&
+        keytool -exportcert -alias voltdb -keystore "$cluster/tls/keystore.jks" -storepass sqlancer \
+            -file "$cluster/tls/voltdb.cer" >>"$cluster/tls/keytool.log" 2>&1 &&
+        keytool -importcert -noprompt -alias voltdb -file "$cluster/tls/voltdb.cer" \
+            -keystore "$cluster/tls/truststore.jks" -storetype JKS -storepass sqlancer >>"$cluster/tls/keytool.log" 2>&1 ||
+        die "keytool failed; see $cluster/tls/keytool.log"
+    printf 'trustStore=%s\ntrustStorePassword=sqlancer\n' "$cluster/tls/truststore.jks" >"$cluster/tls/ssl.properties"
+    ssl_sqlcmd=(--ssl="$cluster/tls/ssl.properties")
+    ssl_voltadmin=(--ssl=nocheck)
+    provider_args+=(--ssl-truststore "$cluster/tls/truststore.jks")
+    tls='
+    <ssl enabled="true" external="true" internal="true"'"$dr_tls"'>
+        <keystore path="'"$cluster/tls/keystore.jks"'" password="sqlancer"/>
+        <truststore path="'"$cluster/tls/truststore.jks"'" password="sqlancer"/>
+    </ssl>'
+fi
+# with IMPORT among the oracles, the pull socket importer (milestone 41): CSV lines from four ports on this machine, which
+# SQLancer's IMPORT oracle listens on, into XI.insert; the nodes share the ports out among themselves
+importing=
+if $importing_oracle; then
+    importing='
+    <import>
+        <configuration type="custom" module="pullsocketimporter.jar" format="csv" enabled="true">
+            <property name="addresses">localhost:'"$(port $import_slot 0)-$(port $import_slot 3)"'</property>
+            <property name="procedure">XI.insert</property>
+        </configuration>
+    </import>'
+fi
+cat >"$cluster/deployment.xml" <<EOF
+<?xml version="1.0"?>
+<deployment>
+    <cluster sitesperhost="$sites" kfactor="$kfactor"/>
+    <httpd enabled="false"/>
+    <metrics enabled="true" interval="1s"/>$durability$dr$users$tls$exporting$importing
+</deployment>
+EOF
+
+# with --export, the HTTP target's receiver (voltdb/http-receiver.py): one line per request, under $cluster so that
+# stopping the cluster stops it too
+if $export; then
+    python3 -I "$repo_dir/voltdb/http-receiver.py" "$(port 0 7)" "$cluster/http-export.log" "$cluster/http.hold" \
+        "$http_mode" sqlancer-secret "$http_sig_alg" Signature >"$cluster/http-receiver.out" 2>&1 &
+fi
+log "Starting $nodes node(s), k=$kfactor, $sites sites per host"
+for ((i = 0; i < nodes; i++)); do
+    node=$cluster/node$i
+    upgrade_cmd "${upgrade_from:-$voltdb_home}/bin/voltdb" init --force -D "$node" -C "$cluster/deployment.xml" ${license_args[@]+"${license_args[@]}"} >"$cluster/init$i.log" 2>&1 ||
+        die "voltdb init failed for node $i; see $cluster/init$i.log"
+done
+cluster_started=true
+# the kit node i runs, and its JAVA_HOME (empty: the environment's); with --upgrade-from every node starts on the
+# older kit and moves to --voltdb when it is upgraded
+node_home=()
+node_java=()
+for ((i = 0; i < nodes; i++)); do
+    node_home[i]=${upgrade_from:-$voltdb_home}
+    node_java[i]=$([ -n "$upgrade_from" ] && echo "$upgrade_java_home")
+done
+# start_node I LOG: starts node I, or restarts it after a failure, which rejoins it to the running cluster
+start_node() {
+    # in the foreground under nohup: "voltdb start --background" allows one server per user (a shared PID file).
+    # In a subshell, so that the server is not one of this script's jobs and its kill -9 is not reported. The
+    # launcher execs the server's JVM, so the PID it starts with is the server's, which node<i>.pid records.
+    # Every node gets the whole host list, so that a restarted node, node 0 included, finds a live one to rejoin through
+    (if [ -n "${node_java[$1]}" ]; then export JAVA_HOME=${node_java[$1]} PATH=${node_java[$1]}/bin:$PATH; fi
+        nohup "${node_home[$1]}/bin/voltdb" start -D "$cluster/node$1" -c "$nodes" -H "$(hosts internal)" \
+        --client="$(client_port $1)" --admin="$(admin_port $1)" --internal="$(internal_port $1)" \
+        --zookeeper="$(port $1 3)" --replication="$(port $1 4)" --metrics="$(port $1 5)" \
+        >"$2" 2>&1 &
+        echo $! >"$cluster/node$1.pid")
+}
+for ((i = 0; i < nodes; i++)); do
+    start_node $i "$cluster/start$i.log"
+done
+
+ready=0
+for _ in $(seq 1 300); do
+    ready=0
+    for ((i = 0; i < nodes; i++)); do
+        grep -q "Server completed initialization" "$cluster/node$i/voltdbroot/log/volt.log" 2>/dev/null &&
+            ready=$((ready + 1))
+    done
+    [ "$ready" -eq "$nodes" ] && break
+    sleep 1
+done
+if [ "$ready" -ne "$nodes" ]; then
+    log "The cluster did not start within 300 s ($ready of $nodes nodes ready)"
+    for ((i = 0; i < nodes; i++)); do
+        mkdir -p "$results/servers/node$i"
+        cp "$cluster/start$i.log" "$results/servers/node$i/" 2>/dev/null
+        cp -R "$cluster/node$i/voltdbroot/log/." "$results/servers/node$i/" 2>/dev/null
+    done
+    echo "RESULT: ERROR (the cluster did not start)" >"$results/summary.txt"
+    exit 2
+fi
+log "Cluster ready: $(grep -h -m1 "^Build:" "$cluster/init0.log" 2>/dev/null)"
+
+# --- XDCR peer ---------------------------------------------------------------------------------------------------
+
+# a second cluster of the same shape, DR id 2, linked to the first by XDCR; its nodes take the slots from 20
+if $xdcr; then
+    # the peer imports nothing: its nodes would take the importer's ports from the first cluster's
+    sed -e 's/<dr id="1"/<dr id="2"/' -e "s|<connection source=\"[^\"]*\"|<connection source=\"$(replication_hosts)\"|" \
+        -e '/<import>/,/<\/import>/d' "$cluster/deployment.xml" >"$cluster/deployment-xdcr.xml"
+    for ((i = 0; i < nodes; i++)); do
+        "$voltdb_home/bin/voltdb" init --force -D "$cluster/xdcr$i" -C "$cluster/deployment-xdcr.xml" \
+            ${license_args[@]+"${license_args[@]}"} >"$cluster/init-xdcr$i.log" 2>&1 ||
+            die "voltdb init failed for XDCR node $i; see $cluster/init-xdcr$i.log"
+    done
+    for ((i = 0; i < nodes; i++)); do
+        x=$((xdcr_slot + i))
+        (nohup "$voltdb_home/bin/voltdb" start -D "$cluster/xdcr$i" -c "$nodes" -H "$(xdcr_hosts internal)" \
+            --client="$(client_port $x)" --admin="$(admin_port $x)" --internal="$(internal_port $x)" \
+            --zookeeper="$(port $x 3)" --replication="$(port $x 4)" --metrics="$(port $x 5)" \
+            >"$cluster/start-xdcr$i.log" 2>&1 &
+            echo $! >"$cluster/xdcr$i.pid")
+    done
+    ready=0
+    for _ in $(seq 1 300); do
+        ready=0
+        for ((i = 0; i < nodes; i++)); do
+            grep -q "Server completed initialization" "$cluster/xdcr$i/voltdbroot/log/volt.log" 2>/dev/null &&
+                ready=$((ready + 1))
+        done
+        [ "$ready" -eq "$nodes" ] && break
+        sleep 1
+    done
+    [ "$ready" -eq "$nodes" ] || die "the XDCR peer did not start within 300 s ($ready of $nodes nodes ready)"
+    log "XDCR peer ready: client ports $(xdcr_hosts client)"
+    provider_args+=(--xdcr "$(xdcr_hosts client)")
+fi
+
+# --- mirror (DIFF) -----------------------------------------------------------------------------------------------
+
+# one node of the other kit, k=0, the same sites per host, on the port slot after the last node's
+if [ -n "$mirror_home" ]; then
+    m=$nodes
+    # the mirror never crashes: no command log or snapshots
+    sed -e "s/kfactor=\"$kfactor\"/kfactor=\"0\"/" -e '/<commandlog /d' -e '/<snapshot /d' \
+        -e '/<dr /d' -e '/<connection /d' -e '/<\/dr>/d' -e '/<export>/,/<\/export>/d' -e '/<import>/,/<\/import>/d' \
+        -e '/<ssl /,/<\/ssl>/d' "$cluster/deployment.xml" >"$cluster/deployment-mirror.xml"
+    mirror_cmd "$mirror_home/bin/voltdb" init --force -D "$cluster/mirror" -C "$cluster/deployment-mirror.xml" \
+        ${mirror_license_args[@]+"${mirror_license_args[@]}"} >"$cluster/init-mirror.log" 2>&1 ||
+        die "voltdb init failed for the mirror; see $cluster/init-mirror.log"
+    (if [ -n "$mirror_java_home" ]; then export JAVA_HOME=$mirror_java_home PATH=$mirror_java_home/bin:$PATH; fi
+        nohup "$mirror_home/bin/voltdb" start -D "$cluster/mirror" -c 1 -H "localhost:$(internal_port $m)" \
+        --client="$(client_port $m)" --admin="$(admin_port $m)" --internal="$(internal_port $m)" \
+        --zookeeper="$(port $m 3)" --replication="$(port $m 4)" --metrics="$(port $m 5)" \
+        >"$cluster/start-mirror.log" 2>&1 &
+        echo $! >"$cluster/mirror.pid")
+    for _ in $(seq 1 300); do
+        grep -q "Server completed initialization" "$cluster/mirror/voltdbroot/log/volt.log" 2>/dev/null && break
+        # a mirror that exited (a JDK it refuses, say) will not start: stop waiting
+        kill -0 "$(cat "$cluster/mirror.pid")" 2>/dev/null || break
+        sleep 1
+    done
+    grep -q "Server completed initialization" "$cluster/mirror/voltdbroot/log/volt.log" 2>/dev/null ||
+        die "the mirror did not start; see $cluster/start-mirror.log: $(tail -1 "$cluster/start-mirror.log" 2>/dev/null)"
+    log "Mirror ready: $(grep -h -m1 "^Build:" "$cluster/init-mirror.log" 2>/dev/null), client port $(client_port $m)"
+    provider_args+=(--mirror "localhost:$(client_port $m)")
+fi
+
+# --- the JDBC target's sink (--export) ---------------------------------------------------------------------------
+
+# one node of the kit under test, k=0, 2 sites per host, on port slot 19, never killed; the JDBC target (milestone 40)
+# creates a table there for each stream it exports, named after the stream, and inserts each row into it
+if $export; then
+    sed -e 's/sitesperhost="[0-9]*"/sitesperhost="2"/' -e "s/kfactor=\"$kfactor\"/kfactor=\"0\"/" \
+        -e '/<commandlog /d' -e '/<snapshot /d' -e '/<dr /d' -e '/<connection /d' -e '/<\/dr>/d' \
+        -e '/<export>/,/<\/export>/d' -e '/<import>/,/<\/import>/d' -e '/<ssl /,/<\/ssl>/d' \
+        "$cluster/deployment.xml" >"$cluster/deployment-sink.xml"
+    "$voltdb_home/bin/voltdb" init --force -D "$cluster/sink" -C "$cluster/deployment-sink.xml" \
+        ${license_args[@]+"${license_args[@]}"} >"$cluster/init-sink.log" 2>&1 ||
+        die "voltdb init failed for the JDBC sink; see $cluster/init-sink.log"
+    (nohup "$voltdb_home/bin/voltdb" start -D "$cluster/sink" -c 1 -H "localhost:$(internal_port $sink_slot)" \
+        --client="$(client_port $sink_slot)" --admin="$(admin_port $sink_slot)" \
+        --internal="$(internal_port $sink_slot)" --zookeeper="$(port $sink_slot 3)" \
+        --replication="$(port $sink_slot 4)" --metrics="$(port $sink_slot 5)" >"$cluster/start-sink.log" 2>&1 &
+        echo $! >"$cluster/sink.pid")
+    for _ in $(seq 1 300); do
+        grep -q "Server completed initialization" "$cluster/sink/voltdbroot/log/volt.log" 2>/dev/null && break
+        kill -0 "$(cat "$cluster/sink.pid")" 2>/dev/null || break
+        sleep 1
+    done
+    grep -q "Server completed initialization" "$cluster/sink/voltdbroot/log/volt.log" 2>/dev/null ||
+        die "the JDBC sink did not start; see $cluster/start-sink.log"
+    if ! $jdbc_createtable; then
+        # the tables the target would create: the STREAMS oracle's stream columns, one table per database name and
+        # stream generation (XS_DB2_ST, then XS_DB2G1_ST up to G8, as streams fall out of step)
+        for ((d = 0; d < 2 * threads; d++)); do
+            for g in "" G1 G2 G3 G4 G5 G6 G7 G8; do
+                echo "CREATE TABLE XS_DB${d}${g}_ST (K INTEGER NOT NULL, V BIGINT, S VARCHAR(16), F FLOAT, I BIGINT NOT NULL, PRIMARY KEY (I));"
+            done
+        done | "$voltdb_home/bin/sqlcmd" --port="$(client_port $sink_slot)" ${admin_creds[@]+--user=sqlancer --password=sqlancer} \
+            >>"$results/run.log" 2>&1
+    fi
+    log "JDBC sink ready, client port $(client_port $sink_slot)$($jdbc_createtable || echo ", tables made beforehand (ENG-30681)")"
+fi
+
+# --- SQLancer ----------------------------------------------------------------------------------------------------
+
+sqlancer_args=(--num-threads "$threads" --num-tries "$threads" --timeout-seconds "$duration" --num-queries "$queries"
+    --random-seed "$seed" --host localhost --port "$(client_port 0)" --username "$($security && echo sqlancer)" --password "$($security && echo sqlancer)"
+    --database-prefix db --num-statement-kind-retries 20)
+# A failed INSERT is retried with new values, up to SQLancer's default of 1000 times; once a table's key has run out of
+# values (a BOOLEAN or TINYINT primary key, say), each of a database's inserts spent 1000 constraint violations, and
+# with --num-statement-kind-retries 20 they spend 20
+$use_reducer && sqlancer_args+=(--use-reducer)
+# --- node failures -----------------------------------------------------------------------------------------------
+
+# Every kill_interval seconds: kill -9 a random node, node 0 included (SQLancer is connected to every node), wait
+# until its client port closes, restart it and wait until it has rejoined. Each event is a line of chaos.log; a rejoin that
+# does not complete within 600 s ends the loop and fails the run. The loop stops when $results/chaos.stop exists,
+# after the node it is handling has rejoined, so the run ends with every node up.
+# rejoin_node I N: restarts node I after kill N and waits until it has rejoined, up to 600 s. A restart that exits
+# because a port is taken ("Address already in use", by another process's outgoing connection) is tried again, up
+# to 5 times, 10 s apart. The FATAL lines such an attempt writes to volt.log are listed in chaos.excluded and not
+# counted against the run.
+# stop_node I LOG: stops node I with "voltadmin stop" through another node, which VoltDB refuses for a few seconds
+# after a rejoin and so is retried, up to 20 times, 10 s apart; returns once the node's server has exited, 1 if it
+# never does. voltadmin names the node by the address VoltDB reports for it, which need not be localhost. Each refusal
+# is a line of LOG
+stop_node() {
+    local i=$1 slog=$2 other info hid ip out pid j
+    other=$(((i + 1) % nodes))
+    info=$(echo "exec @SystemInformation OVERVIEW;" | "$voltdb_home/bin/sqlcmd" --port="$(client_port $other)" \
+        ${admin_creds[@]+--user=sqlancer --password=sqlancer} ${ssl_sqlcmd[@]+"${ssl_sqlcmd[@]}"} 2>/dev/null)
+    hid=$(echo "$info" | awk -v p="$(internal_port $i)" '$2 == "INTERNALPORT" && $3 == p { print $1 }')
+    ip=$(echo "$info" | awk -v h="$hid" '$1 == h && $2 == "IPADDRESS" { print $3 }')
+    if [ -z "$ip" ]; then
+        echo "$(date '+%H:%M:%S') node$i not found in @SystemInformation" >>"$slog"
+        return 1
+    fi
+    pid=$(cat "$cluster/node$i.pid" 2>/dev/null)
+    for j in $(seq 1 20); do
+        out=$("$voltdb_home/bin/voltadmin" stop -H "localhost:$(admin_port $other)" ${admin_creds[@]+"${admin_creds[@]}"} \
+            ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} "$ip:$(internal_port $i)" 2>&1 | grep -v '^ *$' | tail -1)
+        for _ in $(seq 1 30); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        kill -0 "$pid" 2>/dev/null || return 0
+        echo "$(date '+%H:%M:%S') stopping node$i refused (attempt $j): $out" >>"$slog"
+        sleep 10
+    done
+    return 1
+}
+
+rejoin_node() {
+    local log=$cluster/restart$1-$2.log attempt deadline=$((SECONDS + 600)) before
+    local vlog=$cluster/node$1/voltdbroot/log/volt.log
+    for attempt in 1 2 3 4 5; do
+        before=$(wc -l <"$vlog" 2>/dev/null || echo 0)
+        start_node "$1" "$log"
+        while [ $SECONDS -lt $deadline ]; do
+            grep -q "Server completed initialization" "$log" 2>/dev/null && return 0
+            grep -q "unrecoverable error" "$log" 2>/dev/null && break
+            sleep 1
+        done
+        grep -q "Address already in use" "$log" 2>/dev/null || return 1
+        # the attempt is exiting (it prints "unrecoverable error" as it does); give its log a moment
+        sleep 2
+        echo "node$1 $((before + 1)) $(wc -l <"$vlog")" >>"$results/chaos.excluded"
+        echo "$(date '+%H:%M:%S') rejoin $2: node$1 could not bind a port (attempt $attempt), retrying" >>"$results/chaos.log"
+        mv "$log" "${log%.log}-bind$attempt.log"
+        sleep 10
+    done
+    return 1
+}
+
+chaos_loop() {
+    local n=0 i pid t0 rejoins vlog line
+    while true; do
+        for _ in $(seq 1 "$kill_interval"); do
+            [ -e "$results/chaos.stop" ] && return 0
+            sleep 1
+        done
+        i=$((RANDOM % nodes))
+        n=$((n + 1))
+        # the PID start_node recorded; a pattern match on the command line is not reliable, as the server's command
+        # line carries a long classpath before its voltdbroot directory
+        pid=$(cat "$cluster/node$i.pid" 2>/dev/null)
+        if [ -z "$pid" ] || ! is_server "$pid"; then
+            echo "$(date '+%H:%M:%S') kill $n: node$i is not running" >>"$results/chaos.log"
+            return 1
+        fi
+        # A node killed while a catalog update (@UpdateCore) is in flight deadlocks the MPI (ENG-30612) or crashes a
+        # survivor (ENG-30663), and DDL while the node rejoins crashed both survivors (lab build #49, ENG-30663), so
+        # DDL is held (the provider's --ddl-hold) from a few seconds before the kill, letting a catalog update in
+        # flight finish, until the node has rejoined ("Node rejoin completed")
+        touch "$results/ddl.hold"
+        # with --export, every other kill (the first included) is made while the HTTP target refuses rows (503), until
+        # 20 s after the node has rejoined: the rows written while it was down are still unacknowledged when it comes
+        # back, so the rejoined replica has a gap in each stream that it must fill from the other replicas (E3's gap
+        # fill, milestone 45); the end-of-run count requires every row to arrive all the same
+        $export && [ $((n % 2)) -eq 1 ] && touch "$cluster/http.hold" && echo "$(date '+%H:%M:%S') hold $n: the HTTP target refuses rows" >>"$results/chaos.log"
+        sleep 3
+        rejoins=$(grep -c "Node rejoin completed" "$cluster/node$i/voltdbroot/log/volt.log" 2>/dev/null)
+        # with --graceful, every other failure (the second, fourth, ...) is a graceful stop (voltadmin stop: VoltDB
+        # moves the node's partition leaders away first, @PrepareStopNode and @StopNode; milestone 48)
+        if $graceful && [ $((n % 2)) -eq 0 ]; then
+            t0=$(date +%s)
+            if ! stop_node "$i" "$results/chaos.log"; then
+                rm -f "$results/ddl.hold" "$cluster/http.hold"
+                echo "$(date '+%H:%M:%S') stop $n: node$i did not stop" >>"$results/chaos.log"
+                return 1
+            fi
+            echo "$(date '+%H:%M:%S') stop $n: node$i (pid $pid), voltadmin stop" >>"$results/chaos.log"
+            # once a stopped node has shut down ("The database node has been shutdown"), it sometimes sees the
+            # survivors hang up on it before its JVM exits, and partition detection logs FATAL ("fewer than half of
+            # the previous servers", ENG-30704): seen in 5 of 6 stops of two loaded coverage runs, never in 20 stops of
+            # an idle cluster. Those lines, after its shutdown, are about a node that left on purpose, and are not counted.
+            # A stop whose orderly shutdown stalls (a snapshot starting as it stops, milestone 51's coverage run) ends
+            # instead with "did not finish within 5 seconds ... Forcing the database node to exit", then the same FATAL
+            vlog=$cluster/node$i/voltdbroot/log/volt.log
+            line=$(grep -nE "The database node has been shutdown|Forcing the database node to exit" "$vlog" 2>/dev/null \
+                | tail -1 | cut -d: -f1)
+            [ -n "$line" ] && echo "node$i $line $(wc -l <"$vlog")" >>"$results/chaos.excluded"
+        else
+            kill -9 "$pid"
+            t0=$(date +%s)
+            echo "$(date '+%H:%M:%S') kill $n: node$i (pid $pid)" >>"$results/chaos.log"
+        fi
+        while port_in_use "$(client_port $i)"; do sleep 1; done
+        # the survivors must notice the failure before the node comes back
+        sleep 5
+        if ! rejoin_node "$i" "$n"; then
+            rm -f "$results/ddl.hold" "$cluster/http.hold"
+            echo "$(date '+%H:%M:%S') rejoin $n: node$i did not rejoin within 600 s" >>"$results/chaos.log"
+            return 1
+        fi
+        for _ in $(seq 1 120); do
+            [ "$(grep -c "Node rejoin completed" "$cluster/node$i/voltdbroot/log/volt.log" 2>/dev/null)" -gt "${rejoins:-0}" ] && break
+            sleep 1
+        done
+        rm -f "$results/ddl.hold"
+        echo "$(date '+%H:%M:%S') rejoin $n: node$i, $(($(date +%s) - t0)) s after it went down" >>"$results/chaos.log"
+        if [ -e "$cluster/http.hold" ]; then
+            sleep 20
+            rm -f "$cluster/http.hold"
+            echo "$(date '+%H:%M:%S') hold $n: the HTTP target takes rows again" >>"$results/chaos.log"
+        fi
+    done
+}
+
+chaos_pid=
+if [ "$kill_interval" -gt 0 ]; then
+    : >"$results/chaos.log"
+    chaos_loop &
+    chaos_pid=$!
+    log "Killing and rejoining a random node every $kill_interval s (chaos.log)"
+fi
+
+# Every crash_interval seconds: kill -9 every node at once, wait until their client ports close, restart them all with
+# the same command, which recovers the database from the last snapshot and the command log, and wait until every node
+# has finished ("Server completed initialization"), up to 600 s. A restart that cannot bind a port is tried again, as in
+# rejoin_node. Each event is a line of crash.log; a recovery that does not complete ends the loop and fails the run. The
+# loop stops when $results/crash.stop exists, after the recovery it is waiting for, so the run ends with every node up.
+crash_loop() {
+    local n=0 i pid t0 up deadline log vlog pids attempts befores out
+    while true; do
+        for _ in $(seq 1 "$crash_interval"); do
+            [ -e "$results/crash.stop" ] && return 0
+            sleep 1
+        done
+        n=$((n + 1))
+        pids=()
+        for ((i = 0; i < nodes; i++)); do
+            pid=$(cat "$cluster/node$i.pid" 2>/dev/null)
+            if [ -z "$pid" ] || ! is_server "$pid"; then
+                echo "$(date '+%H:%M:%S') crash $n: node$i is not running" >>"$results/crash.log"
+                return 1
+            fi
+            pids+=("$pid")
+        done
+        # with --graceful, every other crash (the second, fourth, ...) is "voltadmin shutdown --save": VoltDB pauses,
+        # drains, takes a final snapshot and stops every node, and the restart recovers from that snapshot
+        # (@Shutdown's save, the shutdown snapshot's restore; milestone 48); if it fails, the nodes are killed after all
+        if $graceful && [ $((n % 2)) -eq 0 ]; then
+            t0=$(date +%s)
+            out=$(within 300 "$voltdb_home/bin/voltadmin" shutdown --save -H "localhost:$(admin_port 0)" ${admin_creds[@]+"${admin_creds[@]}"} \
+                ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} 2>&1 | grep -v '^ *$' | tail -1)
+            for _ in $(seq 1 120); do
+                up=0
+                for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && up=$((up + 1)); done
+                [ "$up" -eq 0 ] && break
+                sleep 1
+            done
+            if [ "$up" -ne 0 ]; then
+                echo "$(date '+%H:%M:%S') shutdown $n: voltadmin shutdown --save left $up nodes running: $out" >>"$results/crash.log"
+                return 1
+            fi
+            echo "$(date '+%H:%M:%S') crash $n: every node shut down, voltadmin shutdown --save" >>"$results/crash.log"
+        else
+            kill -9 "${pids[@]}"
+            t0=$(date +%s)
+            echo "$(date '+%H:%M:%S') crash $n: every node killed (pids ${pids[*]})" >>"$results/crash.log"
+        fi
+        for ((i = 0; i < nodes; i++)); do
+            while port_in_use "$(client_port $i)"; do sleep 1; done
+        done
+        attempts=()
+        befores=()
+        for ((i = 0; i < nodes; i++)); do
+            attempts[i]=1
+            befores[i]=$(wc -l <"$cluster/node$i/voltdbroot/log/volt.log" 2>/dev/null || echo 0)
+            start_node $i "$cluster/recover$i-$n.log"
+        done
+        deadline=$((SECONDS + 600))
+        while true; do
+            up=0
+            for ((i = 0; i < nodes; i++)); do
+                log=$cluster/recover$i-$n.log
+                if grep -q "Server completed initialization" "$log" 2>/dev/null; then
+                    up=$((up + 1))
+                elif grep -q "Address already in use" "$log" 2>/dev/null && [ "${attempts[i]}" -lt 5 ]; then
+                    # another process's outgoing connection took the port; the attempt's FATAL lines are not the run's
+                    sleep 2
+                    vlog=$cluster/node$i/voltdbroot/log/volt.log
+                    echo "node$i $((befores[i] + 1)) $(wc -l <"$vlog")" >>"$results/chaos.excluded"
+                    echo "$(date '+%H:%M:%S') recover $n: node$i could not bind a port (attempt ${attempts[i]}), retrying" >>"$results/crash.log"
+                    mv "$log" "${log%.log}-bind${attempts[i]}.log"
+                    attempts[i]=$((attempts[i] + 1))
+                    befores[i]=$(wc -l <"$vlog" 2>/dev/null || echo 0)
+                    start_node $i "$log"
+                fi
+            done
+            [ "$up" -eq "$nodes" ] && break
+            if [ $SECONDS -ge $deadline ]; then
+                echo "$(date '+%H:%M:%S') recover $n: $up of $nodes nodes up after 600 s" >>"$results/crash.log"
+                return 1
+            fi
+            sleep 1
+        done
+        echo "$(date '+%H:%M:%S') recover $n: every node up, $(($(date +%s) - t0)) s after the crash" >>"$results/crash.log"
+    done
+}
+
+crash_pid=
+if [ "$crash_interval" -gt 0 ]; then
+    : >"$results/crash.log"
+    crash_loop &
+    crash_pid=$!
+    log "Killing every node and recovering the cluster every $crash_interval s (crash.log)"
+fi
+
+# --upgrade-from: upgrade_at seconds into the run, upgrade the nodes one at a time, from the last to node 0: stop the
+# node with "voltadmin stop" (which VoltDB refuses for a few seconds after a rejoin, and so is retried), wait until it
+# has exited, start it on --voltdb, which rejoins it, and wait until it has, up to 600 s. Each event is a line of
+# upgrade.log; a node that cannot be stopped or does not rejoin ends the loop and fails the run.
+upgrade_loop() {
+    local i j other info hid ip out pid t0 up
+    for _ in $(seq 1 "$upgrade_at"); do
+        [ -e "$results/upgrade.stop" ] && return 0
+        sleep 1
+    done
+    echo "$(date '+%H:%M:%S') upgrade: from $(upgrade_cmd "$upgrade_from/bin/voltdb" --version 2>&1 | tail -1) to $("$voltdb_home/bin/voltdb" --version 2>&1 | tail -1)" >>"$results/upgrade.log"
+    for ((i = nodes - 1; i >= 0; i--)); do
+        t0=$(date +%s)
+        other=$(((i + 1) % nodes))
+        # voltadmin stop names the node by the address VoltDB reports for it, which need not be localhost
+        info=$(echo "exec @SystemInformation OVERVIEW;" | "$voltdb_home/bin/sqlcmd" --port="$(client_port $other)" ${ssl_sqlcmd[@]+"${ssl_sqlcmd[@]}"} 2>/dev/null)
+        hid=$(echo "$info" | awk -v p="$(internal_port $i)" '$2 == "INTERNALPORT" && $3 == p { print $1 }')
+        ip=$(echo "$info" | awk -v h="$hid" '$1 == h && $2 == "IPADDRESS" { print $3 }')
+        if [ -z "$ip" ]; then
+            echo "$(date '+%H:%M:%S') upgrade: node$i not found in @SystemInformation" >>"$results/upgrade.log"
+            return 1
+        fi
+        pid=$(cat "$cluster/node$i.pid" 2>/dev/null)
+        # done once the node's server has exited; a refusal leaves it running, and is retried
+        for j in $(seq 1 20); do
+            out=$("$voltdb_home/bin/voltadmin" stop -H "localhost:$(admin_port $other)" ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} "$ip:$(internal_port $i)" 2>&1 |
+                grep -v '^ *$' | tail -1)
+            for _ in $(seq 1 30); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 1
+            done
+            kill -0 "$pid" 2>/dev/null || break
+            echo "$(date '+%H:%M:%S') upgrade: stopping node$i refused (attempt $j): $out" >>"$results/upgrade.log"
+            sleep 10
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "$(date '+%H:%M:%S') upgrade: node$i did not stop" >>"$results/upgrade.log"
+            return 1
+        fi
+        echo "$(date '+%H:%M:%S') upgrade: node$i stopped" >>"$results/upgrade.log"
+        node_home[i]=$voltdb_home
+        node_java[i]=
+        start_node $i "$cluster/upgrade$i.log"
+        up=false
+        for _ in $(seq 1 600); do
+            grep -q "Server completed initialization" "$cluster/upgrade$i.log" 2>/dev/null && { up=true; break; }
+            # kill -0, not is_server: the launcher runs as a script for a moment before it execs the server
+            kill -0 "$(cat "$cluster/node$i.pid")" 2>/dev/null || break
+            sleep 1
+        done
+        if ! $up; then
+            echo "$(date '+%H:%M:%S') upgrade: node$i did not rejoin on the new kit" >>"$results/upgrade.log"
+            return 1
+        fi
+        echo "$(date '+%H:%M:%S') upgrade: node$i upgraded, $(($(date +%s) - t0)) s" >>"$results/upgrade.log"
+    done
+    echo "$(date '+%H:%M:%S') upgrade: done" >>"$results/upgrade.log"
+}
+
+upgrade_pid=
+if [ -n "$upgrade_from" ]; then
+    : >"$results/upgrade.log"
+    upgrade_loop &
+    upgrade_pid=$!
+    log "Upgrading the cluster in service, one node at a time, $upgrade_at s into the run (upgrade.log)"
+fi
+
+# Every resize_interval seconds, by turns: grow the cluster by k+1 nodes, then shrink it by the same nodes. A grow
+# starts them with "voltdb start --add" in their own directories ($cluster/add<N>-<j>, kept for their logs) and waits
+# until they have joined and until "voltadmin resize --test" would remove them: VoltDB publishes the new topology some
+# seconds after the join (40 s in a trial), and a shrink planned before then would remove the original nodes, which it
+# refuses as more than half the cluster. A shrink runs "voltadmin resize", which removes the partition group with
+# the highest partition ids, those the last grow added, and waits until their servers exit. Each step has 600 s; one
+# that fails or times out ends the loop and fails the run. Each event is a line of resize.log. The loop stops when
+# $results/resize.stop exists, after its step, so the run ends at a settled size.
+grows=0
+shrinks=0
+# --ignore=disabled_export: the STREAMS oracle's streams have no export target but with --export, and VoltDB will not
+# resize while such a "disabled export target" may hold rows (lab build #43: every grow timed out); a stream with no
+# target discards its rows, so there is nothing to drain
+resize_hosts() {
+    "$voltdb_home/bin/voltadmin" resize --test --ignore=disabled_export -H "localhost:$(admin_port 0)" ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} 2>&1 | tail -1
+}
+# start_added N: starts the k+1 nodes of grow N, each initialized afresh in $cluster/add<N>-<j>
+start_added() {
+    local n=$1 j slot dir
+    for ((j = 0; j < added; j++)); do
+        slot=$((added_slot + j))
+        dir=$cluster/add$n-$j
+        "$voltdb_home/bin/voltdb" init --force -D "$dir" -C "$cluster/deployment.xml" \
+            ${license_args[@]+"${license_args[@]}"} >"$dir.init.log" 2>&1 || return 1
+        (nohup "$voltdb_home/bin/voltdb" start --add -D "$dir" -H "$(hosts internal)" \
+            --client="$(client_port $slot)" --admin="$(admin_port $slot)" --internal="$(internal_port $slot)" \
+            --zookeeper="$(port $slot 3)" --replication="$(port $slot 4)" --metrics="$(port $slot 5)" \
+            >"$dir.start.log" 2>&1 &
+            echo $! >"$dir.pid")
+    done
+}
+# grow N: adds k+1 nodes and waits until the cluster would remove them again. VoltDB rejects a join while a catalog
+# update is in progress, and SQLancer's DDL makes one likely: the joining nodes then exit with a FATAL line. Such an
+# attempt is set aside (its directories renamed add<N>-<j>-rejected<A>, whose FATAL lines are not counted) and tried
+# again 5 s later, up to 10 times.
+grow() {
+    local n=$1 j attempt deadline=$((SECONDS + 600)) ready out rejected originals
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        start_added $n || return 1
+        rejected=false
+        while [ $SECONDS -lt $deadline ]; do
+            ready=0
+            for ((j = 0; j < added; j++)); do
+                grep -q "Server completed initialization" "$cluster/add$n-$j.start.log" 2>/dev/null && ready=$((ready + 1))
+                grep -q "Can't do elastic join while catalog update is in progress" "$cluster/add$n-$j.start.log" 2>/dev/null &&
+                    rejected=true
+            done
+            [ "$ready" -eq "$added" ] || $rejected && break
+            # kill -0, not is_server: the PID is the launcher's until it execs the server's JVM
+            for ((j = 0; j < added; j++)); do
+                kill -0 "$(cat "$cluster/add$n-$j.pid")" 2>/dev/null && continue
+                # exited: a rejected join (its log may have been read just before the line was written), or a failure
+                sleep 1
+                grep -q "Can't do elastic join while catalog update is in progress" "$cluster/add$n-$j.start.log" || return 1
+                rejected=true
+            done
+            $rejected && break
+            sleep 1
+        done
+        $rejected || break
+        echo "$(date '+%H:%M:%S') grow $n: join rejected while a catalog update was in progress (attempt $attempt), retrying" >>"$results/resize.log"
+        for ((j = 0; j < added; j++)); do
+            kill -9 "$(cat "$cluster/add$n-$j.pid")" 2>/dev/null
+        done
+        sleep 5
+        for ((j = 0; j < added; j++)); do
+            for f in "" .init.log .start.log .pid; do
+                mv "$cluster/add$n-$j$f" "$cluster/add$n-$j-rejected$attempt$f" 2>/dev/null
+            done
+        done
+        [ $SECONDS -lt $deadline ] || return 1
+    done
+    $rejected && return 1
+    [ "$ready" -eq "$added" ] || return 1
+    # the original nodes are hosts 0 to nodes-1: done once the planned removal names none of them (paste, not
+    # seq -s, as BSD seq ends the list with the separator, which makes an empty alternative)
+    originals=$(seq 0 $((nodes - 1)) | paste -sd '|' -)
+    while [ $SECONDS -lt $deadline ]; do
+        out=$(resize_hosts)
+        if echo "$out" | grep -q "Host Ids: \[" && ! echo "$out" | grep -qE "Host Ids: \[(.*[ ,\[])?($originals)[],]"; then
+            echo "$(date '+%H:%M:%S') grow $n: planned removal: ${out#INFO: }" >>"$results/resize.log"
+            return 0
+        fi
+        sleep 5
+    done
+    return 1
+}
+# ENG-30622: a table dropped while an elastic remove streams its index snapshot hangs the remove for good, so DDL is
+# held (the provider's --ddl-hold) from a few seconds before the shrink, letting a catalog update in flight finish,
+# until it is done
+shrink() {
+    local rc=0
+    touch "$results/ddl.hold"
+    sleep 3
+    shrink_steps "$1" || rc=1
+    rm -f "$results/ddl.hold"
+    return $rc
+}
+shrink_steps() {
+    local n=$1 j alive deadline=$((SECONDS + 600)) out
+    out=$("$voltdb_home/bin/voltadmin" resize --ignore=disabled_export -H "localhost:$(admin_port 0)" ${ssl_voltadmin[@]+"${ssl_voltadmin[@]}"} 2>&1 | tail -1)
+    echo "$(date '+%H:%M:%S') shrink $n: $out" >>"$results/resize.log"
+    echo "$out" | grep -q "^INFO" || return 1
+    while [ $SECONDS -lt $deadline ]; do
+        alive=0
+        for ((j = 0; j < added; j++)); do
+            is_server "$(cat "$cluster/add$n-$j.pid")" && alive=$((alive + 1))
+        done
+        [ "$alive" -eq 0 ] && return 0
+        sleep 1
+    done
+    return 1
+}
+resize_loop() {
+    local n=0 t0
+    while true; do
+        for _ in $(seq 1 "$resize_interval"); do
+            [ -e "$results/resize.stop" ] && return 0
+            sleep 1
+        done
+        n=$((n + 1))
+        t0=$SECONDS
+        echo "$(date '+%H:%M:%S') grow $n: adding $added node(s)" >>"$results/resize.log"
+        # ENG-30676: a restore during an elastic join wedges the cluster as one during a rejoin does, so SNAPSHOT's
+        # restores wait (its --ddl-hold's sibling restore.hold) from a few seconds before the join, letting one in
+        # flight finish, until the join is done
+        touch "$results/restore.hold"
+        sleep 3
+        if ! grow $n; then
+            rm -f "$results/restore.hold"
+            echo "$(date '+%H:%M:%S') grow $n: FAILED after $((SECONDS - t0)) s" >>"$results/resize.log"
+            return 1
+        fi
+        rm -f "$results/restore.hold"
+        echo "$(date '+%H:%M:%S') grow $n: done, $((SECONDS - t0)) s" >>"$results/resize.log"
+        for _ in $(seq 1 "$resize_interval"); do
+            [ -e "$results/resize.stop" ] && return 0
+            sleep 1
+        done
+        t0=$SECONDS
+        if ! shrink $n; then
+            echo "$(date '+%H:%M:%S') shrink $n: FAILED after $((SECONDS - t0)) s" >>"$results/resize.log"
+            return 1
+        fi
+        echo "$(date '+%H:%M:%S') shrink $n: done, $((SECONDS - t0)) s" >>"$results/resize.log"
+    done
+}
+resize_pid=
+if [ "$resize_interval" -gt 0 ]; then
+    : >"$results/resize.log"
+    resize_loop &
+    resize_pid=$!
+    log "Growing and shrinking the cluster by $added node(s) by turns, every $resize_interval s (resize.log)"
+fi
+
+log "Running SQLancer for $duration s: oracles $oracles, seed $seed, $threads threads"
+# in the background, so that an interrupt runs the trap at once instead of after SQLancer finishes
+(cd "$results/sqlancer" && exec "$java" -jar "$jar" "${sqlancer_args[@]}" voltdb --oracle "$oracles" \
+    ${provider_args[@]+"${provider_args[@]}"} >out.log 2>&1) &
+sqlancer_pid=$!
+# SQLancer's --timeout-seconds only asks its threads to stop; one stuck in a call never does, and the run (and the ones
+# after it in a nightly) would wait for good (lab build #44). 15 minutes after the duration (SQLANCER_HANG_GRACE
+# seconds), a watchdog saves its thread dump and kills it, and the run fails.
+sqlancer_hung=false
+hang_grace=${SQLANCER_HANG_GRACE:-900}
+jstack=jstack
+case $java in */*) jstack=$(dirname "$java")/jstack ;; esac
+(
+    sleep $((duration + hang_grace))
+    kill -0 "$sqlancer_pid" 2>/dev/null || exit 0
+    : >"$results/sqlancer/hung"
+    "$jstack" -l "$sqlancer_pid" >"$results/sqlancer/jstack.txt" 2>&1
+    kill "$sqlancer_pid" 2>/dev/null
+    sleep 30
+    kill -9 "$sqlancer_pid" 2>/dev/null
+) &
+watchdog_pid=$!
+wait "$sqlancer_pid"
+sqlancer_exit=$?
+sqlancer_pid=
+pkill -P "$watchdog_pid" 2>/dev/null
+kill "$watchdog_pid" 2>/dev/null
+wait "$watchdog_pid" 2>/dev/null
+if [ -e "$results/sqlancer/hung" ]; then
+    sqlancer_hung=true
+    log "SQLancer did not exit within $hang_grace s of its duration; killed (sqlancer/jstack.txt)"
+fi
+log "SQLancer exited with $sqlancer_exit"
+
+chaos_failed=false
+kills=0
+rejoins=0
+if [ -n "$chaos_pid" ]; then
+    touch "$results/chaos.stop"
+    wait "$chaos_pid" || chaos_failed=true
+    kills=$(grep -c " kill [0-9]*: node[0-9]* (pid" "$results/chaos.log")
+    stops=$(grep -c " stop [0-9]*: node[0-9]* (pid" "$results/chaos.log")
+    rejoins=$(grep -c " rejoin [0-9]*: node[0-9]*, " "$results/chaos.log")
+    rm -f "$cluster/http.hold"
+    log "Node failures: $kills kills, ${stops:-0} graceful stops, $rejoins rejoins$($chaos_failed && echo ", the last one FAILED")"
+fi
+upgrade_failed=false
+upgraded=0
+if [ -n "$upgrade_pid" ]; then
+    touch "$results/upgrade.stop"
+    wait "$upgrade_pid" || upgrade_failed=true
+    upgraded=$(grep -c " upgrade: node[0-9]* upgraded" "$results/upgrade.log")
+    # an upgrade that never started (a run shorter than --upgrade-at) fails too: the run did not do what it says
+    grep -q " upgrade: done" "$results/upgrade.log" || upgrade_failed=true
+    log "Upgrade: $upgraded of $nodes nodes upgraded$($upgrade_failed && echo ", FAILED")"
+fi
+crash_failed=false
+crashes=0
+recoveries=0
+if [ -n "$crash_pid" ]; then
+    touch "$results/crash.stop"
+    wait "$crash_pid" || crash_failed=true
+    crashes=$(grep -c " crash [0-9]*: every node killed" "$results/crash.log")
+    shutdowns=$(grep -c " crash [0-9]*: every node shut down" "$results/crash.log")
+    recoveries=$(grep -c " recover [0-9]*: every node up" "$results/crash.log")
+    log "Crashes: $crashes, shutdowns with --save: ${shutdowns:-0}, recoveries: $recoveries$($crash_failed && echo ", the last one FAILED")"
+fi
+resize_failed=false
+if [ -n "$resize_pid" ]; then
+    touch "$results/resize.stop"
+    wait "$resize_pid" || resize_failed=true
+    grows=$(grep -c " grow [0-9]*: done" "$results/resize.log")
+    shrinks=$(grep -c " shrink [0-9]*: done" "$results/resize.log")
+    log "Resizes: $grows grows, $shrinks shrinks$($resize_failed && echo ", the last step FAILED")"
+fi
+
+# --- export ------------------------------------------------------------------------------------------------------
+
+# with --export, @Quiesce drains the streams to the file target; the files are counted once the cluster has shut down
+# gracefully, which closes them (the target writes some rows only when it rolls or closes a file)
+export_failed=false
+exported=0
+duplicates=0
+inserted=0
+stream_interrupted=0
+if $export; then
+    within 120 "$voltdb_home/bin/sqlcmd" --port="$(client_port 0)" ${admin_creds[@]+--user=sqlancer --password=sqlancer} ${ssl_sqlcmd[@]+"${ssl_sqlcmd[@]}"} \
+        <<<"exec @Quiesce;" >>"$results/run.log" 2>&1
+    # a batch reaches the HTTP target when the target rolls it, every 10 s: wait until the receiver's rows are the same
+    # for 25 s (at most 120 s)
+    if [ "$http_mode" = batch ]; then
+        last= same=0
+        for _ in $(seq 1 120); do
+            now=$(wc -l <"$cluster/http-export.log" 2>/dev/null | tr -d ' ')
+            [ "$now" = "$last" ] && same=$((same + 1)) || same=0
+            last=$now
+            [ "$same" -ge 25 ] && break
+            sleep 1
+        done
+    fi
+    inserted=$(grep -m1 "^STREAMS inserted rows:" "$results/sqlancer/out.log" | sed 's/^STREAMS inserted rows: \([0-9]*\).*/\1/')
+    # inserts a node failure interrupted: each may have committed and been exported, or not
+    stream_interrupted=$(grep -m1 "^STREAMS inserted rows:" "$results/sqlancer/out.log" | sed -n 's/.*; interrupted inserts: \([0-9]*\).*/\1/p')
+    stream_interrupted=${stream_interrupted:-0}
+    inserted=${inserted:-0}
+    # the JDBC target's rows, in the sink's tables named after the streams (XS_DB2_ST and so on): once their counts
+    # are the same three times in a row (at most 40 tries), each table's rows and distinct I (unique in the run), into
+    # export/jdbc.csv as TABLE,ROWS,DISTINCT_I
+    jdbc_count() {
+        local t queries=
+        for t in $("$voltdb_home/bin/sqlcmd" --port="$(client_port $sink_slot)" ${admin_creds[@]+--user=sqlancer --password=sqlancer} \
+            --output-format=csv --output-skip-metadata <<<"exec @SystemCatalog TABLES;" 2>/dev/null |
+            awk -F, '{ gsub(/"/, "", $3); if ($3 ~ /^XS_DB[0-9]+(G[0-9]+)?_ST$/) print $3 }'); do
+            queries+="SELECT '$t', COUNT(*), COUNT(DISTINCT i) FROM $t;"$'\n'
+        done
+        [ -n "$queries" ] || return 0
+        "$voltdb_home/bin/sqlcmd" --port="$(client_port $sink_slot)" ${admin_creds[@]+--user=sqlancer --password=sqlancer} \
+            --output-format=csv --output-skip-metadata <<<"$queries" 2>/dev/null | tr -d '"' | sort
+    }
+    last= same=0
+    for _ in $(seq 1 40); do
+        now=$(jdbc_count)
+        [ "$now" = "$last" ] && same=$((same + 1)) || same=0
+        last=$now
+        [ "$same" -ge 3 ] && break
+        sleep 1
+    done
+    mkdir -p "$results/export"
+    printf '%s\n' "$last" | grep -E '^XS_DB[0-9]+(G[0-9]+)?_ST,[0-9]+,[0-9]+$' >"$results/export/jdbc.csv"
+    within 60 "$voltdb_home/bin/voltadmin" shutdown --force -H "localhost:$(admin_port $sink_slot)" ${admin_creds[@]+"${admin_creds[@]}"} >>"$results/run.log" 2>&1
+fi
+
+# --- collect -----------------------------------------------------------------------------------------------------
+
+down=()
+for ((i = 0; i < nodes; i++)); do
+    port_in_use "$(client_port $i)" || down+=("node$i")
+    $xdcr && { port_in_use "$(client_port $((xdcr_slot + i)))" || down+=("xdcr$i"); }
+done
+stop_cluster
+# save_logs DIR FILE|DIR...: copies the logs into DIR. A log over 256 MB is a server logging something without end, and
+# would fill the agent's disk (lab build #43); its copy keeps the first and last 64 MB and the FATAL lines between, and
+# it fails the run
+oversized=()
+save_logs() {
+    local dest=$1 f size keep=$((64 * 1024 * 1024))
+    shift
+    mkdir -p "$dest"
+    for f in "$@"; do
+        if [ -d "$f" ]; then
+            save_logs "$dest" "$f"/*
+            continue
+        fi
+        [ -f "$f" ] || continue
+        size=$(wc -c <"$f" | tr -d ' ')
+        if [ "$size" -le $((256 * 1024 * 1024)) ]; then
+            cp "$f" "$dest/"
+            continue
+        fi
+        oversized+=("${dest#"$results"/servers/}/$(basename "$f") ($size bytes)")
+        {
+            head -c "$keep" "$f"
+            printf '\n[run-sqlancer: %s was %s bytes; its middle is cut but for its FATAL-level lines]\n' "$f" "$size"
+            tail -c +$((keep + 1)) "$f" | head -c $((size - 2 * keep)) | grep -a " FATAL "
+            printf '[run-sqlancer: its last %s bytes]\n' "$keep"
+            tail -c "$keep" "$f"
+        } >"$dest/$(basename "$f")"
+    done
+}
+for ((i = 0; i < nodes; i++)); do
+    save_logs "$results/servers/node$i" "$cluster/start$i.log" "$cluster/init$i.log" "$cluster"/restart$i-*.log \
+        "$cluster"/recover$i-*.log "$cluster/upgrade$i.log" "$cluster/node$i/voltdbroot/log"
+done
+for d in "$cluster"/add*-*; do
+    [ -d "$d" ] || continue
+    save_logs "$results/servers/$(basename "$d")" "$d.init.log" "$d.start.log" "$d/voltdbroot/log"
+done
+if $xdcr; then
+    for ((i = 0; i < nodes; i++)); do
+        save_logs "$results/servers/xdcr$i" "$cluster/start-xdcr$i.log" "$cluster/init-xdcr$i.log" \
+            "$cluster/xdcr$i/voltdbroot/log"
+    done
+fi
+# the JVM error reports of servers that crashed; each names its node's directory in its command line
+save_logs "$results/servers" "$cluster"/hs_err_pid*.log
+if $export; then
+    save_logs "$results/servers/sink" "$cluster/start-sink.log" "$cluster/init-sink.log" "$cluster/sink/voltdbroot/log"
+fi
+if [ -n "$mirror_home" ]; then
+    save_logs "$results/servers/mirror" "$cluster/start-mirror.log" "$cluster/init-mirror.log" \
+        "$cluster/mirror/voltdbroot/log"
+fi
+cp "$cluster/deployment.xml" "$results/"
+# every row the STREAMS oracle inserted must have been exported; export is at least once, so a row exported twice counts
+# once, and the duplicates are reported. A row is told by its I, unique in the run: a row a new partition leader exported
+# again after a failover has the same transaction id and sequence number but another site id (milestone 40), so its
+# line differs
+if $export; then
+    for ((i = 0; i < nodes; i++)); do
+        mkdir -p "$results/export/node$i"
+        cp "$cluster/node$i/voltdbroot/sqlancer_export"/*.csv "$results/export/node$i/" 2>/dev/null
+    done
+    cp "$cluster/http-export.log" "$results/export/" 2>/dev/null
+    total=$(cat "$cluster"/node*/voltdbroot/sqlancer_export/*.csv 2>/dev/null | wc -l | tr -d ' ')
+    # each line's last column is the row's I
+    exported=$(cat "$cluster"/node*/voltdbroot/sqlancer_export/*.csv 2>/dev/null | awk -F, '{ print $NF }' | sort -u | wc -l | tr -d ' ')
+    # the HTTP target's rows: each request is one row, its columns as form fields; the row's I is unique in the run
+    # (with --http-mode batch, the receiver writes each CSV line of a batch as such a line; a signed request whose
+    # signature does not match is a BADSIG line, not a row, and fails the run)
+    http_total=$(grep -v "^BADSIG" "$cluster/http-export.log" 2>/dev/null | grep -c "&I=[0-9]*")
+    http_rows=$(grep -v "^BADSIG" "$cluster/http-export.log" 2>/dev/null | grep -o "&I=[0-9]*" | sort -u | wc -l | tr -d ' ')
+    bad_signatures=$(grep -c "^BADSIG" "$cluster/http-export.log" 2>/dev/null)
+    [ "${bad_signatures:-0}" -eq 0 ] || export_failed=true
+    jdbc_total=$(awk -F, '{ s += $2 } END { print s + 0 }' "$results/export/jdbc.csv" 2>/dev/null)
+    jdbc_rows=$(awk -F, '{ s += $3 } END { print s + 0 }' "$results/export/jdbc.csv" 2>/dev/null)
+    total=$((total + ${http_total:-0} + ${jdbc_total:-0}))
+    exported=$((exported + ${http_rows:-0} + ${jdbc_rows:-0}))
+    duplicates=$((total - exported))
+    # E3's gap fills (milestone 45): a replica that filled its gaps from others logs "Replica hosts filled gaps"
+    gap_fills=$(cat "$cluster"/node*/voltdbroot/log/volt.log* 2>/dev/null | grep -c "Replica hosts filled gaps")
+    gap_holds=$(grep -c "the HTTP target refuses rows" "$results/chaos.log" 2>/dev/null)
+    # every inserted row, and at most the interrupted ones besides
+    [ "$exported" -ge "$inserted" ] && [ "$exported" -le $((inserted + stream_interrupted)) ] || export_failed=true
+    log "Export: $exported rows exported (${http_rows:-0} through HTTP, ${jdbc_rows:-0} through JDBC; $duplicates exported twice), $inserted inserted into the streams ($stream_interrupted inserts interrupted)$([ "${bad_signatures:-0}" -eq 0 ] || echo ", $bad_signatures requests with a bad signature")$($export_failed && echo ", MISMATCH"); gap fills: ${gap_fills:-0} (HTTP held across ${gap_holds:-0} kills)"
+fi
+# XDCR's conflict log: each database writes through one cluster only, so XDCR has nothing to resolve, and any
+# conflict it logged fails the run; but for XCONFLICT's tables (XCP_..., XCR_...), whose conflicts it makes on purpose
+# and checks itself
+conflicts=0
+if $xdcr; then
+    mkdir -p "$results/xdcr_conflicts"
+    for f in $(find "$cluster" -path "*xdcr_conflicts*" -type f 2>/dev/null); do
+        cp "$f" "$results/xdcr_conflicts/$(echo "${f#"$cluster"/}" | tr / _)"
+        conflicts=$((conflicts + $(grep -cv '","XC[PR]_' "$f" || true)))
+    done
+fi
+$keep_cluster || rm -rf "$cluster"
+
+failures=()
+for f in "$results"/sqlancer/logs/voltdb/*.log; do
+    [ -e "$f" ] || continue
+    case $f in *-cur.log) continue ;; esac
+    failures+=("$f")
+    cp "$f" "$results/reproductions/"
+done
+# the reducer opens a log for every thread; only a failing one has anything in it
+for f in "$results"/sqlancer/logs/voltdb/reduce/*.log; do
+    [ -s "$f" ] && cp "$f" "$results/reproductions/"
+done
+# FATAL lines in the server logs, but for those of restarts that could not bind a port and those a gracefully stopped
+# node logged after its shutdown (chaos.excluded)
+fatal=0
+for ((i = 0; i < nodes; i++)); do
+    n=$(awk -v node="node$i" -v excluded="$results/chaos.excluded" '
+        BEGIN { while ((getline line < excluded) > 0) { split(line, f, " "); if (f[1] == node) { lo[++k] = f[2]; hi[k] = f[3] } } }
+        / FATAL / { for (j = 1; j <= k; j++) if (FNR >= lo[j] && FNR <= hi[j]) next; c++ }
+        END { print c + 0 }' "$results/servers/node$i/volt.log" 2>/dev/null)
+    fatal=$((fatal + ${n:-0}))
+done
+for f in "$results"/servers/xdcr*/volt.log; do
+    [ -e "$f" ] || continue
+    fatal=$((fatal + $(grep -c " FATAL " "$f")))
+done
+for f in "$results"/servers/add*-*/volt.log; do
+    [ -e "$f" ] || continue
+    case $f in *-rejected*) continue ;; esac
+    fatal=$((fatal + $(grep -c " FATAL " "$f")))
+done
+# MP repair blockers held more than 60 s (ENG-30758, milestone 56): LeaderAppointer creates /db/action_blockers/mp_repair_blocker
+# at a leader promotion and the MPI removes it once its repair is done, normally within a second; while it is held,
+# DDL, @UpdateClasses and rejoins are refused. The creations and removals of every node's log (the cluster's own,
+# not the XDCR peer's), in time order (UTC, as the logs are); a hold counts from its first creation to the next removal,
+# or to now if none followed
+long_repairs=$(cat "$results"/servers/node*/volt.log "$results"/servers/add*-*/volt.log 2>/dev/null |
+    grep -h "action_blockers/mp_repair_blocker successfully" | sort |
+    awk -v now="$(date -u +%H:%M:%S)" '{ split($2, t, /[:,]/); s = t[1] * 3600 + t[2] * 60 + t[3] }
+        / Create / { if (!held) { held = 1; since = s; at = $2 } }
+        / Remove / { if (held && s - since > 60) { n++; list = list (list ? ", " : "") at " for " s - since " s" } held = 0 }
+        END { split(now, t, ":"); if (held && t[1] * 3600 + t[2] * 60 + t[3] - since > 60) { n++; list = list (list ? ", " : "") at " until the end" }
+            print n + 0 (n ? " (" list ")" : "") }')
+
+# --- summary -----------------------------------------------------------------------------------------------------
+
+result=PASS
+[ "$sqlancer_exit" -eq 0 ] && [ ${#failures[@]} -eq 0 ] && [ ${#down[@]} -eq 0 ] && [ "$fatal" -eq 0 ] &&
+    ! $chaos_failed && ! $resize_failed && ! $crash_failed && ! $upgrade_failed && ! $export_failed &&
+    [ "$conflicts" -eq 0 ] && [ ${#oversized[@]} -eq 0 ] && ! $sqlancer_hung || result=FAIL
+{
+    echo "RESULT: $result"
+    echo "run: $run_id"
+    echo "progress: $(grep "Executed" "$results/sqlancer/out.log" | tail -1)"
+    echo "sqlancer exit code: $sqlancer_exit"
+    $sqlancer_hung && echo "sqlancer hung: did not exit within $hang_grace s of its duration, killed (sqlancer/jstack.txt)"
+    echo "failed databases: ${#failures[@]}"
+    echo "nodes down at the end: ${down[*]:-none}"
+    echo "FATAL lines in server logs: $fatal"
+    [ ${#oversized[@]} -eq 0 ] || echo "server logs over 256 MB, cut: ${oversized[*]}"
+    # ENG-30602: failures that did not recur when rerun at once (VoltDBTransientCheck), counted, not failed
+    grep -m1 "^PLANS compared different plans:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^PERMS checked:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^STREAMS inserted rows:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^TTL checks:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^LOAD checks:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^CONFIG changes checked:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^SNAPSHOT restores checked:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^XCONFLICT checks:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^TASK checks:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^IMPORT checks:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^STATS calls checked:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^LOGIN checks:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^JAVAPROC checks:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^STREAMSNAP streams checked:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^METRICS checks:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^DEFRAG checks:" "$results/sqlancer/out.log" 2>/dev/null
+    grep -m1 "^TLSRELOAD checks:" "$results/sqlancer/out.log" 2>/dev/null
+    $export && echo "export: $exported rows exported (${http_rows:-0} through HTTP $http_mode by $http_method$([ "${bad_signatures:-0}" -eq 0 ] || echo ", $bad_signatures BAD SIGNATURES"), ${jdbc_rows:-0} through JDBC, $duplicates twice), $inserted inserted$($export_failed && echo ", a MISMATCH (export/)"); gap fills: ${gap_fills:-0} (HTTP held across ${gap_holds:-0} kills)"
+    echo "transient results skipped (ENG-30602): $(grep -c "^ENG-30602 transient:" "$results/sqlancer/out.log" 2>/dev/null || true)"
+    echo "statements refused past --retry-seconds, skipped: $(grep -c "^Refused past --retry-seconds:" "$results/sqlancer/out.log" 2>/dev/null || true)"
+    echo "MP repair blockers held over 60 s (ENG-30758): $long_repairs"
+    [ "$kill_interval" -gt 0 ] && echo "node failures: $kills kills, ${stops:-0} graceful stops, $rejoins rejoins$($chaos_failed && echo ", a rejoin FAILED (chaos.log)")"
+    [ "$crash_interval" -gt 0 ] && echo "crashes: $crashes crashes, ${shutdowns:-0} shutdowns with --save, $recoveries recoveries$($crash_failed && echo ", a recovery FAILED (crash.log)")"
+    [ -n "$upgrade_from" ] && echo "upgrade: $upgraded of $nodes nodes upgraded$($upgrade_failed && echo ", FAILED (upgrade.log)")"
+    $xdcr && echo "XDCR conflicts logged: $conflicts$([ "$conflicts" -eq 0 ] || echo " (xdcr_conflicts/)")"
+    $xdcr && echo "databases XDCR compared after convergence: $(grep -c "^XDCR converged:" "$results/sqlancer/out.log" 2>/dev/null || true)"
+    [ "$crash_interval" -gt 0 ] && echo "databases DURABLE compared across a crash: $(grep -c "^DURABLE across a crash:" "$results/sqlancer/out.log" 2>/dev/null || true)"
+    [ "$resize_interval" -gt 0 ] && echo "resizes: $grows grows, $shrinks shrinks$($resize_failed && echo ", a step FAILED (resize.log)")"
+    for f in ${failures[@]+"${failures[@]}"}; do
+        echo
+        echo "== reproductions/$(basename "$f")"
+        # the oracle's account of the failure, or the error and its root cause
+        if grep -q "^-- On the database" "$f"; then
+            grep -A3 "^-- On the database" "$f" | cut -c1-400
+        else
+            grep -m1 -E "^--java" "$f" | cut -c1-400
+            grep -E "^--Caused by" "$f" | tail -1 | cut -c1-400
+        fi
+    done
+} >"$results/summary.txt"
+
+echo
+cat "$results/summary.txt"
+echo
+echo "Results: $results"
+[ "$result" = PASS ]

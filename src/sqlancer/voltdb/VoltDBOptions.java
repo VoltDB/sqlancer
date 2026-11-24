@@ -1,0 +1,106 @@
+package sqlancer.voltdb;
+
+import java.util.List;
+
+import com.beust.jcommander.Parameter;
+import com.beust.jcommander.Parameters;
+
+import sqlancer.DBMSSpecificOptions;
+
+@Parameters(separators = "=", commandDescription = "VoltDB (default host: " + VoltDBOptions.DEFAULT_HOST
+        + ", default port: " + VoltDBOptions.DEFAULT_PORT + ")")
+public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
+
+    public static final String DEFAULT_HOST = "localhost";
+    public static final int DEFAULT_PORT = 21212;
+
+    @Parameter(names = "--oracle", description = "The test oracles to use")
+    public List<VoltDBOracleFactory> oracles = List.of(VoltDBOracleFactory.NOREC);
+
+    @Parameter(names = "--max-num-tables", description = "The maximum number of tables each database creates")
+    public int maxNumTables = 3;
+
+    @Parameter(names = "--max-num-indexes", description = "The maximum number of CREATE INDEX statements each database issues")
+    public int maxNumIndexes = 4;
+
+    @Parameter(names = "--max-num-updates", description = "The maximum number of UPDATE statements each database issues")
+    public int maxNumUpdates = 5;
+
+    @Parameter(names = "--max-num-deletes", description = "The maximum number of DELETE statements each database issues")
+    public int maxNumDeletes = 2;
+
+    @Parameter(names = "--max-num-views", description = "The maximum number of CREATE VIEW statements each database issues")
+    public int maxNumViews = 2;
+
+    @Parameter(names = "--retry-seconds", description = "How long a statement VoltDB rejects because of a concurrent schema change is retried")
+    public int retrySeconds = 120;
+
+    @Parameter(names = "--avoid-known-bugs", description = "Do not generate SQL that hits a known, unfixed VoltDB bug (see the README)", arity = 1)
+    public boolean avoidKnownBugs = true;
+
+    @Parameter(names = "--node-failures", description = "Nodes are killed and rejoined during the run (run-sqlancer.sh --kill-interval): expect and retry the errors that causes", arity = 1)
+    public boolean nodeFailures;
+
+    @Parameter(names = "--resizes", description = "The cluster grows and shrinks elastically during the run (run-sqlancer.sh --resize-interval): expect and retry the errors that hosts leaving the cluster cause, as for --node-failures", arity = 1)
+    public boolean resizes;
+
+    @Parameter(names = "--xdcr", description = "Comma-separated host:port client addresses of a second cluster linked to the first by XDCR (run-sqlancer.sh --xdcr): each database writes through one of the two, chosen at random, its DDL runs on both with DR TABLE for each table, and the XDCR oracle compares their rows")
+    public String xdcr;
+
+    @Parameter(names = "--upgrades", description = "The cluster is upgraded in service during the run, one node at a time (run-sqlancer.sh --upgrade-from): expect the errors that a stopped node causes, as for --node-failures", arity = 1)
+    public boolean upgrades;
+
+    @Parameter(names = "--export-target", description = "The export target (run-sqlancer.sh --export) that the STREAMS oracle's streams export to; without it, the streams export nowhere")
+    public String exportTarget;
+
+    @Parameter(names = "--loopback-target", description = "A loopback export target (run-sqlancer.sh --export) whose procedure is XS_LB.insert: the STREAMS oracle also exports each row through it into the table XS_LB, and checks the table gets the rows")
+    public String loopbackTarget;
+
+    @Parameter(names = "--ttl-migrate-target", description = "A loopback export target (run-sqlancer.sh --export) whose procedure is XS_LBT.insert: the TTL oracle's TTL tables that MIGRATE TO TARGET it move their expired rows into the table XS_LBT")
+    public String ttlMigrateTarget;
+
+    @Parameter(names = "--ssl-truststore", description = "A Java truststore (password sqlancer) trusting the cluster's TLS certificate (run-sqlancer.sh --ssl): SQLancer connects to the cluster, and the XDCR peer, over TLS; not to the mirror")
+    public String sslTruststore;
+
+    @Parameter(names = "--import-ports", description = "The ports on this machine, FIRST or FIRST-LAST, that the cluster's pull socket importer (run-sqlancer.sh, with IMPORT among the oracles) pulls CSV lines from into XI.insert: the IMPORT oracle listens on them and sends lines; without it, IMPORT does nothing")
+    public String importPorts;
+
+    @Parameter(names = "--cluster-dir", description = "The directory on this machine that holds every node's voltdbroot, of both clusters with --xdcr (run-sqlancer.sh passes its cluster directory): XCONFLICT reads XDCR's conflict log there")
+    public String clusterDir;
+
+    @Parameter(names = "--snapshot-path", description = "A directory on this machine holding every node's voltdbroot (run-sqlancer.sh passes its cluster directory): the SNAPSHOT oracle saves its snapshots to each node's own snapshot directory and reads the files they write there; without it, SNAPSHOT does nothing")
+    public String snapshotPath;
+
+    @Parameter(names = "--security", description = "Security is on (run-sqlancer.sh --security): SQLancer connects as an administrator, the provider creates the roles sqlancer_read (SQLREAD) and sqlancer_write (SQL), and the PERMS oracle runs statements as the users reader and writer, who hold them", arity = 1)
+    public boolean security;
+
+    @Parameter(names = "--crashes", description = "Every node is killed at once and the cluster recovered from its command log during the run (run-sqlancer.sh --crash-interval): expect the errors that causes, as for --node-failures, and wait for the cluster to come back before connecting", arity = 1)
+    public boolean crashes;
+
+    @Parameter(names = "--ddl-hold", description = "A file that, while it exists, holds every DDL statement until it is gone (run-sqlancer.sh creates it during each shrink, ENG-30622); ignored with --avoid-known-bugs false")
+    public String ddlHold;
+
+    @Parameter(names = "--mirror", description = "Comma-separated host:port client addresses of a second cluster, normally running another VoltDB version: every statement that changes the database is repeated on it, and the DIFF oracle compares the two clusters' rows for the same query")
+    public String mirror;
+
+    @Parameter(names = "--procedure-classpath", description = "The VoltDB jars (colon-separated) that Java stored procedures compile against (run-sqlancer.sh passes the kit's): the JAVAPROC oracle compiles its procedure classes with them; without it, JAVAPROC does nothing")
+    public String procedureClasspath;
+
+    @Parameter(names = "--metrics-servers", description = "Comma-separated host:port addresses of every node's metrics port (run-sqlancer.sh passes them, and enables the metrics system, collecting every second): the METRICS oracle reads their /metrics; without it, METRICS does nothing")
+    public String metricsServers;
+
+    @Parameter(names = "--servers", description = "Comma-separated host:port client addresses of every node; SQLancer connects to all of them, so it keeps working while any one node is down (used instead of --host and --port)")
+    public String servers;
+
+    @Override
+    public List<VoltDBOracleFactory> getTestOracleFactory() {
+        return oracles;
+    }
+
+    // whether to avoid a known bug that is fixed after 16.0.0 but still hits a 16.0.0 server: one is in the run when
+    // there is a mirror (--mirror, normally 16.0.0) or an in-service upgrade from 16.0.0 (--upgrades)
+    public boolean avoidBugsOf1600() {
+        return avoidKnownBugs && (mirror != null && !mirror.isBlank() || upgrades);
+    }
+
+}
