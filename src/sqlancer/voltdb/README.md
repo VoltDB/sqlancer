@@ -1843,6 +1843,9 @@ sqlcmd of `ENG-30789-sqlcmd-rebuilt` 09e0680bdf ("new"). The new sqlcmd's change
 master build.
 - **One node, SQLCMD only, 5 minutes, 4 threads:** every one of 907 old and 894 new queries matched JDBC. The csv
   text was the same for all 894 queries that both ran.
+- **3 nodes, k=1, a node killed every 300 s, 20 minutes:** NOREC, TLP_WHERE, PQS and SQLCMD ran, through 2 kills,
+  1 graceful stop and 3 rejoins. Every one of 2,551 old and 2,411 new queries matched JDBC, and the csv text was the
+  same for all 2,411 queries that both ran. The result was PASS.
 - **Before the known issues were folded in,** the same runs found ENG-30895 and ENG-30896 in both sqlcmds.
 
 ## The STREAMS oracle
