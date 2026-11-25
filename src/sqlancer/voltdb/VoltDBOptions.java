@@ -89,6 +89,9 @@ public class VoltDBOptions implements DBMSSpecificOptions<VoltDBOracleFactory> {
     @Parameter(names = "--metrics-servers", description = "Comma-separated host:port addresses of every node's metrics port (run-sqlancer.sh passes them, and enables the metrics system, collecting every second): the METRICS oracle reads their /metrics; without it, METRICS does nothing")
     public String metricsServers;
 
+    @Parameter(names = "--sqlcmd", description = "Comma-separated name=path of sqlcmd commands (a kit's bin/sqlcmd) that the SQLCMD oracle runs each of its queries through, in csv, against the cluster, to compare with the rows JDBC returns, and with each other; without it, SQLCMD does nothing")
+    public String sqlcmd;
+
     @Parameter(names = "--servers", description = "Comma-separated host:port client addresses of every node; SQLancer connects to all of them, so it keeps working while any one node is down (used instead of --host and --port)")
     public String servers;
 
