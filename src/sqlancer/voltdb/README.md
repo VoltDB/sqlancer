@@ -2517,6 +2517,105 @@ The bugs below were found in milestone 28.
 The published `voltdbclient` jar does not register its JDBC driver with `java.sql.Driver`, so the provider loads
 `org.voltdb.jdbc.Driver` itself.
 
+## When VoltDB adds SQL
+
+The provider generates only the SQL it was written to generate, so a new statement, function or system procedure is
+not tested until the provider learns it. These are the places that need changing, by what VoltDB added. Sections
+further up describe each piece in more detail.
+
+### Keep new SQL away from 16.0.0
+
+Two of the nightly runs hold a 16.0.0 server, which does not know SQL added after it:
+
+- **The mirror** (`--mirror-voltdb`, every run of the nightly job; `MIRROR_VERSION` in the job). Every statement that
+  `VoltDBConnection.isWrite` counts as a change is repeated there. That is anything that does not start with SELECT,
+  WITH or `(`, a new read-only statement included. A statement that succeeds here and fails there marks the database
+  diverged, and DIFF stops checking it without saying so. A new function in a DIFF query is worse: the mirror's error
+  is unexpected, and the run fails.
+- **The in-service upgrade** (`--upgrade-from`, the `3:1:u` run). The cluster runs 16.0.0 until a third of the way
+  through, and part 16.0.0 until every node is upgraded.
+
+So new SQL must not be generated while either is in the run, even with `--avoid-known-bugs false`: on 16.0.0 it is not
+a bug, it does not exist. `VoltDBOptions.avoidBugsOf1600()` tells when a 16.0.0 server is in the run, but it is also
+false with `--avoid-known-bugs false`. Add a sibling that checks only `mirror` and `upgrades`, and gate the new SQL on
+it. When `MIRROR_VERSION` moves to a release that has the new SQL, remove the gate.
+
+### A new function
+
+1. Add the name to `VoltDBFunction.VoltDBFunctionName`, under the group for its result type. Add it to `MODELLED` only
+   if the PQS evaluator computes it exactly (see step 3).
+2. Generate it in `VoltDBExpressionGenerator`, in the `Kind` of its result: NUMERIC, STRING, TEMPORAL, VARBINARY or
+   BOOLEAN. Give it arguments it accepts (the bitwise functions get `CAST_BIGINT` operands, ROUND gets
+   `CAST_DECIMAL`), or add the errors it cannot avoid (step 4). Every oracle that builds expressions then uses it:
+   NoREC, TLP, PQS, PARAMS, VIEWS, PROCEDURE, PLANS and the rest. `VoltDBToStringVisitor` writes a function as
+   `NAME(arg, ...)`; a function written differently, with keywords (like CAST, POSITION or OVERLAY), needs a
+   case there.
+3. If it is in `MODELLED`, implement it in `oracle/VoltDBExpressionEvaluator` the way VoltDB behaves, NULLs and edge
+   cases included, and add cases to `TestVoltDBExpressionEvaluator`.
+4. Add each error it raises by design to `VoltDBErrors.addExpressionErrors`, with a comment that says why the
+   generator cannot avoid it. Add a row to the "Expected errors" table above too. An error with no reason is a bug.
+
+### A new statement (DML or DDL)
+
+1. Write a generator in `gen/` that returns a `SQLQueryAdapter` with its expected errors, like
+   `VoltDBUpdateGenerator`. It must stay inside VoltDB's rules (see "Intentional VoltDB differences"). For example,
+   never set a partitioning column, and use ASSUMEUNIQUE for a unique index without the partitioning column.
+2. To run it while each database is built, add it to `VoltDBProvider.Action` and give it a count in `mapActions`. For a
+   count that can be tuned, add a `--max-num-...` option to `VoltDBOptions`, like `maxNumUpdates`.
+3. Decide how the special runs see it:
+   - **The mirror:** it is repeated there unless `isWrite` says otherwise (see above).
+   - **XDCR:** DDL runs on both clusters, and changes replicate by DR. A statement whose effect does not replicate
+     must not run in an `--xdcr` run, or the XDCR oracle reports the difference.
+   - **PERMS:** `VoltDBPermissionOracle` checks what roles `sqlancer_read` (SQLREAD) and `sqlancer_write` (SQL) may
+     do. Add the statement to the kind it belongs to (query, change or DDL), or to a new kind if VoltDB gives it its
+     own permission.
+   - **Node failures, resizes, crashes and upgrades:** the errors those cause are retried or expected in
+     `VoltDBErrors` (`isNodeFailure`, `isRetryable`). A statement that fails in a new way while a node is down needs
+     its message there, with the run that found it.
+4. If it changes the schema, check the SCHEMA oracle (plans made before and after a change) and the catalog-update
+   retries in `VoltDBConnection` (one DDL statement at a time).
+
+### A new system procedure or admin command
+
+Commands like `@Defrag`, `@SwapTables` or `@ReloadSslContext` got oracles of their own (DEFRAG, SWAP, TLSRELOAD), which
+run the command and then check its effect. To add one:
+
+1. Write the oracle in `oracle/`, with a class comment that says what it runs and what it checks. Have it print a count
+   of its checks at exit, as PERMS and TLSRELOAD do, so a run that never reached the command shows.
+2. Add it to `VoltDBOracleFactory`.
+3. Add its name wherever the oracles are listed:
+   - `run-sqlancer.sh`: the `--oracle` help;
+   - `run-coverage.sh`: `all_oracles`;
+   - internal `jenkins-lab/systemtest/apprunner/sqlancer/Jenkinsfile`: the `ORACLES` default;
+   - pro `tests/apptests/jenkins-scripts/run-jenkins-sqlancer-test.sh`: the `SQLANCER_ORACLES` default.
+
+   A job run with an explicit `ORACLES` list does not pick it up.
+4. If it needs the cluster set up differently (a deployment setting, a path on the node, a port), add that to
+   `run-sqlancer.sh` and pass it to the provider as an option. Without the option, the oracle should do nothing,
+   like SNAPSHOT without `--snapshot-path`.
+
+### Check it, then turn it on
+
+1. Run the unit tests and `mvn verify -DskipTests` (see [Tests](#tests)).
+2. Run `voltdb/run-sqlancer.sh` against a kit that has the new SQL, with only the oracles that use it, for a few
+   minutes. Then run it with `--mirror-voltdb` and with `--upgrade-from` set to a 16.0.0 kit, to show the gate holds.
+   The run's `out.log` shows how often each oracle checked something.
+3. Measure with `voltdb/run-coverage.sh --compare-with` (see [Code coverage](#code-coverage)) to see that the code
+   behind the new SQL runs.
+4. Document it: a line in the status paragraph at the top, a section or a bullet under the oracle or "How the
+   provider maps SQLancer onto VoltDB", and the expected-errors table.
+5. Merge to `main`, then pin the new commit in internal's Jenkinsfile (`SQLANCER_REF`) and in pro's
+   `tests/cloudtests/workloads/kubernetes/sqlancer/SqlancerWorkload.py` (`SQLANCER_REF`). The jobs run the pinned
+   commit, not `main`.
+
+### When it finds a bug
+
+File it under epic ENG-30580, linked to ENG-30396. Add its minimal reproduction to `voltdb/repros/` (see
+[Bug reproductions](#bug-reproductions)). Then make the generator avoid it while `--avoid-known-bugs` is true, with a
+comment that names the ticket, and add a row to "VoltDB issues the provider works around". When the nightly
+reproductions report it FIXED, remove the workaround. If 16.0.0 still has the bug, gate the workaround on
+`avoidBugsOf1600()` instead.
+
 ## Tests
 
 `test/sqlancer/voltdb/oracle/TestVoltDBExpressionEvaluator.java` checks the PQS evaluator against VoltDB's semantics
