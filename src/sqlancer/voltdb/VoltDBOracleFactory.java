@@ -26,6 +26,7 @@ import sqlancer.voltdb.oracle.VoltDBSchemaChangeOracle;
 import sqlancer.voltdb.oracle.VoltDBSetOperationOracle;
 import sqlancer.voltdb.oracle.VoltDBSmokeOracle;
 import sqlancer.voltdb.oracle.VoltDBSnapshotOracle;
+import sqlancer.voltdb.oracle.VoltDBSqlcmdOracle;
 import sqlancer.voltdb.oracle.VoltDBStatsOracle;
 import sqlancer.voltdb.oracle.VoltDBStreamOracle;
 import sqlancer.voltdb.oracle.VoltDBStreamingSnapshotOracle;
@@ -299,6 +300,16 @@ public enum VoltDBOracleFactory implements OracleFactory<VoltDBGlobalState> {
         @Override
         public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
             return new VoltDBMetricsOracle(globalState);
+        }
+    },
+    /**
+     * Runs a query through JDBC and through each sqlcmd of --sqlcmd, in csv, and checks that each prints JDBC's rows
+     * (milestone 58, ENG-30789, the rebuilt sqlcmd); with two or more, also compares their output text.
+     */
+    SQLCMD {
+        @Override
+        public TestOracle<VoltDBGlobalState> create(VoltDBGlobalState globalState) {
+            return new VoltDBSqlcmdOracle(globalState, expressionErrors());
         }
     },
     /**

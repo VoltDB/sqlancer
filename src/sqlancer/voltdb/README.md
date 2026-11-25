@@ -76,6 +76,8 @@ row; see [The DEFRAG oracle](#the-defrag-oracle).
 Since milestone 54 the TLSRELOAD oracle rotates the cluster's TLS certificate with `@ReloadSslContext` while it runs;
 see [The TLSRELOAD oracle](#the-tlsreload-oracle).
 Since milestone 55 `--ssl` combines with `--xdcr`, and DR runs over TLS too; see [XDCR over TLS](#xdcr-over-tls-milestone-55).
+Since milestone 58 the SQLCMD oracle runs queries through sqlcmd as well as JDBC, and compares an old sqlcmd with a new
+one (ENG-30789); see [The SQLCMD oracle](#the-sqlcmd-oracle).
 `SMOKE`, from
 milestone 1, only reads every table and checks that the queries succeed. `voltdb/run-sqlancer.sh` (milestone 4) starts a
 cluster, runs SQLancer against it and saves the results. A nightly lab job (milestone 7) runs it against master's kit;
@@ -1782,6 +1784,67 @@ Results:
 | `SslCertCheck` | 11 | 51 of 90 |
 | `SslContextHolder` | 5 | 18 of 20 |
 
+## The SQLCMD oracle
+
+SQLCMD (milestone 58) checks sqlcmd against JDBC. It was written for ENG-30789, the rebuilt sqlcmd, to compare it
+with the one it replaces. For each check, it generates a query, as DIFF does, and runs it twice:
+
+1. through JDBC;
+2. through every sqlcmd named in `--sqlcmd`, as `sqlcmd --servers=... --output-format=csv --output-skip-metadata
+   --query=...`.
+
+Each sqlcmd must print the rows JDBC returns.
+- **How fields are compared:** each csv field is read back as its column's type, which comes from the JDBC metadata,
+  then compared with JDBC's value. So `1E-12` and `0.000000000001` are the same DECIMAL. Rows are compared as
+  multisets.
+- **Old and new together:** with two or more sqlcmds, their csv text is also compared exactly as written. A
+  difference there doesn't fail the run, since the rebuilt sqlcmd changes some output on purpose. It is counted, and
+  the query and both outputs go to `logs/voltdb/sqlcmd-differences.log`.
+
+```
+voltdb/run-sqlancer.sh --voltdb ~/voltdb --oracle NOREC,TLP_WHERE,SQLCMD \
+    -- --sqlcmd old=$HOME/voltdb/bin/sqlcmd,new=$HOME/sqlcmd-new/bin/sqlcmd
+```
+
+At exit, SQLCMD prints one line, for example:
+
+```
+SQLCMD checked: old 907 queries, 9064 rows, 1303 BOOLEAN fields left empty, 111 TIMESTAMPs before 1970 misprinted, 0 \N strings; new 894 queries, ...; text: 894 same, 0 different
+```
+
+- **What each run needs:**
+  - **Which sqlcmd:** each `--sqlcmd` entry is `name=path`, and the path is a kit's `bin/sqlcmd`. The oracle puts
+    that `bin` directory first on PATH, because the kit's `dbenv` prints a notice on stdout when another `voltdb`
+    comes first, which would end up in the csv. A sqlcmd outside a kit needs its own launcher that does the same.
+  - **Connection:** sqlcmd connects to `--servers`, or else to `--host` and `--port`, as the provider does. With
+    `--security` it connects as the provider's user.
+  - **When it is skipped:** every check is skipped with `--xdcr`, because the database may write through the other
+    cluster, and with `--ssl-truststore`, because sqlcmd would need its own TLS settings.
+  - **Without `--sqlcmd`:** SQLCMD does nothing. It is not in the nightly job's oracles: the job's kit has only one
+    sqlcmd.
+- **Speed:** every check starts a JVM per sqlcmd, about a second each, so SQLCMD makes about two checks a second per
+  thread with two sqlcmds.
+- **Errors:** a sqlcmd error on a query JDBC ran fails the check. The exceptions are a node failure, a catalog-update
+  retry and an error the query may raise by design; those skip it.
+- **Known issues:** these are in the 16.1.0-SNAPSHOT sqlcmd and the rebuilt one alike, and in csv only. The cause is
+  `VoltTableUtil.toCSVWriter`, which also writes CSV snapshots.
+  - ENG-30895: a BOOLEAN is an empty field, TRUE, FALSE and NULL alike, and a lone BOOLEAN column prints empty lines.
+  - ENG-30896: a TIMESTAMP before 1970 whose microseconds are not whole milliseconds is written as the next
+    millisecond, a minus sign and the microseconds to take off: `01:42:38.818363` as `01:42:38.819-637`, and
+    `1969-12-31 23:59:59.999999` as `1970-01-01 00:00:00.000-01`.
+  - The string `\N` is written as csv's NULL is. That is by design.
+
+  While `--avoid-known-bugs` is true, every BOOLEAN matches an empty field, such a TIMESTAMP is read back by taking
+  the microseconds off, and `\N` matches NULL in a VARCHAR column. The exit line counts each, so a fix shows up as
+  zero.
+
+**Results (2026-11-25).** These runs used the 16.1.0-SNAPSHOT sqlcmd of master 133b68bb54 ("old") and the rebuilt
+sqlcmd of `ENG-30789-sqlcmd-rebuilt` 09e0680bdf ("new"). The new sqlcmd's changed classes were compiled over that
+master build.
+- **One node, SQLCMD only, 5 minutes, 4 threads:** every one of 907 old and 894 new queries matched JDBC. The csv
+  text was the same for all 894 queries that both ran.
+- **Before the known issues were folded in,** the same runs found ENG-30895 and ENG-30896 in both sqlcmds.
+
 ## The STREAMS oracle
 
 A stream cannot be read, so STREAMS puts each row into a stream and into a shadow table with the same columns, and
@@ -2212,6 +2275,8 @@ index ..." at WARN. The statement succeeds, so the provider ignores it.
 | ENG-4643 | JDBC `getString` on a NULL returns the type's NULL sentinel (INTEGER, TINYINT, FLOAT) or throws (DECIMAL, BOOLEAN, DATE, TIMESTAMP). | The connection wraps every result set so that `getString` checks `wasNull()` and returns null for a NULL. |
 | ENG-12656 | An index scan for `<`, `<=`, `>`, `>=` or BETWEEN on a VARBINARY(n) column, and for `=` when the column leads a multi-column unique index, fails ("Type VARCHAR can't be cast as VARBINARY") when the value, a constant or another table's column, is longer than n bytes. Found again by NoREC. | While `--avoid-known-bugs` is true, VARBINARY values are never compared with `<`, `>`, `<=`, `>=` or BETWEEN, a VARBINARY comparison has a constant on one side, VARBINARY constants are at most one byte, and VARBINARY partitioning columns are joined only when their sizes match. |
 | ENG-22880 | A BIGINT literal at the type's minimum is stored as NULL instead of rejected. A FLOAT at -1.7976931348623157E308 and an INTEGER expression equal to INTEGER's minimum do the same. | Never generated. |
+| ENG-30895 | sqlcmd's csv writes every BOOLEAN as an empty field, TRUE, FALSE and NULL alike (`VoltTableUtil.toCSVWriter`). | While `--avoid-known-bugs` is true, SQLCMD matches every BOOLEAN with an empty field. |
+| ENG-30896 | sqlcmd's csv writes a TIMESTAMP before 1970 whose microseconds are not whole milliseconds as the next millisecond, a minus sign and the microseconds to take off (`01:42:38.819-637`). | While `--avoid-known-bugs` is true, SQLCMD reads such a field back by taking the microseconds off. |
 
 The bugs below were found by NoREC in milestone 2. While `--avoid-known-bugs` is true (the default) the generator
 avoids each one as described; set it to false to check whether a fix works.
@@ -2629,6 +2694,12 @@ mvn -Djacoco.skip=true -Dtest=TestVoltDBExpressionEvaluator test
 
 ```bash
 mvn -Djacoco.skip=true -Dtest=TestVoltDBParameterOracle test
+```
+
+`test/sqlancer/voltdb/oracle/TestVoltDBSqlcmdOracle.java` checks how SQLCMD reads sqlcmd's csv:
+
+```bash
+mvn -Djacoco.skip=true -Dtest=TestVoltDBSqlcmdOracle test
 ```
 
 `test/sqlancer/voltdb/gen/TestVoltDBConstantGenerator.java` checks how string literals are written (ENG-30562):
